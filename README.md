@@ -1,24 +1,21 @@
 from pyspark.sql import SparkSession, functions as F
+from pyspark.sql.window import Window
 
 # =========================
 # CONFIG / PARAMS
 # =========================
 DB = "dm_ib_dev"
 
-WEALTH_FQN    = f"{DB}.wealth_tbl"
-DIGITAL_FQN   = f"{DB}.digital_tbl"
-INVEST_FQN    = f"{DB}.investpath_tbl"
+WEALTH_FQN  = f"{DB}.wealth_tbl_6m"
+DIGITAL_FQN = f"{DB}.digital_tbl_6m"
+INVEST_FQN  = f"{DB}.investpath_tbl_6m"
 
 DROP_AND_RECREATE = True
 
-# If you want a fixed range you can use these later, but Wealth is usually a single snapshot
-START_DATE = "2025-07-01"
-END_DATE   = "2025-12-31"
-
-def get_spark():
+def get_spark(app_name="wealth_digital_invest_3tables_6m"):
     spark = (
         SparkSession.builder
-        .appName("wealth_digital_investpath_3tables")
+        .appName(app_name)
         .enableHiveSupport()
         .config("spark.sql.adaptive.enabled", "true")
         .config("spark.sql.shuffle.partitions", "300")
@@ -31,180 +28,229 @@ spark = get_spark()
 spark.sql(f"USE {DB}")
 
 # =========================
-# 0) COMMON SNAPSHOT DATES
+# DATE WINDOW (last 6 full months)
+# start = first day of month 6 months ago
+# end   = first day of current month (exclusive)
 # =========================
-wealth_snapshot_dt = spark.sql("select max(business_date) as dt from eil.d_involved_party_h").first()["dt"]
-digital_snapshot_dt = spark.sql("select max(ods_business_dt) as dt from dm_ib.digital_banking_master").first()["dt"]
+this_month = F.trunc(F.current_date(), "MM")
+start_dt = F.add_months(this_month, -6)
+end_dt   = this_month
 
 # =========================
-# 1) WEALTH TABLE (Customer grain: 1 row per RCIF)
+# 1) DIGITAL TABLE (reltibn grain, 1 row per reltibn across window)
+# This supports your DAX:
+#   CALCULATE(DISTINCTCOUNT(Digital[reltibn]), Digital[digitally_active_flag]="Digital Active")
 # =========================
-# Minimal stable wealth customer table:
-# - One row per RCIF
-# - Includes ods_business_dt, accts_cnt, business_group, division, ip_id, cust_internet_banking_number
-wealth_base = (
-    spark.table("eil.d_involved_party_h").alias("ip")
-    .join(
-        spark.table("eil.d_arrangement_to_involved_party_relationship_h").alias("a2i"),
-        (F.col("ip.involved_party_id") == F.col("a2i.involved_party_id")) &
-        (F.col("ip.business_date") == F.col("a2i.business_date")) &
-        (F.col("ip.source_system_code") == F.col("a2i.source_system_code")),
-        "inner"
-    )
-    .join(
-        spark.table("eil.d_arrangement_h").alias("ar"),
-        (F.col("a2i.arrangement_id") == F.col("ar.arrangement_id")) &
-        (F.col("a2i.business_date") == F.col("ar.business_date")) &
-        (F.col("a2i.source_system_code") == F.col("ar.source_system_code")),
-        "inner"
-    )
-    .where(
-        (F.col("ip.business_date") == F.lit(wealth_snapshot_dt)) &
-        (F.col("ip.source_system_code") == F.lit("CF")) &
-        (F.coalesce(F.col("ip.deceased_ind"), F.lit("N")) == F.lit("N"))
-    )
-    # Business Group logic (adapt as needed)
-    .withColumn(
-        "business_group",
-        F.when(F.col("ip.private_client_code").isin("039", "539", "339"), F.lit("Private Wealth"))
-         .when(F.col("ip.private_client_trust_code").isin("239", "739"), F.lit("Private Wealth"))
-         .otherwise(
-            F.when(F.col("ar.business_service_segment_type_code").isin("IS_CT", "IS_IT"), F.lit("Institutional Services"))
-             .when(F.col("ar.business_service_segment_type_code").isin("REGIS_FC", "REGIS"), F.lit("Investment Services"))
-             .when(F.col("ar.business_service_segment_type_code") == F.lit("PWM"), F.lit("Private Wealth"))
-             .otherwise(F.lit("Other"))
-         )
-    )
-)
-
-wealth_tbl = (
-    wealth_base
-    .groupBy(
-        F.lit(wealth_snapshot_dt).alias("ods_business_dt"),
-        F.col("ip.rcif_cust_nbr").cast("string").alias("rcif_number"),
-    )
-    .agg(
-        F.max(F.col("ip.involved_party_id")).alias("ip_id"),
-        F.max(F.col("ip.cust_internet_banking_nbr")).alias("customer_internet_banking_number"),
-        F.max(F.col("business_group")).alias("business_group"),
-        # If you have division logic elsewhere, replace this:
-        F.max(F.col("business_group")).alias("division"),
-        F.countDistinct(F.col("ar.arrangement_id")).alias("accts_cnt"),
-    )
-    .dropDuplicates(["rcif_number"])
-)
-
-# sanity check
-wealth_tbl.selectExpr("count(distinct rcif_number) as wealth_rcif").show(truncate=False)
-
-# =========================
-# 2) DIGITAL TABLE (Digital grain: 1 row per ods_business_dt + reltibn)
-# =========================
-# Build flags + active flags:
-# - mobile_flag: Mobile User / Non Mobile User (based on last login null)
-# - olb_flag: OLB User / Non OLB User
-# - mobile_active_flag / olb_active_flag: based on 90 day recency
-# - digitally_active_flag: if either active
-# - digital_flag: Digital User / Non Digital User (based on reltibn null - typically reltibn won't be null here)
-digital_tbl = (
+dbm = (
     spark.table("dm_ib.digital_banking_master")
-    .where(
-        (F.col("ods_business_dt") == F.lit(digital_snapshot_dt))  # keep a stable snapshot like your dashboard
-        # If you truly want a range, replace with: between START_DATE and END_DATE + then decide how to aggregate
-    )
-    .groupBy("ods_business_dt", "relt_ibn", "rcif_customer_nbr")
-    .agg(
-        F.max("olb_last_login_date").alias("lst_login_olb"),
-        F.max("mob_last_login_date").alias("lst_login_mob"),
-    )
-    .withColumn(
-        "mobile_flag",
-        F.when(F.col("lst_login_mob").isNull(), F.lit("Non Mobile User"))
-         .otherwise(F.lit("Mobile User"))
-    )
-    .withColumn(
-        "olb_flag",
-        F.when(F.col("lst_login_olb").isNull(), F.lit("Non OLB User"))
-         .otherwise(F.lit("OLB User"))
-    )
-    .withColumn(
-        "mobile_active_flag",
-        F.when(F.col("lst_login_mob").isNotNull() & (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90),
-               F.lit("Mobile Active"))
-         .otherwise(F.lit("Non Mobile Active"))
-    )
-    .withColumn(
-        "olb_active_flag",
-        F.when(F.col("lst_login_olb").isNotNull() & (F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90),
-               F.lit("OLB Active"))
-         .otherwise(F.lit("Non OLB Active"))
-    )
-    .withColumn(
-        "digitally_active_flag",
-        F.when(
-            (F.col("mobile_active_flag") == F.lit("Mobile Active")) |
-            (F.col("olb_active_flag") == F.lit("OLB Active")),
-            F.lit("Digital Active")
-        ).otherwise(F.lit("Non Digital Active"))
-    )
-    .withColumn(
-        "digital_flag",
-        F.when(F.col("relt_ibn").isNull(), F.lit("Non Digital User"))
-         .otherwise(F.lit("Digital User"))
-    )
-    .select(
-        "ods_business_dt",
-        F.col("relt_ibn").alias("reltibn"),
-        F.col("rcif_customer_nbr").cast("string").alias("rcif_customer_number"),
-        "mobile_active_flag",
-        "mobile_flag",
-        "olb_active_flag",
-        "olb_flag",
-        "digitally_active_flag",
-        "digital_flag",
-    )
-    .dropDuplicates(["ods_business_dt", "reltibn"])
+    .where((F.col("ods_business_dt") >= start_dt) & (F.col("ods_business_dt") < end_dt))
 )
 
-# sanity check (this should align to your ~3.4M for Digital Active reltibn)
+digital_tbl = (
+    dbm.groupBy("relt_ibn")
+       .agg(
+           F.max("ods_business_dt").alias("ods_business_dt"),              # as-of date per reltibn
+           F.max("rcif_customer_nbr").cast("string").alias("rcif_customer_number"),
+           F.max("olb_last_login_date").alias("lst_login_olb"),
+           F.max("mob_last_login_date").alias("lst_login_mob"),
+       )
+       .withColumn(
+           "mobile_flag",
+           F.when(F.col("lst_login_mob").isNull(), F.lit("Non Mobile User")).otherwise(F.lit("Mobile User"))
+       )
+       .withColumn(
+           "olb_flag",
+           F.when(F.col("lst_login_olb").isNull(), F.lit("Non OLB User")).otherwise(F.lit("OLB User"))
+       )
+       .withColumn(
+           "mobile_active_flag",
+           F.when(
+               F.col("lst_login_mob").isNotNull() &
+               (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90),
+               F.lit("Mobile Active")
+           ).otherwise(F.lit("Non Mobile Active"))
+       )
+       .withColumn(
+           "olb_active_flag",
+           F.when(
+               F.col("lst_login_olb").isNotNull() &
+               (F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90),
+               F.lit("OLB Active")
+           ).otherwise(F.lit("Non OLB Active"))
+       )
+       .withColumn(
+           "digitally_active_flag",
+           F.when(
+               (F.col("mobile_active_flag") == "Mobile Active") |
+               (F.col("olb_active_flag") == "OLB Active"),
+               F.lit("Digital Active")
+           ).otherwise(F.lit("Non Digital Active"))
+       )
+       .withColumn(
+           "digital_flag",
+           F.when(F.col("relt_ibn").isNull(), F.lit("Non Digital User")).otherwise(F.lit("Digital User"))
+       )
+       .select(
+           F.col("ods_business_dt"),
+           F.col("relt_ibn").alias("reltibn"),
+           "rcif_customer_number",
+           "mobile_active_flag", "mobile_flag",
+           "olb_active_flag", "olb_flag",
+           "digitally_active_flag", "digital_flag",
+       )
+)
+
+# sanity check: should be near your expected 3,428,446
 digital_tbl.filter(F.col("digitally_active_flag") == "Digital Active") \
           .selectExpr("count(distinct reltibn) as digital_active_reltibn").show(truncate=False)
 
 # =========================
-# 3) INVESTPATH TABLE (Account grain: 1 row per ods_business_dt + arrangement_id)
+# 2) WEALTH TABLE (RCIF grain: latest row per RCIF within window)
+# Target: distinct rcif_number ~ 269,148 (your expectation)
+# IMPORTANT: Use eil.m_involved_party_h (your screenshots heavily use m_)
 # =========================
-investpath_tbl = (
-    spark.table("eil.d_involved_party_h").alias("ip")
+ip = (
+    spark.table("eil.m_involved_party_h")
+    .where((F.to_date("business_date") >= start_dt) & (F.to_date("business_date") < end_dt))
+    .where(F.coalesce(F.col("deceased_ind"), F.lit("N")) == "N")
+)
+
+# pick latest business_date row per rcif within the 6-month window (keeps RCIF count stable)
+w_rcif = Window.partitionBy(F.col("rcif_cust_nbr").cast("string")).orderBy(F.to_date("business_date").desc())
+
+ip_latest = (
+    ip.select(
+        F.to_date("business_date").alias("ods_business_dt"),
+        F.col("rcif_cust_nbr").cast("string").alias("rcif_number"),
+        F.col("involved_party_id").alias("ip_id"),
+        F.col("cust_internet_banking_nbr").alias("customer_internet_banking_number"),
+        F.col("private_client_code"),
+        F.col("private_client_trust_code"),
+        F.col("source_system_code"),
+    )
+    .withColumn("rn", F.row_number().over(w_rcif))
+    .where(F.col("rn") == 1)
+    .drop("rn")
+)
+
+# Enrichment join (LEFT) so we do NOT lose RCIFs:
+# Use relationship + arrangement on same date/source where available, but never drop RCIFs.
+a2i = (
+    spark.table("eil.m_arrangement_to_involved_party_relationship_h")
+    .where((F.to_date("business_date") >= start_dt) & (F.to_date("business_date") < end_dt))
+    .select(
+        F.to_date("business_date").alias("ods_business_dt"),
+        "involved_party_id",
+        "source_system_code",
+        "arrangement_id"
+    )
+)
+
+ar = (
+    spark.table("eil.m_arrangement_h")
+    .where((F.to_date("business_date") >= start_dt) & (F.to_date("business_date") < end_dt))
+    .select(
+        F.to_date("business_date").alias("ods_business_dt"),
+        "source_system_code",
+        "arrangement_id",
+        "business_service_segment_type_code"
+    )
+)
+
+wealth_enriched = (
+    ip_latest.alias("ip")
     .join(
-        spark.table("eil.d_arrangement_to_involved_party_relationship_h").alias("a2i"),
-        (F.col("ip.involved_party_id") == F.col("a2i.involved_party_id")) &
-        (F.col("ip.business_date") == F.col("a2i.business_date")) &
+        a2i.alias("a2i"),
+        (F.col("ip.ip_id") == F.col("a2i.involved_party_id")) &
+        (F.col("ip.ods_business_dt") == F.col("a2i.ods_business_dt")) &
         (F.col("ip.source_system_code") == F.col("a2i.source_system_code")),
-        "inner"
+        "left"
     )
     .join(
-        spark.table("eil.d_arrangement_h").alias("ar"),
+        ar.alias("ar"),
         (F.col("a2i.arrangement_id") == F.col("ar.arrangement_id")) &
-        (F.col("a2i.business_date") == F.col("ar.business_date")) &
+        (F.col("a2i.ods_business_dt") == F.col("ar.ods_business_dt")) &
         (F.col("a2i.source_system_code") == F.col("ar.source_system_code")),
-        "inner"
+        "left"
     )
-    .where(
-        (F.col("ip.source_system_code") == F.lit("CF")) &
-        (F.coalesce(F.col("ip.deceased_ind"), F.lit("N")) == F.lit("N"))
+)
+
+wealth_tbl = (
+    wealth_enriched
+    .groupBy("ip.ods_business_dt", "ip.rcif_number", "ip.ip_id", "ip.customer_internet_banking_number",
+             "ip.private_client_code", "ip.private_client_trust_code")
+    .agg(
+        F.countDistinct("ar.arrangement_id").alias("accts_cnt"),
+        F.max("ar.business_service_segment_type_code").alias("any_segment_code")  # simple enrichment
+    )
+    .withColumn(
+        "business_group",
+        F.when(F.col("private_client_code").isin("039", "539", "339"), F.lit("Private Wealth"))
+         .when(F.col("private_client_trust_code").isin("239", "739"), F.lit("Private Wealth"))
+         .when(F.col("any_segment_code").isin("IS_CT", "IS_IT"), F.lit("Institutional Services"))
+         .when(F.col("any_segment_code").isin("REGIS_FC", "REGIS"), F.lit("Investment Services"))
+         .when(F.col("any_segment_code") == "PWM", F.lit("Private Wealth"))
+         .otherwise(F.lit("Other"))
+    )
+    .withColumn("division", F.col("business_group"))  # replace if you have separate division logic
+    .select(
+        "ods_business_dt",
+        "rcif_number",
+        "ip_id",
+        "customer_internet_banking_number",
+        "accts_cnt",
+        "business_group",
+        "division"
+    )
+)
+
+# sanity check: should be near your expected 269,148
+wealth_tbl.selectExpr("count(distinct rcif_number) as wealth_rcif").show(truncate=False)
+
+# =========================
+# 3) INVESTPATH TABLE (arrangement grain; NEVER 0 unless source tables are empty)
+# Build from a2i within window, attach rcif via ip within same date/source (LEFT to avoid drops)
+# =========================
+ip_rcif_by_day = (
+    ip.select(
+        F.to_date("business_date").alias("ods_business_dt"),
+        "involved_party_id",
+        "source_system_code",
+        F.col("rcif_cust_nbr").cast("string").alias("rcif_number")
+    )
+)
+
+invest_tbl = (
+    a2i.alias("a2i")
+    .join(
+        ip_rcif_by_day.alias("ipd"),
+        (F.col("a2i.involved_party_id") == F.col("ipd.involved_party_id")) &
+        (F.col("a2i.ods_business_dt") == F.col("ipd.ods_business_dt")) &
+        (F.col("a2i.source_system_code") == F.col("ipd.source_system_code")),
+        "left"
+    )
+    .join(
+        spark.table("eil.m_arrangement_h").alias("ar"),
+        (F.col("a2i.arrangement_id") == F.col("ar.arrangement_id")) &
+        (F.to_date(F.col("ar.business_date")) == F.col("a2i.ods_business_dt")) &
+        (F.col("a2i.source_system_code") == F.col("ar.source_system_code")),
+        "left"
     )
     .select(
-        F.col("ar.business_date").alias("ods_business_dt"),
-        F.col("ip.rcif_cust_nbr").cast("string").alias("rcif_number"),
-        F.col("ar.arrangement_id").alias("arrangement_id"),
+        F.col("a2i.ods_business_dt").alias("ods_business_dt"),
+        F.col("ipd.rcif_number").alias("rcif_number"),
+        F.col("a2i.arrangement_id").alias("arrangement_id"),
         F.col("ar.current_balance_amt").alias("balance"),
         F.col("ar.open_date").alias("open_date"),
     )
+    .where(F.col("arrangement_id").isNotNull())
     .dropDuplicates(["ods_business_dt", "arrangement_id"])
 )
 
+invest_tbl.selectExpr("count(*) as invest_rows", "count(distinct arrangement_id) as distinct_arrangement").show(truncate=False)
+
 # =========================
-# 4) WRITE TABLES
+# WRITE TABLES
 # =========================
 if DROP_AND_RECREATE:
     spark.sql(f"DROP TABLE IF EXISTS {WEALTH_FQN}")
@@ -213,9 +259,9 @@ if DROP_AND_RECREATE:
 
 wealth_tbl.write.mode("overwrite").saveAsTable(WEALTH_FQN)
 digital_tbl.write.mode("overwrite").saveAsTable(DIGITAL_FQN)
-investpath_tbl.write.mode("overwrite").saveAsTable(INVEST_FQN)
+invest_tbl.write.mode("overwrite").saveAsTable(INVEST_FQN)
 
 print("✅ Created 3 tables:")
-print(f"  - {WEALTH_FQN}   (RCIF grain, expect ~270K distinct rcif)")
-print(f"  - {DIGITAL_FQN}  (reltibn grain, expect ~3.4M digital active distinct reltibn)")
+print(f"  - {WEALTH_FQN}   (RCIF grain, expect ~269k distinct rcif)")
+print(f"  - {DIGITAL_FQN}  (reltibn grain, expect ~3.428M digital active distinct reltibn)")
 print(f"  - {INVEST_FQN}   (arrangement grain)")
