@@ -1,19 +1,34 @@
-from pyspark.sql import functions as F
+from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.window import Window
 
 # =========================
-# Inputs you already have
+# CONFIG
 # =========================
 DB = "dm_ib_dev"
 START_DATE = "2025-07-01"
 END_DATE   = "2025-12-31"
 DIG_FQN    = f"{DB}.digital_202507_202512"
 
+def get_spark(app_name="digital_only_202507_202512"):
+    spark = (
+        SparkSession.builder
+        .appName(app_name)
+        .enableHiveSupport()
+        .config("spark.sql.adaptive.enabled", "true")
+        .config("spark.sql.shuffle.partitions", "300")
+        .getOrCreate()
+    )
+    spark.sparkContext.setLogLevel("WARN")
+    return spark
+
+spark = get_spark()
+spark.sql(f"USE {DB}")
+
 start_dt = F.to_date(F.lit(START_DATE))
 end_dt   = F.to_date(F.lit(END_DATE))
 
 # -------------------------
-# Helper: pick column safely
+# Helper: pick correct IBN col (repo uses relt_ibn)
 # -------------------------
 def first_existing_col(df, *candidates):
     cols = set(df.columns)
@@ -23,9 +38,7 @@ def first_existing_col(df, *candidates):
     raise ValueError(f"Missing columns. Tried {candidates}. Sample cols: {list(cols)[:50]}")
 
 dbm_src = spark.table("dm_ib.digital_banking_master")
-
-# IMPORTANT: repo uses relt_ibn as the IBN key
-ibn_col = first_existing_col(dbm_src, "relt_ibn", "ibn")
+ibn_col = first_existing_col(dbm_src, "relt_ibn", "ibn")  # <-- IMPORTANT
 
 dbm = (
     dbm_src.alias("dbm")
@@ -41,11 +54,7 @@ dbm = (
     .where(F.col("reltibn").isNotNull() & (F.length(F.col("reltibn")) > 0))
 )
 
-# -------------------------
-# Dig_Customer CTE (repo)
-# group by month_dt, reltibn, rcif_customer_nbr
-# take max logins + max ods date
-# -------------------------
+# Dig_Customer CTE (repo): group by month_dt, reltibn, rcif_customer_nbr
 dig_customer = (
     dbm.groupBy("month_dt", "reltibn", "rcif_customer_nbr")
        .agg(
@@ -55,10 +64,6 @@ dig_customer = (
        )
 )
 
-# -------------------------
-# Flags (repo): datediff(c.ods_business_dt, c.lst_login_*) <= 90
-# NOTE: this matches your screenshot exactly
-# -------------------------
 digital = (
     dig_customer
     .withColumn(
@@ -103,51 +108,23 @@ digital = (
     )
     .withColumn("digital_flag", F.lit("Digital User"))
     .select(
-        "month_dt", "ods_business_dt",
-        "reltibn", "rcif_customer_nbr",
-        "mobile_active_flag", "mobile_flag",
-        "olb_active_flag", "olb_flag",
-        "digitally_active_flag", "digital_flag"
+        "month_dt","ods_business_dt","reltibn","rcif_customer_nbr",
+        "mobile_active_flag","mobile_flag",
+        "olb_active_flag","olb_flag",
+        "digitally_active_flag","digital_flag"
     )
 )
 
-# =========================
-# WRITE DIGITAL TABLE ONLY
-# =========================
+# Write
 spark.sql(f"DROP TABLE IF EXISTS {DIG_FQN}")
 digital.write.mode("overwrite").saveAsTable(DIG_FQN)
+print("✅ Created:", DIG_FQN)
 
-print("✅ Created digital table:", DIG_FQN)
-
-# ==========================================================
-# SANITY CHECKS — DO IT THE SAME WAY THE REPORT DOES:
-# use the LATEST month in the table, not the whole 6-month window
-# ==========================================================
+# Sanity: latest month only (matches report behavior)
 latest_month = digital.select(F.max("month_dt").alias("mx")).first()["mx"]
-print("Latest month_dt in digital:", latest_month)
+print("Latest month_dt:", latest_month)
 
-print("DIGITAL active distinct IBN (latest month):")
 digital.filter(
-        (F.col("month_dt") == F.lit(latest_month)) &
-        (F.col("digitally_active_flag") == "Digital Active")
-    ).selectExpr("count(distinct reltibn) as digital_active_ibn").show(truncate=False)
-
-# If you want Wealth Digital RCIF (latest month) using your Wealth table already created as WEALTH_FQN:
-WEALTH_FQN = f"{DB}.wealth_rcif_202507_202512"
-wealth_rcif = spark.table(WEALTH_FQN).select(
-    F.col("rcif_number").cast("string").alias("rcif_number"),
-    F.upper(F.trim(F.col("cust_internet_banking_nbr").cast("string"))).alias("cust_internet_banking_nbr")
-)
-
-print("WEALTH digital RCIF (latest month, using RCIF join like your model expects):")
-wealth_digital_rcif = (
-    wealth_rcif.join(
-        digital.filter(
-            (F.col("month_dt") == F.lit(latest_month)) &
-            (F.col("digitally_active_flag") == "Digital Active")
-        ).select(F.col("rcif_customer_nbr").alias("rcif_number")).dropDuplicates(),
-        on="rcif_number",
-        how="inner"
-    )
-)
-wealth_digital_rcif.selectExpr("count(distinct rcif_number) as wealth_digital_rcif").show(truncate=False)
+    (F.col("month_dt") == F.lit(latest_month)) &
+    (F.col("digitally_active_flag") == "Digital Active")
+).selectExpr("count(distinct reltibn) as digital_active_ibn").show(truncate=False)
