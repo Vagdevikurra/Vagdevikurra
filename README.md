@@ -22,6 +22,11 @@ INV_ACCOUNT_TYPE_CODE = "IP"
 INV_AR_SOURCE_SYSTEM  = "RN"
 INV_CLOSED_ONLY       = "N"
 
+# DIGITAL SNAPSHOT MODE:
+# We want counts to match your expected "as-of" number (3428446), not "active in ANY month".
+# This script uses END_DATE snapshot if available; else it falls back to the latest date in the window.
+DIGITAL_SNAPSHOT_PREFER_END_DATE = True
+
 def get_spark(app_name="wealth_digital_investpath_3tables_202507_202512"):
     spark = (
         SparkSession.builder
@@ -94,8 +99,6 @@ last_date = (
 
 # ==========================================================
 # 1) WEALTH (PW1) — RCIF grain (1 row per rcif_number)
-# OUTPUT columns: business_date, rcif_number, ip_id, cust_internet_banking_nbr,
-#                 business_group, division, accts_cnt
 # ==========================================================
 ind = (
     INVOLVED_PARTY.alias("ind")
@@ -144,12 +147,13 @@ business_group = (
      )
 )
 
+# Row-level wealth set (kept for correct account DISTINCTCOUNT checks)
 w_tmp = (
     pw_join.select(
         F.to_date(F.col("ind.business_date")).alias("business_date"),
         F.col(f"ind.{ip_rcif_col}").cast("string").alias("rcif_number"),
         F.col(f"ind.{ip_id_col}").alias("ip_id"),
-        F.col(f"ind.{ip_ibn_col}").alias("cust_internet_banking_nbr"),
+        F.upper(F.trim(F.col(f"ind.{ip_ibn_col}"))).alias("cust_internet_banking_nbr"),
         business_group.alias("business_group"),
         F.col(f"ar.{ar_seg_col}").alias("seg_code"),
         F.col(f"ar.{ar_src_col}").alias("ar_source_system_code"),
@@ -157,7 +161,7 @@ w_tmp = (
     )
 )
 
-# keep only the segment buckets you use in your PW1 filter
+# Keep only the segment buckets you use in your PW1 filter
 w_tmp = w_tmp.where(
     (F.col("seg_code").isin("IS_CT","IS_IT","REGIS_FC","REGIS","PWM")) |
     (F.col("business_group").isin("Private Wealth","Institutional Services","Investment Services"))
@@ -193,7 +197,7 @@ wealth_rcif = (
             F.col("business_group") == "Private Wealth",
             F.when((F.col("trust_count") > 0) & (F.col("banking_count") > 0), F.lit("Banking & IM&T"))
              .otherwise(
-                F.when((F.col("investment_count")+F.col("trust_count") > 0) & (F.col("banking_count")==0), F.lit("Investments Only"))
+                F.when(((F.col("investment_count")+F.col("trust_count")) > 0) & (F.col("banking_count")==0), F.lit("Investments Only"))
                  .otherwise(F.lit("Banking only"))
              )
         )
@@ -217,70 +221,93 @@ wealth_rcif = (
 )
 
 # ==========================================================
-# 2) DIGITAL — creates flags (your block) using ibn + login dates
-# Grain: (month_dt, ibn, rcif_customer_nbr)
+# 2) DIGITAL — FIXED (AS-OF snapshot, 1 row per IBN)
+# This prevents counting "active in ANY month" which inflates IBN.
 # ==========================================================
-dbm = (
+dbm_raw = (
     spark.table("dm_ib.digital_banking_master").alias("dbm")
     .where((F.to_date("dbm.ods_business_dt") >= start_dt) & (F.to_date("dbm.ods_business_dt") <= end_dt))
     .select(
-        F.trunc(F.to_date("dbm.ods_business_dt"), "MM").alias("month_dt"),
         F.to_date("dbm.ods_business_dt").alias("ods_business_dt"),
         F.upper(F.trim(F.col("dbm.ibn"))).alias("ibn"),
         F.col("dbm.rcif_customer_nbr").cast("string").alias("rcif_customer_nbr"),
-        F.col("dbm.olb_last_login_date").alias("lst_login_olb"),
-        F.col("dbm.mob_last_login_date").alias("lst_login_mob"),
+        F.to_date(F.col("dbm.olb_last_login_date")).alias("lst_login_olb"),
+        F.to_date(F.col("dbm.mob_last_login_date")).alias("lst_login_mob"),
     )
     .where(F.col("ibn").isNotNull() & (F.length(F.col("ibn")) > 0))
 )
 
+# Determine which snapshot date to use
+# Prefer END_DATE if present, else fallback to latest available ods_business_dt in window.
+if DIGITAL_SNAPSHOT_PREFER_END_DATE:
+    end_date_exists = (
+        dbm_raw.where(F.col("ods_business_dt") == F.to_date(F.lit(END_DATE)))
+               .limit(1)
+               .count()
+    )
+    if end_date_exists > 0:
+        digital_snapshot_dt = END_DATE
+    else:
+        digital_snapshot_dt = (
+            dbm_raw.select(F.max("ods_business_dt").alias("mx")).first()["mx"]
+        )
+else:
+    digital_snapshot_dt = (
+        dbm_raw.select(F.max("ods_business_dt").alias("mx")).first()["mx"]
+    )
+
+dbm_snap = dbm_raw.where(F.col("ods_business_dt") == F.to_date(F.lit(digital_snapshot_dt)))
+
+# Dedup safely: 1 row per IBN at snapshot date (choose max login dates; keep an RCIF)
 digital = (
-    dbm.groupBy("month_dt","ibn","rcif_customer_nbr")
-       .agg(
-           F.max("lst_login_olb").alias("lst_login_olb"),
-           F.max("lst_login_mob").alias("lst_login_mob"),
-           F.max("ods_business_dt").alias("ods_business_dt")
-       )
-       .withColumn(
-           "mobile_active_flag",
-           F.when(F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90, F.lit("Mobile Active"))
-            .otherwise(F.lit("Non Mobile Active"))
-       )
-       .withColumn(
-           "mobile_flag",
-           F.when(F.col("lst_login_mob").isNull(), F.lit("Non Mobile User")).otherwise(F.lit("Mobile User"))
-       )
-       .withColumn(
-           "olb_active_flag",
-           F.when(F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90, F.lit("OLB Active"))
-            .otherwise(F.lit("Non OLB Active"))
-       )
-       .withColumn(
-           "olb_flag",
-           F.when(F.col("lst_login_olb").isNull(), F.lit("Non OLB User")).otherwise(F.lit("OLB User"))
-       )
-       .withColumn(
-           "digitally_active_flag",
-           F.when(
-               (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90) |
-               (F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90),
-               F.lit("Digital Active")
-           ).otherwise(F.lit("Non Digital Active"))
-       )
-       .withColumn("digital_flag", F.lit("Digital User"))
-       .select(
-           "month_dt","ods_business_dt","ibn","rcif_customer_nbr",
-           "mobile_active_flag","mobile_flag",
-           "olb_active_flag","olb_flag",
-           "digitally_active_flag","digital_flag"
-       )
+    dbm_snap
+    .groupBy("ibn")
+    .agg(
+        F.max("ods_business_dt").alias("ods_business_dt"),
+        F.max("rcif_customer_nbr").alias("rcif_customer_nbr"),
+        F.max("lst_login_olb").alias("lst_login_olb"),
+        F.max("lst_login_mob").alias("lst_login_mob"),
+    )
+    .withColumn("month_dt", F.trunc(F.col("ods_business_dt"), "MM"))
+    .withColumn(
+        "mobile_active_flag",
+        F.when(F.col("lst_login_mob").isNotNull() & (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90),
+               F.lit("Mobile Active"))
+         .otherwise(F.lit("Non Mobile Active"))
+    )
+    .withColumn(
+        "mobile_flag",
+        F.when(F.col("lst_login_mob").isNull(), F.lit("Non Mobile User")).otherwise(F.lit("Mobile User"))
+    )
+    .withColumn(
+        "olb_active_flag",
+        F.when(F.col("lst_login_olb").isNotNull() & (F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90),
+               F.lit("OLB Active"))
+         .otherwise(F.lit("Non OLB Active"))
+    )
+    .withColumn(
+        "olb_flag",
+        F.when(F.col("lst_login_olb").isNull(), F.lit("Non OLB User")).otherwise(F.lit("OLB User"))
+    )
+    .withColumn(
+        "digitally_active_flag",
+        F.when(
+            (F.col("lst_login_mob").isNotNull() & (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90)) |
+            (F.col("lst_login_olb").isNotNull() & (F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90)),
+            F.lit("Digital Active")
+        ).otherwise(F.lit("Non Digital Active"))
+    )
+    .withColumn("digital_flag", F.lit("Digital User"))
+    .select(
+        "month_dt","ods_business_dt","ibn","rcif_customer_nbr",
+        "mobile_active_flag","mobile_flag",
+        "olb_active_flag","olb_flag",
+        "digitally_active_flag","digital_flag"
+    )
 )
 
 # ==========================================================
-# 3) INVESTPATH — single table (act_cnt + ip_id grain) so all 3 measures work
-# Accounts: DISTINCTCOUNT(act_cnt)
-# Funded: DISTINCTCOUNT(act_cnt) where balance>0
-# Customers: DISTINCTCOUNT(ip_id)
+# 3) INVESTPATH — same logic, unchanged
 # ==========================================================
 inv_ind = (
     INVOLVED_PARTY.alias("ind")
@@ -319,7 +346,6 @@ inv_join = (
     )
 )
 
-# Latest account facts per act_cnt
 acc_facts = (
     inv_join.select(
         F.col(f"ar.{ar_arr_col}").alias("act_cnt"),
@@ -343,17 +369,31 @@ investpath = (
 )
 
 # ==========================================================
-# SANITY CHECKS (should match your expected ranges)
+# SANITY CHECKS — CORRECT (ALL COUNT DISTINCT, NO SUM)
 # ==========================================================
-print("WEALTH RCIF (expect 269148):")
+print(f"\nDIGITAL snapshot date used: {digital_snapshot_dt}\n")
+
+print("WEALTH distinct RCIF (expected ~269148):")
 wealth_rcif.selectExpr("count(distinct rcif_number) as wealth_rcif").show(truncate=False)
 
-print("WEALTH accounts via SUM(accts_cnt) (expect ~303414):")
-wealth_rcif.selectExpr("sum(accts_cnt) as wealth_accounts_sum").show(truncate=False)
+print("WEALTH distinct accounts (expected ~303414):")
+w_tmp.selectExpr("count(distinct arrangement_id) as wealth_accounts_distinct").show(truncate=False)
 
-print("DIGITAL active distinct ibn (month-grain; match slicer logic):")
+print("DIGITAL active distinct IBN (expected ~3428446):")
 digital.filter(F.col("digitally_active_flag")=="Digital Active") \
       .selectExpr("count(distinct ibn) as digital_active_ibn").show(truncate=False)
+
+print("WEALTH digital users (distinct RCIF where Digital Active) — expected ~121933:")
+wealth_digital_rcif = (
+    wealth_rcif.select(F.col("rcif_number").alias("rcif_number")).dropDuplicates()
+    .join(
+        digital.filter(F.col("digitally_active_flag")=="Digital Active")
+               .select(F.col("rcif_customer_nbr").alias("rcif_number")).dropDuplicates(),
+        on="rcif_number",
+        how="inner"
+    )
+)
+wealth_digital_rcif.selectExpr("count(distinct rcif_number) as wealth_digital_rcif").show(truncate=False)
 
 print("INVESTPATH accounts(114), funded(108), customers ip_id(119):")
 investpath.selectExpr(
@@ -374,7 +414,7 @@ wealth_rcif.write.mode("overwrite").saveAsTable(WEALTH_FQN)
 digital.write.mode("overwrite").saveAsTable(DIG_FQN)
 investpath.write.mode("overwrite").saveAsTable(INV_FQN)
 
-print("✅ Created 3 tables:")
+print("\n✅ Created 3 tables:")
 print(WEALTH_FQN)
 print(DIG_FQN)
 print(INV_FQN)
