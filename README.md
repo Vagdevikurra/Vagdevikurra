@@ -13,9 +13,11 @@ WEALTH_FQN = f"{DB}.wealth_rcif_202507_202512"
 DIG_FQN    = f"{DB}.digital_202507_202512"
 INV_FQN    = f"{DB}.investpath_202507_202512"
 
+# Wealth filters (PW1)
 AR_SOURCE_SYSTEM_LIST = ['BI','RN','TR','DA','SV','CC','LS','MG','TM','PC','LO','BW','CS','IC','MA','PF','PR','SD','CM','EL']
 AR_CLOSED_ONLY = "N"
 
+# InvestPath filters
 INV_ACCOUNT_TYPE_CODE = "IP"
 INV_AR_SOURCE_SYSTEM  = "RN"
 INV_CLOSED_ONLY       = "N"
@@ -84,7 +86,7 @@ ar_balance_col  = first_existing_col(ARRANGEMENT, "current_balance_amt", "balanc
 ar_open_col     = first_existing_col(ARRANGEMENT, "open_date", "account_open_date")
 ar_acct_type_col= first_existing_col(ARRANGEMENT, "account_type_code", "acct_type_code")
 
-# last_date inside requested window
+# last_date inside requested window (your pattern)
 last_date = (
     INVOLVED_PARTY
     .where((F.to_date("business_date") >= start_dt) & (F.to_date("business_date") <= end_dt))
@@ -180,7 +182,7 @@ w_agg = (
     )
 )
 
-wealth_rcif = (
+wealth_base = (
     w_agg
     .withColumn(
         "division",
@@ -212,7 +214,7 @@ wealth_rcif = (
 )
 
 # ==========================================================
-# 2) DIGITAL — repo-aligned using relt_ibn
+# 2) DIGITAL — repo-aligned (month grain, uses relt_ibn)
 # ==========================================================
 dbm_src = spark.table("dm_ib.digital_banking_master")
 ibn_col = first_existing_col(dbm_src, "relt_ibn", "ibn")  # MUST use relt_ibn if present
@@ -231,6 +233,7 @@ dbm = (
     .where(F.col("reltibn").isNotNull() & (F.length(F.col("reltibn")) > 0))
 )
 
+# Dig_Customer CTE (repo)
 dig_customer = (
     dbm.groupBy("month_dt", "reltibn", "rcif_customer_nbr")
        .agg(
@@ -242,30 +245,6 @@ dig_customer = (
 
 digital = (
     dig_customer
-    .withColumn(
-        "mobile_active_flag",
-        F.when(
-            F.col("lst_login_mob").isNotNull() &
-            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90),
-            F.lit("Mobile Active")
-        ).otherwise(F.lit("Non Mobile Active"))
-    )
-    .withColumn(
-        "mobile_flag",
-        F.when(F.col("lst_login_mob").isNull(), F.lit("Non Mobile User")).otherwise(F.lit("Mobile User"))
-    )
-    .withColumn(
-        "olb_active_flag",
-        F.when(
-            F.col("lst_login_olb").isNotNull() &
-            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90),
-            F.lit("OLB Active")
-        ).otherwise(F.lit("Non OLB Active"))
-    )
-    .withColumn(
-        "olb_flag",
-        F.when(F.col("lst_login_olb").isNull(), F.lit("Non OLB User")).otherwise(F.lit("OLB User"))
-    )
     .withColumn(
         "digitally_active_flag",
         F.when(
@@ -283,9 +262,44 @@ digital = (
     .withColumn("digital_flag", F.lit("Digital User"))
     .select(
         "month_dt","ods_business_dt","reltibn","rcif_customer_nbr",
-        "mobile_active_flag","mobile_flag",
-        "olb_active_flag","olb_flag",
+        "lst_login_olb","lst_login_mob",
         "digitally_active_flag","digital_flag"
+    )
+)
+
+# ==========================================================
+# FIX: Wealth digital RCIF should be computed using IBN join across ANY month in the window
+# ==========================================================
+# Create a per-IBN summary across the entire window:
+# - enrolled if IBN appears at least once
+# - active if active at least once
+digital_ibn_any = (
+    digital.groupBy("reltibn")
+           .agg(
+               F.lit(1).alias("is_enrolled"),
+               F.max(F.when(F.col("digitally_active_flag") == "Digital Active", F.lit(1)).otherwise(F.lit(0))).alias("is_active")
+           )
+)
+
+wealth_rcif = (
+    wealth_base.alias("rc")
+    .join(
+        digital_ibn_any.alias("d"),
+        (F.col("rc.cust_internet_banking_nbr") == F.col("d.reltibn")),
+        "left"
+    )
+    .withColumn(
+        "digital_flag",
+        F.when(F.col("d.is_enrolled") == 1, F.lit("Digital User")).otherwise(F.lit("Non Digital User"))
+    )
+    .withColumn(
+        "digitally_active_flag",
+        F.when(F.col("d.is_active") == 1, F.lit("Digital Active")).otherwise(F.lit("Non Digital Active"))
+    )
+    .select(
+        "rc.business_date","rc.rcif_number","rc.ip_id","rc.cust_internet_banking_nbr",
+        "rc.business_group","rc.division","rc.accts_cnt",
+        "digital_flag","digitally_active_flag"
     )
 )
 
@@ -353,7 +367,7 @@ investpath = (
 )
 
 # ==========================================================
-# SANITY CHECKS (includes FIXED Wealth Digital RCIF via IBN join)
+# SANITY CHECKS (matching your requirements)
 # ==========================================================
 print("WEALTH distinct RCIF (expect 269148):")
 wealth_rcif.selectExpr("count(distinct rcif_number) as wealth_rcif").show(truncate=False)
@@ -361,6 +375,8 @@ wealth_rcif.selectExpr("count(distinct rcif_number) as wealth_rcif").show(trunca
 print("WEALTH total accounts = SUM(accts_cnt) (expect ~303k):")
 wealth_rcif.selectExpr("sum(accts_cnt) as wealth_accounts_total").show(truncate=False)
 
+# Digital active IBN expectation (3428446):
+# repo logic is month-grain; validate against latest month in the fixed window
 latest_month = digital.select(F.max("month_dt").alias("mx")).first()["mx"]
 print("Latest month_dt in DIGITAL within 07/01–12/31:", latest_month)
 
@@ -370,34 +386,13 @@ digital.filter(
     (F.col("digitally_active_flag") == "Digital Active")
 ).selectExpr("count(distinct reltibn) as digital_active_ibn").show(truncate=False)
 
-# ---- FIX: Wealth Digital RCIF should be based on Wealth IBN (cust_internet_banking_nbr) matching Digital reltibn
-# Build a 1-row-per-reltibn dimension for latest month to avoid dupes
-digital_ibn_dim = (
-    digital.filter(F.col("month_dt") == F.lit(latest_month))
-           .groupBy("reltibn")
-           .agg(
-               F.max(F.when(F.col("digitally_active_flag") == "Digital Active", F.lit(1)).otherwise(F.lit(0))).alias("is_digital_active")
-           )
-)
+print("WEALTH digital RCIF (ENROLLED across ANY month via IBN) expect ~121k:")
+wealth_rcif.filter(F.col("digital_flag") == "Digital User") \
+    .selectExpr("count(distinct rcif_number) as wealth_digital_rcif").show(truncate=False)
 
-wealth_ibn = (
-    wealth_rcif.select(
-        F.col("rcif_number").alias("rcif_number"),
-        F.upper(F.trim(F.col("cust_internet_banking_nbr").cast("string"))).alias("reltibn")
-    )
-    .where(F.col("reltibn").isNotNull() & (F.length(F.col("reltibn")) > 0))
-)
-
-wealth_digital_rcif_active = (
-    wealth_ibn.join(
-        digital_ibn_dim.filter(F.col("is_digital_active") == 1).select("reltibn"),
-        on="reltibn",
-        how="inner"
-    )
-)
-
-print("WEALTH digital RCIF (ACTIVE via IBN, latest month) expect ~121933:")
-wealth_digital_rcif_active.selectExpr("count(distinct rcif_number) as wealth_digital_rcif").show(truncate=False)
+print("WEALTH digital ACTIVE RCIF (ACTIVE across ANY month via IBN):")
+wealth_rcif.filter(F.col("digitally_active_flag") == "Digital Active") \
+    .selectExpr("count(distinct rcif_number) as wealth_digital_active_rcif").show(truncate=False)
 
 print("INVESTPATH accounts=114, funded=108, customers(ip_id)=119:")
 investpath.selectExpr(
