@@ -1,89 +1,378 @@
-You’re getting **100,190** because the code you ran is counting **Digital Active** (login within **90 days**) — that definition is *stricter* and it’s exactly why you keep landing around ~100k.
+from pyspark.sql import SparkSession, functions as F
+from pyspark.sql.window import Window
 
-To get **~121,933**, you need the “middle” definition that sits between:
+# ==========================================================
+# CONFIG
+# ==========================================================
+DB = "dm_ib_dev"
+START_DATE = "2025-07-01"
+END_DATE   = "2025-12-31"
+DROP_AND_RECREATE = True
 
-* **Enrolled** (IBN exists in digital) → you saw **134,868**
-* **Active (≤90 days)** → you saw **100,190**
-* ✅ **Logged-in user (has *any* OLB/Mobile login date present)** → this is typically the ~121k bucket
+WEALTH_FQN = f"{DB}.wealth_rcif_202507_202512"
+DIG_FQN    = f"{DB}.digital_202507_202512"
+INV_FQN    = f"{DB}.investpath_202507_202512"
 
-In your repo, that “digital user” concept is often *not* the 90-day active flag; it’s **whether they’ve ever logged in** (login date not null). That produces a number between enrolled and active — i.e., your **121k**.
+AR_SOURCE_SYSTEM_LIST = ['BI','RN','TR','DA','SV','CC','LS','MG','TM','PC','LO','BW','CS','IC','MA','PF','PR','SD','CM','EL']
+AR_CLOSED_ONLY = "N"
 
-## ✅ Replace your wealth digital RCIF calc with this “121k” logic
+INV_ACCOUNT_TYPE_CODE = "IP"
+INV_AR_SOURCE_SYSTEM  = "RN"
+INV_CLOSED_ONLY       = "N"
 
-This uses the same join key (**IBN**) and the same fixed window (**07/01–12/31**), but flags a wealth customer as “digital” if their IBN has **any** login date (OLB or Mobile) in the window.
-
-Put this right after you build `dig_customer` (it still has `lst_login_olb`, `lst_login_mob`) and after `wealth_base` exists:
-
-```python
-from pyspark.sql import functions as F
-
-# ----------------------------------------------------------
-# 121k logic: Wealth RCIF whose IBN has EVER logged in (OLB or Mobile) in 07/01–12/31
-# (this is NOT the 90-day active definition)
-# ----------------------------------------------------------
-
-# IBN-level "has any login" across the full window (no month filter)
-digital_ibn_has_login_any = (
-    dig_customer
-    .select(
-        F.upper(F.trim(F.col("reltibn").cast("string"))).alias("ibn_key"),
-        F.col("lst_login_olb").alias("lst_login_olb"),
-        F.col("lst_login_mob").alias("lst_login_mob"),
+# ==========================================================
+# Spark
+# ==========================================================
+def get_spark(app_name="wealth_digital_investpath_3tables_202507_202512"):
+    spark = (
+        SparkSession.builder
+        .appName(app_name)
+        .enableHiveSupport()
+        .config("spark.sql.adaptive.enabled", "true")
+        .config("spark.sql.shuffle.partitions", "300")
+        .getOrCreate()
     )
-    .where(F.col("ibn_key").isNotNull() & (F.length(F.col("ibn_key")) > 0))
-    .groupBy("ibn_key")
-    .agg(
-        F.max(
-            F.when(
-                F.col("lst_login_olb").isNotNull() | F.col("lst_login_mob").isNotNull(),
-                F.lit(1)
-            ).otherwise(F.lit(0))
-        ).alias("has_login_any")
-    )
-    .filter(F.col("has_login_any") == 1)
-    .select("ibn_key")
-    .dropDuplicates()
+    spark.sparkContext.setLogLevel("WARN")
+    return spark
+
+spark = get_spark()
+spark.sql(f"USE {DB}")
+
+start_dt = F.to_date(F.lit(START_DATE))
+end_dt   = F.to_date(F.lit(END_DATE))
+
+# ==========================================================
+# Helpers
+# ==========================================================
+def first_existing_col(df, *candidates):
+    cols = set(df.columns)
+    for c in candidates:
+        if c in cols:
+            return c
+    raise ValueError(f"Missing columns. Tried {candidates}. Sample cols: {list(cols)[:50]}")
+
+def T(*candidates):
+    last = None
+    for c in candidates:
+        try:
+            return spark.table(c)
+        except Exception as e:
+            last = e
+    raise last
+
+INVOLVED_PARTY = T("eil.m_involved_party_h", "eil.d_involved_party_h")
+A2I_REL        = T("eil.m_arrangement_to_involved_party_relationship_h", "eil.d_arrangement_to_involved_party_relationship_h")
+ARRANGEMENT    = T("eil.m_arrangement_h", "eil.d_arrangement_h")
+
+ip_deceased_col = first_existing_col(INVOLVED_PARTY, "deceased_ind", "deceased_indicator", "deceased_flag")
+ip_rcif_col     = first_existing_col(INVOLVED_PARTY, "rcif_cust_nbr", "rcif_customer_nbr", "rcif_nbr")
+ip_ibn_col      = first_existing_col(INVOLVED_PARTY, "cust_internet_banking_nbr", "cust_internet_banking_number", "cust_internet_banking_no")
+ip_id_col       = first_existing_col(INVOLVED_PARTY, "involved_party_id", "ip_id")
+
+a2i_ip_col      = first_existing_col(A2I_REL, "involved_party_id", "ip_id")
+a2i_arr_col     = first_existing_col(A2I_REL, "arrangement_id", "act_cnt")
+a2i_arr_src_col = first_existing_col(A2I_REL, "arrangement_source_system_code", "arrangement_source_system_cd", "arrangement_src_system_code")
+a2i_src_col     = first_existing_col(A2I_REL, "source_system_code", "src_system_code")
+
+ar_arr_col      = first_existing_col(ARRANGEMENT, "arrangement_id", "act_cnt")
+ar_src_col      = first_existing_col(ARRANGEMENT, "source_system_code", "src_system_code")
+ar_closed_col   = first_existing_col(ARRANGEMENT, "closed_ind", "closed_indicator", "closed_flag")
+ar_seg_col      = first_existing_col(ARRANGEMENT, "business_service_segment_type_code", "business_service_segment_code", "segment_type_code")
+ar_balance_col  = first_existing_col(ARRANGEMENT, "current_balance_amt", "balance", "current_balance_amount")
+ar_open_col     = first_existing_col(ARRANGEMENT, "open_date", "account_open_date")
+ar_acct_type_col= first_existing_col(ARRANGEMENT, "account_type_code", "acct_type_code")
+
+# last_date in the window
+last_date = (
+    INVOLVED_PARTY
+    .where((F.to_date("business_date") >= start_dt) & (F.to_date("business_date") <= end_dt))
+    .select(F.max(F.to_date("business_date")).alias("last_dt"))
+    .first()["last_dt"]
 )
 
-wealth_keys = (
-    wealth_base
+# ==========================================================
+# 1) WEALTH (build w_tmp row-set, then RCIF aggregation)
+# ==========================================================
+ind = (
+    INVOLVED_PARTY.alias("ind")
+    .where(F.to_date(F.col("ind.business_date")) == F.lit(last_date))
+    .where(F.col("ind.source_system_code") == F.lit("CF"))
+    .where(F.coalesce(F.col(f"ind.{ip_deceased_col}"), F.lit("N")) == F.lit("N"))
+)
+
+a2i = (
+    A2I_REL.alias("a2i")
+    .where(F.to_date(F.col("a2i.business_date")) == F.lit(last_date))
+)
+
+ar = (
+    ARRANGEMENT.alias("ar")
+    .where(F.to_date(F.col("ar.business_date")) == F.lit(last_date))
+    .where(F.col(f"ar.{ar_src_col}").isin(AR_SOURCE_SYSTEM_LIST))
+    .where(F.col(f"ar.{ar_closed_col}") == F.lit(AR_CLOSED_ONLY))
+)
+
+pw_join = (
+    ind.join(
+        a2i,
+        (F.col(f"ind.{ip_id_col}") == F.col(f"a2i.{a2i_ip_col}")) &
+        (F.col("ind.source_system_code") == F.col(f"a2i.{a2i_src_col}")) &
+        (F.col("ind.business_date") == F.col("a2i.business_date")),
+        "inner"
+    )
+    .join(
+        ar,
+        (F.col(f"a2i.{a2i_arr_col}") == F.col(f"ar.{ar_arr_col}")) &
+        (F.col(f"a2i.{a2i_arr_src_col}") == F.col(f"ar.{ar_src_col}")) &
+        (F.col("a2i.business_date") == F.col("ar.business_date")),
+        "inner"
+    )
+)
+
+business_group = (
+    F.when(F.col("ind.private_client_code").isin("039","539","339"), F.lit("Private Wealth"))
+     .when(F.col("ind.private_client_trust_code").isin("239","739"), F.lit("Private Wealth"))
+     .otherwise(
+        F.when(F.col(f"ar.{ar_seg_col}").isin("IS_CT","IS_IT"), F.lit("Institutional Services"))
+         .when(F.col(f"ar.{ar_seg_col}").isin("REGIS_FC","REGIS"), F.lit("Investment Services"))
+         .when(F.col(f"ar.{ar_seg_col}") == F.lit("PWM"), F.lit("Private Wealth"))
+         .otherwise(F.lit("Other"))
+     )
+)
+
+w_tmp = (
+    pw_join.select(
+        F.to_date(F.col("ind.business_date")).alias("business_date"),
+        F.col(f"ind.{ip_rcif_col}").cast("string").alias("rcif_number"),
+        F.col(f"ind.{ip_id_col}").alias("ip_id"),
+        F.upper(F.trim(F.col(f"ind.{ip_ibn_col}").cast("string"))).alias("cust_internet_banking_nbr"),
+        business_group.alias("business_group"),
+        F.col(f"ar.{ar_seg_col}").alias("seg_code"),
+        F.col(f"ar.{ar_src_col}").alias("ar_source_system_code"),
+        F.col(f"ar.{ar_arr_col}").alias("arrangement_id"),
+    )
+    .where(
+        (F.col("seg_code").isin("IS_CT","IS_IT","REGIS_FC","REGIS","PWM")) |
+        (F.col("business_group").isin("Private Wealth","Institutional Services","Investment Services"))
+    )
+)
+
+w_agg = (
+    w_tmp.groupBy("rcif_number")
+    .agg(
+        F.max("business_date").alias("business_date"),
+        F.max("ip_id").alias("ip_id"),
+        F.max("cust_internet_banking_nbr").alias("cust_internet_banking_nbr"),
+        F.max("business_group").alias("business_group"),
+        F.countDistinct("arrangement_id").alias("accts_cnt"),
+    )
+)
+
+wealth_base = w_agg.select(
+    "business_date","rcif_number","ip_id","cust_internet_banking_nbr","business_group","accts_cnt"
+)
+
+# ==========================================================
+# 2) DIGITAL (repo-aligned month grain, uses relt_ibn)
+# ==========================================================
+dbm_src = spark.table("dm_ib.digital_banking_master")
+ibn_col = first_existing_col(dbm_src, "relt_ibn", "ibn")
+
+dbm = (
+    dbm_src.alias("dbm")
+    .where((F.to_date(F.col("dbm.ods_business_dt")) >= start_dt) & (F.to_date(F.col("dbm.ods_business_dt")) <= end_dt))
     .select(
+        F.trunc(F.to_date(F.col("dbm.ods_business_dt")), "MM").alias("month_dt"),
+        F.to_date(F.col("dbm.ods_business_dt")).alias("ods_business_dt"),
+        F.upper(F.trim(F.col(f"dbm.{ibn_col}").cast("string"))).alias("reltibn"),
+        F.col("dbm.rcif_customer_nbr").cast("string").alias("rcif_customer_nbr"),
+        F.to_date(F.col("dbm.olb_last_login_date")).alias("lst_login_olb"),
+        F.to_date(F.col("dbm.mob_last_login_date")).alias("lst_login_mob"),
+    )
+    .where(F.col("reltibn").isNotNull() & (F.length(F.col("reltibn")) > 0))
+)
+
+dig_customer = (
+    dbm.groupBy("month_dt", "reltibn", "rcif_customer_nbr")
+       .agg(
+           F.max("lst_login_olb").alias("lst_login_olb"),
+           F.max("lst_login_mob").alias("lst_login_mob"),
+           F.max("ods_business_dt").alias("ods_business_dt")
+       )
+)
+
+digital = (
+    dig_customer
+    .withColumn(
+        "digitally_active_flag",
+        F.when(
+            (
+                F.col("lst_login_mob").isNotNull() &
+                (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90)
+            ) |
+            (
+                F.col("lst_login_olb").isNotNull() &
+                (F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90)
+            ),
+            F.lit("Digital Active")
+        ).otherwise(F.lit("Non Digital Active"))
+    )
+    .withColumn("digital_flag", F.lit("Digital User"))
+    .select(
+        "month_dt","ods_business_dt","reltibn","rcif_customer_nbr",
+        "digitally_active_flag","digital_flag"
+    )
+)
+
+# ==========================================================
+# ✅ Wealth Digital RCIF (121k) — RCIF.pq behavior (PWRANK=1 + IBN join)
+# ==========================================================
+# 1) Build RCIF↔IBN pairs from w_tmp, rank per RCIF (PWRANK)
+rcif_ibn_pairs = (
+    w_tmp.select(
         F.col("rcif_number").cast("string").alias("rcif_number"),
         F.upper(F.trim(F.col("cust_internet_banking_nbr").cast("string"))).alias("ibn_key")
     )
     .where(F.col("ibn_key").isNotNull() & (F.length(F.col("ibn_key")) > 0))
+    .dropDuplicates(["rcif_number","ibn_key"])
 )
 
-wealth_digital_rcif_121k = wealth_keys.join(digital_ibn_has_login_any, on="ibn_key", how="inner")
+w_rank = Window.partitionBy("rcif_number").orderBy(F.col("ibn_key").asc())
+rcif_primary_ibn = (
+    rcif_ibn_pairs
+    .withColumn("pwrank", F.row_number().over(w_rank))
+    .where(F.col("pwrank") == 1)
+    .drop("pwrank")
+)
 
-# ✅ This should land around your ~121,933
-wealth_digital_rcif_121k.selectExpr(
-    "count(distinct rcif_number) as wealth_digital_rcif"
+# 2) Latest month in the fixed window (repo month-grain)
+latest_month = dig_customer.select(F.max("month_dt").alias("mx")).first()["mx"]
+
+# 3) Enrolled IBN set for latest month
+dig_enrolled_latest = (
+    dig_customer
+    .filter(F.col("month_dt") == F.lit(latest_month))
+    .select(F.upper(F.trim(F.col("reltibn").cast("string"))).alias("ibn_key"))
+    .where(F.col("ibn_key").isNotNull() & (F.length(F.col("ibn_key")) > 0))
+    .dropDuplicates()
+)
+
+# 4) RCIF is Digital User if its primary IBN exists in dig_enrolled_latest
+rcif_digital_flag = (
+    rcif_primary_ibn
+    .join(dig_enrolled_latest.withColumn("is_digital_user", F.lit(1)), on="ibn_key", how="left")
+    .select(
+        "rcif_number",
+        F.when(F.col("is_digital_user") == 1, F.lit("Digital User")).otherwise(F.lit("Non Digital User")).alias("digital_flag")
+    )
+)
+
+# 5) Attach digital_flag back onto wealth_base (no column collisions)
+wealth_rcif = (
+    wealth_base.alias("w")
+    .join(rcif_digital_flag.alias("f"), on="rcif_number", how="left")
+    .withColumn("digital_flag", F.coalesce(F.col("digital_flag"), F.lit("Non Digital User")))
+)
+
+# ==========================================================
+# 3) INVESTPATH (unchanged from your version)
+# ==========================================================
+inv_ind = (
+    INVOLVED_PARTY.alias("ind")
+    .where(F.to_date(F.col("ind.business_date")) == F.lit(last_date))
+    .where(F.col("ind.source_system_code") == F.lit("CF"))
+    .where(F.coalesce(F.col(f"ind.{ip_deceased_col}"), F.lit("N")) == F.lit("N"))
+)
+
+inv_a2i = (
+    A2I_REL.alias("a2i")
+    .where(F.to_date(F.col("a2i.business_date")) == F.lit(last_date))
+)
+
+inv_ar = (
+    ARRANGEMENT.alias("ar")
+    .where(F.to_date(F.col("ar.business_date")) == F.lit(last_date))
+    .where(F.col(f"ar.{ar_closed_col}") == F.lit(INV_CLOSED_ONLY))
+    .where(F.col(f"ar.{ar_acct_type_col}") == F.lit(INV_ACCOUNT_TYPE_CODE))
+    .where(F.col(f"ar.{ar_src_col}") == F.lit(INV_AR_SOURCE_SYSTEM))
+)
+
+inv_join = (
+    inv_ind.join(
+        inv_a2i,
+        (F.col(f"ind.{ip_id_col}") == F.col(f"a2i.{a2i_ip_col}")) &
+        (F.col("ind.business_date") == F.col("a2i.business_date")) &
+        (F.col("ind.source_system_code") == F.col(f"a2i.{a2i_src_col}")),
+        "inner"
+    )
+    .join(
+        inv_ar,
+        (F.col(f"a2i.{a2i_arr_col}") == F.col(f"ar.{ar_arr_col}")) &
+        (F.col(f"a2i.{a2i_arr_src_col}") == F.col(f"ar.{ar_src_col}")) &
+        (F.col("a2i.business_date") == F.col("ar.business_date")),
+        "inner"
+    )
+)
+
+acc_facts = (
+    inv_join.select(
+        F.col(f"ar.{ar_arr_col}").alias("act_cnt"),
+        F.col(f"ar.{ar_balance_col}").alias("balance"),
+        F.to_date(F.col("ar.business_date")).alias("business_date")
+    )
+)
+
+w_acc = Window.partitionBy("act_cnt").orderBy(F.col("business_date").desc())
+acc_facts_latest = acc_facts.withColumn("rn", F.row_number().over(w_acc)).where("rn=1").drop("rn")
+
+investpath = (
+    inv_join.select(
+        F.col(f"ar.{ar_arr_col}").alias("act_cnt"),
+        F.col(f"ind.{ip_rcif_col}").cast("string").alias("rcif_number"),
+        F.col(f"a2i.{a2i_ip_col}").alias("ip_id")
+    )
+    .dropDuplicates(["act_cnt","ip_id"])
+    .join(acc_facts_latest, "act_cnt", "left")
+    .select("business_date","rcif_number","ip_id","act_cnt","balance")
+)
+
+# ==========================================================
+# SANITY CHECKS
+# ==========================================================
+print("WEALTH distinct RCIF (expect 269148):")
+wealth_rcif.selectExpr("count(distinct rcif_number) as wealth_rcif").show(truncate=False)
+
+print("WEALTH total accounts = SUM(accts_cnt) (expect ~303k):")
+wealth_rcif.selectExpr("sum(accts_cnt) as wealth_accounts_total").show(truncate=False)
+
+print("DIGITAL active distinct reltibn (latest month) expect 3428446:")
+digital.filter((F.col("month_dt") == F.lit(latest_month)) & (F.col("digitally_active_flag") == "Digital Active")) \
+       .selectExpr("count(distinct reltibn) as digital_active_ibn").show(truncate=False)
+
+print("WEALTH digital RCIF (Digital User via PWRANK=1, latest month) expect ~121933:")
+wealth_rcif.filter(F.col("digital_flag") == "Digital User") \
+          .selectExpr("count(distinct rcif_number) as wealth_digital_rcif").show(truncate=False)
+
+print("INVESTPATH accounts(114), funded(108), customers(ip_id)(119):")
+investpath.selectExpr(
+    "count(distinct act_cnt) as invest_accounts",
+    "count(distinct case when balance > 0 then act_cnt end) as invest_accounts_funded",
+    "count(distinct ip_id) as invest_customers_ip"
 ).show(truncate=False)
-```
 
-### Quick sanity proof (so you can see why 100k happens)
+# ==========================================================
+# WRITE TABLES (3 only)
+# ==========================================================
+if DROP_AND_RECREATE:
+    spark.sql(f"DROP TABLE IF EXISTS {WEALTH_FQN}")
+    spark.sql(f"DROP TABLE IF EXISTS {DIG_FQN}")
+    spark.sql(f"DROP TABLE IF EXISTS {INV_FQN}")
 
-Run these three counts back-to-back:
+wealth_rcif.write.mode("overwrite").saveAsTable(WEALTH_FQN)
+digital.write.mode("overwrite").saveAsTable(DIG_FQN)
+investpath.write.mode("overwrite").saveAsTable(INV_FQN)
 
-```python
-# enrolled (exists in digital)
-dig_enrolled_any = dig_customer.select(F.upper(F.trim(F.col("reltibn").cast("string"))).alias("ibn_key")).dropDuplicates()
-print("ENROLLED IBN any month:")
-dig_enrolled_any.selectExpr("count(*) as enrolled_ibn").show()
-
-# active (<=90 days) — your 100k wealth result comes from this stricter bucket
-dig_active_any = digital.filter(F.col("digitally_active_flag")=="Digital Active") \
-                        .select(F.upper(F.trim(F.col("reltibn").cast("string"))).alias("ibn_key")) \
-                        .dropDuplicates()
-print("ACTIVE IBN any month:")
-dig_active_any.selectExpr("count(*) as active_ibn").show()
-
-# logged-in any time (this is the middle bucket that typically matches ~121k wealth RCIF)
-print("HAS_LOGIN IBN any month:")
-digital_ibn_has_login_any.selectExpr("count(*) as has_login_ibn").show()
-```
-
----
-
-If you want, I can merge this into the **full 3-table script** you’re running, but the snippet above is the **exact fix** that moves you from **100k** to the **~121k** bucket without changing your date window or wealth logic.
+print("✅ Created 3 tables:")
+print(WEALTH_FQN)
+print(DIG_FQN)
+print(INV_FQN)
