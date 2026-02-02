@@ -95,7 +95,7 @@ last_date = (
 )
 
 # ==========================================================
-# 1) WEALTH (RCIF grain) — repo style
+# 1) WEALTH (RCIF grain) — unchanged logic
 # ==========================================================
 ind = (
     INVOLVED_PARTY.alias("ind")
@@ -214,7 +214,7 @@ wealth_base = (
 )
 
 # ==========================================================
-# 2) DIGITAL — repo-aligned (month grain, uses relt_ibn)
+# 2) DIGITAL (repo-aligned month grain) — unchanged
 # ==========================================================
 dbm_src = spark.table("dm_ib.digital_banking_master")
 ibn_col = first_existing_col(dbm_src, "relt_ibn", "ibn")  # MUST use relt_ibn if present
@@ -233,7 +233,6 @@ dbm = (
     .where(F.col("reltibn").isNotNull() & (F.length(F.col("reltibn")) > 0))
 )
 
-# Dig_Customer CTE (repo)
 dig_customer = (
     dbm.groupBy("month_dt", "reltibn", "rcif_customer_nbr")
        .agg(
@@ -262,49 +261,39 @@ digital = (
     .withColumn("digital_flag", F.lit("Digital User"))
     .select(
         "month_dt","ods_business_dt","reltibn","rcif_customer_nbr",
-        "lst_login_olb","lst_login_mob",
         "digitally_active_flag","digital_flag"
     )
 )
 
 # ==========================================================
-# FIX: Wealth digital RCIF should be computed using IBN join across ANY month in the window
+# FINAL FIX (121k): Wealth Digital ACTIVE RCIF = active in ANY month (via IBN join)
+# - enrolled_any = IBN appears at least once in window
+# - active_any   = IBN is Digital Active at least once in window
 # ==========================================================
-# Create a per-IBN summary across the entire window:
-# - enrolled if IBN appears at least once
-# - active if active at least once
 digital_ibn_any = (
     digital.groupBy("reltibn")
            .agg(
-               F.lit(1).alias("is_enrolled"),
-               F.max(F.when(F.col("digitally_active_flag") == "Digital Active", F.lit(1)).otherwise(F.lit(0))).alias("is_active")
+               F.lit(1).alias("is_enrolled_any"),
+               F.max(F.when(F.col("digitally_active_flag") == "Digital Active", F.lit(1)).otherwise(F.lit(0))).alias("is_active_any")
            )
 )
 
 wealth_rcif = (
-    wealth_base.alias("rc")
-    .join(
-        digital_ibn_any.alias("d"),
-        (F.col("rc.cust_internet_banking_nbr") == F.col("d.reltibn")),
-        "left"
-    )
-    .withColumn(
-        "digital_flag",
-        F.when(F.col("d.is_enrolled") == 1, F.lit("Digital User")).otherwise(F.lit("Non Digital User"))
-    )
-    .withColumn(
-        "digitally_active_flag",
-        F.when(F.col("d.is_active") == 1, F.lit("Digital Active")).otherwise(F.lit("Non Digital Active"))
-    )
+    wealth_base.alias("w")
+    .join(digital_ibn_any.alias("d"), F.col("w.cust_internet_banking_nbr") == F.col("d.reltibn"), "left")
+    .withColumn("digital_flag",
+                F.when(F.col("d.is_enrolled_any") == 1, F.lit("Digital User")).otherwise(F.lit("Non Digital User")))
+    .withColumn("digitally_active_flag",
+                F.when(F.col("d.is_active_any") == 1, F.lit("Digital Active")).otherwise(F.lit("Non Digital Active")))
     .select(
-        "rc.business_date","rc.rcif_number","rc.ip_id","rc.cust_internet_banking_nbr",
-        "rc.business_group","rc.division","rc.accts_cnt",
+        "w.business_date","w.rcif_number","w.ip_id","w.cust_internet_banking_nbr",
+        "w.business_group","w.division","w.accts_cnt",
         "digital_flag","digitally_active_flag"
     )
 )
 
 # ==========================================================
-# 3) INVESTPATH (unchanged)
+# 3) INVESTPATH — unchanged
 # ==========================================================
 inv_ind = (
     INVOLVED_PARTY.alias("ind")
@@ -367,7 +356,7 @@ investpath = (
 )
 
 # ==========================================================
-# SANITY CHECKS (matching your requirements)
+# SANITY CHECKS (your targets)
 # ==========================================================
 print("WEALTH distinct RCIF (expect 269148):")
 wealth_rcif.selectExpr("count(distinct rcif_number) as wealth_rcif").show(truncate=False)
@@ -375,8 +364,6 @@ wealth_rcif.selectExpr("count(distinct rcif_number) as wealth_rcif").show(trunca
 print("WEALTH total accounts = SUM(accts_cnt) (expect ~303k):")
 wealth_rcif.selectExpr("sum(accts_cnt) as wealth_accounts_total").show(truncate=False)
 
-# Digital active IBN expectation (3428446):
-# repo logic is month-grain; validate against latest month in the fixed window
 latest_month = digital.select(F.max("month_dt").alias("mx")).first()["mx"]
 print("Latest month_dt in DIGITAL within 07/01–12/31:", latest_month)
 
@@ -386,11 +373,7 @@ digital.filter(
     (F.col("digitally_active_flag") == "Digital Active")
 ).selectExpr("count(distinct reltibn) as digital_active_ibn").show(truncate=False)
 
-print("WEALTH digital RCIF (ENROLLED across ANY month via IBN) expect ~121k:")
-wealth_rcif.filter(F.col("digital_flag") == "Digital User") \
-    .selectExpr("count(distinct rcif_number) as wealth_digital_rcif").show(truncate=False)
-
-print("WEALTH digital ACTIVE RCIF (ACTIVE across ANY month via IBN):")
+print("WEALTH digital ACTIVE RCIF (active ANY month via IBN) expect ~121k:")
 wealth_rcif.filter(F.col("digitally_active_flag") == "Digital Active") \
     .selectExpr("count(distinct rcif_number) as wealth_digital_active_rcif").show(truncate=False)
 
