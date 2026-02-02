@@ -1,33 +1,29 @@
-from pyspark.sql import SparkSession, functions as F
+from pyspark.sql import SparkSession, functions as F, Window
 
 # ==========================================================
 # CONFIG
 # ==========================================================
 DB = "dm_ib_dev"
 
-# >>> CHANGE ONLY THESE TWO <<<
 START_DATE = "2025-08-01"
-END_DATE   = "2026-01-01"   # if this is not month-end, code will exclude partial month from "latest month"
-# >>> CHANGE ONLY THESE TWO <<<
+END_DATE   = "2026-01-31"   # <-- use month end since you said 08/01–01/31
 
 DROP_AND_RECREATE = True
 
 WIC_FQN = f"{DB}.wic2"   # wealth RCIF DIM (1 row per RCIF)
 WIA_FQN = f"{DB}.wia2"   # wealth accounts FACT (arrangement grain)
-WID_FQN = f"{DB}.wid2"   # digital monthly FACT (month-end)
+WID_FQN = f"{DB}.wid2"   # digital SNAPSHOT FACT (max ods_business_dt in window)
 
-# Wealth filters
 AR_SOURCE_SYSTEM_LIST = ['BI','RN','TR','DA','SV','CC','LS','MG','TM','PC','LO','BW','CS','IC','MA','PF','PR','SD','CM','EL']
 AR_CLOSED_ONLY = "N"
 
-# Wealth population filter (this is what keeps Wealth Users around 269k)
 WEALTH_SEG_KEEP = ["IS_CT","IS_IT","REGIS_FC","REGIS","PWM"]
 WEALTH_BG_KEEP  = ["Private Wealth","Institutional Services","Investment Services"]
 
 # ==========================================================
 # Spark
 # ==========================================================
-def get_spark(app_name="final_3table_core_fixed"):
+def get_spark(app_name="final_3table_snapshot_fix"):
     spark = (
         SparkSession.builder
         .appName(app_name)
@@ -53,7 +49,7 @@ def first_existing_col(df, *candidates):
     for c in candidates:
         if c in cols:
             return c
-    raise ValueError(f"Missing columns. Tried {candidates}. Sample cols: {list(cols)[:60]}")
+    raise ValueError(f"Missing columns. Tried {candidates}. Sample cols: {list(cols)[:80]}")
 
 def maybe_col(df, *candidates):
     cols = set(df.columns)
@@ -77,6 +73,7 @@ def T(*candidates):
 INVOLVED_PARTY = T("eil.m_involved_party_h", "eil.d_involved_party_h")
 A2I_REL        = T("eil.m_arrangement_to_involved_party_relationship_h", "eil.d_arrangement_to_involved_party_relationship_h")
 ARRANGEMENT    = T("eil.m_arrangement_h", "eil.d_arrangement_h")
+ADDRESS        = T("eil.m_involved_party_address_h", "eil.d_involved_party_address_h")
 DBM            = spark.table("dm_ib.digital_banking_master")
 
 # EIL column guardrails
@@ -97,6 +94,9 @@ ar_seg_col      = first_existing_col(ARRANGEMENT, "business_service_segment_type
 ar_open_col     = first_existing_col(ARRANGEMENT, "open_date", "account_open_date")
 ar_balance_col  = first_existing_col(ARRANGEMENT, "current_balance_amt", "balance", "current_balance_amount")
 
+addr_state_col  = first_existing_col(ADDRESS, "state_name", "state", "state_cd", "state_code")
+addr_ip_col     = first_existing_col(ADDRESS, "involved_party_id", "ip_id")
+
 # Wealth snapshot date = last business_date in the window
 last_date = (
     INVOLVED_PARTY
@@ -106,46 +106,44 @@ last_date = (
 )
 
 # ==========================================================
-# 1) DIGITAL FACT (wid2) — month-end grain + flags + state_name
-#    CRITICAL FIX: exclude partial-month month_dt beyond END_DATE
+# 1) DIGITAL SNAPSHOT FACT (wid2)
+#    Match your SQL: ods_business_dt = max(ods_business_dt) within the window
 # ==========================================================
 ibn_col  = first_existing_col(DBM, "relt_ibn", "ibn")
-rcif_col = first_existing_col(DBM, "rcif_customer_nbr", "rcif_cust_nbr", "rcif_nbr")
+rcif_col = maybe_col(DBM, "rcif_customer_nbr", "rcif_cust_nbr", "rcif_nbr")  # optional
 olb_col  = first_existing_col(DBM, "olb_last_login_date", "olb_last_login_dt")
 mob_col  = first_existing_col(DBM, "mob_last_login_date", "mob_last_login_dt")
-
 state_col = maybe_col(DBM, "state_name", "state", "state_cd", "state_code", "customer_state", "mailing_state")
 
-digital_raw = (
+digital_windowed = (
     DBM
     .where((F.to_date("ods_business_dt") >= start_dt) & (F.to_date("ods_business_dt") <= end_dt))
     .select(
-        F.last_day(F.to_date("ods_business_dt")).alias("month_dt"),  # month-end bucket
         F.to_date("ods_business_dt").alias("ods_business_dt"),
         F.upper(F.trim(F.col(ibn_col).cast("string"))).alias("reltibn"),
-        F.col(rcif_col).cast("string").alias("rcif_customer_nbr"),
+        (F.col(rcif_col).cast("string").alias("rcif_customer_nbr") if rcif_col else F.lit(None).cast("string").alias("rcif_customer_nbr")),
         F.to_date(F.col(olb_col)).alias("olb_last_login_dt"),
         F.to_date(F.col(mob_col)).alias("mob_last_login_dt"),
         (F.col(state_col).cast("string").alias("state_name") if state_col else F.lit(None).cast("string").alias("state_name"))
     )
     .where(F.col("reltibn").isNotNull() & (F.length("reltibn") > 0))
-    # ✅ CORE FIX: If END_DATE is mid-month (like 2026-01-01), do NOT allow month_dt (Jan31) to be included
-    .where(F.last_day(F.to_date("ods_business_dt")) <= end_dt)
 )
 
+snapshot_dt = digital_windowed.select(F.max("ods_business_dt").alias("mx")).first()["mx"]
+
+# One row per IBN at snapshot (keep max login fields)
 wid2 = (
-    digital_raw
-    .groupBy("month_dt", "reltibn", "rcif_customer_nbr")
+    digital_windowed
+    .where(F.col("ods_business_dt") == F.lit(snapshot_dt))
+    .groupBy("ods_business_dt", "reltibn")
     .agg(
-        F.max("ods_business_dt").alias("ods_business_dt"),
+        F.max("rcif_customer_nbr").alias("rcif_customer_nbr"),
         F.max("olb_last_login_dt").alias("olb_last_login_dt"),
         F.max("mob_last_login_dt").alias("mob_last_login_dt"),
         F.max("state_name").alias("state_name")
     )
-    # user flags
     .withColumn("olb_flag",    F.when(F.col("olb_last_login_dt").isNotNull(), F.lit("OLB User")).otherwise(F.lit("Non OLB User")))
     .withColumn("mobile_flag", F.when(F.col("mob_last_login_dt").isNotNull(), F.lit("Mobile User")).otherwise(F.lit("Non Mobile User")))
-    # activity flags (90 days)
     .withColumn(
         "olb_active_flag",
         F.when(
@@ -172,30 +170,29 @@ wid2 = (
     .withColumn("digital_flag", F.lit("Digital User"))
 )
 
-latest_month = wid2.select(F.max("month_dt").alias("mx")).first()["mx"]
-
-# latest-month RCIF -> state mapping
-rcif_state_latest = (
-    wid2.where(F.col("month_dt") == F.lit(latest_month))
-        .select(F.col("rcif_customer_nbr").alias("rcif_number"), F.col("state_name"))
-        .dropDuplicates(["rcif_number"])
-)
-
-# latest-month active RCIF list (for ~121k enrollment)
-active_rcif_latest = (
-    wid2.where((F.col("month_dt") == F.lit(latest_month)) & (F.col("digitally_active_flag") == "Digital Active"))
-        .select(F.col("rcif_customer_nbr").alias("rcif_number"))
+active_ibn_snapshot = (
+    wid2.where(F.col("digitally_active_flag") == "Digital Active")
+        .select("reltibn")
         .dropDuplicates()
 )
 
 # ==========================================================
-# 2) WEALTH ACCOUNTS FACT (wia2) — arrangement grain (correct accounts)
+# 2) WEALTH ACCOUNTS FACT (wia2) — arrangement grain
 # ==========================================================
 ind = (
     INVOLVED_PARTY.alias("ind")
     .where(F.to_date("ind.business_date") == F.lit(last_date))
     .where(F.col("ind.source_system_code") == F.lit("CF"))
     .where(F.coalesce(F.col(f"ind.{ip_deceased_col}"), F.lit("N")) == F.lit("N"))
+)
+
+addr = (
+    ADDRESS.alias("addr")
+    .where(F.to_date("addr.business_date") == F.lit(last_date))
+    .select(
+        F.col(f"addr.{addr_ip_col}").alias("ip_id_addr"),
+        F.col(f"addr.{addr_state_col}").cast("string").alias("state_name")
+    )
 )
 
 a2i = A2I_REL.alias("a2i").where(F.to_date("a2i.business_date") == F.lit(last_date))
@@ -222,6 +219,11 @@ pw_join = (
         (F.col("a2i.business_date") == F.col("ar.business_date")),
         "inner"
     )
+    .join(
+        addr,
+        F.col(f"ind.{ip_id_col}") == F.col("ip_id_addr"),
+        "left"
+    )
 )
 
 business_group_expr = (
@@ -241,6 +243,7 @@ wia2_raw = (
         F.col(f"ind.{ip_rcif_col}").cast("string").alias("rcif_number"),
         F.col(f"ind.{ip_id_col}").alias("ip_id"),
         F.upper(F.trim(F.col(f"ind.{ip_ibn_col}").cast("string"))).alias("customer_internet_banking_number"),
+        F.col("state_name").alias("state_name"),
         business_group_expr.alias("business_group"),
         F.col(f"ar.{ar_seg_col}").alias("seg_code"),
         F.col(f"ar.{ar_src_col}").alias("ar_source_system_code"),
@@ -251,7 +254,7 @@ wia2_raw = (
     .dropna(subset=["rcif_number", "arrangement_id"])
 )
 
-# ✅ Apply wealth population filter (core to 269k / 303k)
+# Wealth population filter (keeps Wealth Users ~269k)
 wia2_filtered = (
     wia2_raw.where(
         (F.col("seg_code").isin(WEALTH_SEG_KEEP)) |
@@ -259,11 +262,10 @@ wia2_filtered = (
     )
 )
 
-# ✅ De-dupe at arrangement_id + rcif_number
+# De-dupe at arrangement_id + rcif_number
 wia2 = (
     wia2_filtered
     .dropDuplicates(["arrangement_id", "rcif_number"])
-    .join(rcif_state_latest, on="rcif_number", how="left")
     .select(
         "business_date","rcif_number","ip_id","arrangement_id","open_date","balance",
         "seg_code","ar_source_system_code",
@@ -272,7 +274,7 @@ wia2 = (
 )
 
 # ==========================================================
-# 3) WEALTH RCIF DIM (wic2) — 1 row per RCIF + division + accts_cnt + enrollment flag
+# 3) WEALTH RCIF DIM (wic2) — enroll via IBN ∈ active IBN snapshot
 # ==========================================================
 wic_counts = (
     wia2.groupBy("rcif_number")
@@ -297,7 +299,7 @@ wic_counts = (
         )
 )
 
-wic2 = (
+wic2_base = (
     wic_counts
     .withColumn(
         "division",
@@ -322,12 +324,21 @@ wic2 = (
              .otherwise(F.lit("Corporate & Institutional Trust"))
         )
     )
-    .join(active_rcif_latest.withColumn("is_active_latest", F.lit(1)), on="rcif_number", how="left")
+)
+
+# Enrollment flag: Wealth IBN is in active digital IBN snapshot
+wic2 = (
+    wic2_base
+    .join(
+        active_ibn_snapshot.withColumnRenamed("reltibn", "ibn_active").withColumn("is_active_latest", F.lit(1)),
+        F.upper(F.trim(F.col("customer_internet_banking_number"))) == F.col("ibn_active"),
+        "left"
+    )
     .withColumn(
         "digital_enrollment_flag_latest_month",
         F.when(F.col("is_active_latest") == 1, F.lit("Digital Active")).otherwise(F.lit("Non Digital Active"))
     )
-    .drop("is_active_latest")
+    .drop("ibn_active", "is_active_latest")
     .select(
         "business_date",
         "rcif_number",
@@ -343,9 +354,9 @@ wic2 = (
 )
 
 # ==========================================================
-# SANITY OUTPUTS (these should now align to the snapshot definition)
+# SANITY OUTPUTS
 # ==========================================================
-print("Latest month used for snapshot:", latest_month)
+print("Digital snapshot ods_business_dt used:", snapshot_dt)
 
 print("Wealth Users (expect ~269148):")
 wic2.selectExpr("count(distinct rcif_number) as wealth_users").show(truncate=False)
@@ -353,9 +364,9 @@ wic2.selectExpr("count(distinct rcif_number) as wealth_users").show(truncate=Fal
 print("Accounts Total (expect ~303k):")
 wia2.selectExpr("count(distinct arrangement_id) as accounts_total").show(truncate=False)
 
-print("Top Digital Active IBN latest month (expect ~3427877):")
-wid2.where((F.col("month_dt")==F.lit(latest_month)) & (F.col("digitally_active_flag")=="Digital Active")) \
-   .selectExpr("count(distinct reltibn) as digital_active_ibn_latest").show(truncate=False)
+print("Top Digital Active IBN on snapshot day (expect ~3427877):")
+wid2.where(F.col("digitally_active_flag")=="Digital Active") \
+   .selectExpr("count(distinct reltibn) as digital_active_ibn_snapshot").show(truncate=False)
 
 print("Digital Enrollments Wealth (expect ~121k):")
 wic2.where(F.col("digital_enrollment_flag_latest_month")=="Digital Active") \
