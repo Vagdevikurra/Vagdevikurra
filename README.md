@@ -95,7 +95,7 @@ last_date = (
 )
 
 # ==========================================================
-# 1) WEALTH (RCIF grain) — unchanged logic
+# 1) WEALTH (RCIF grain) — repo style (unchanged)
 # ==========================================================
 ind = (
     INVOLVED_PARTY.alias("ind")
@@ -214,7 +214,7 @@ wealth_base = (
 )
 
 # ==========================================================
-# 2) DIGITAL (repo-aligned month grain) — unchanged
+# 2) DIGITAL — repo-aligned month grain using relt_ibn (unchanged)
 # ==========================================================
 dbm_src = spark.table("dm_ib.digital_banking_master")
 ibn_col = first_existing_col(dbm_src, "relt_ibn", "ibn")  # MUST use relt_ibn if present
@@ -266,34 +266,34 @@ digital = (
 )
 
 # ==========================================================
-# FINAL FIX (121k): Wealth Digital ACTIVE RCIF = active in ANY month (via IBN join)
-# - enrolled_any = IBN appears at least once in window
-# - active_any   = IBN is Digital Active at least once in window
+# ✅ FINAL 121k FIX (Wealth Digital RCIF = ENROLLED, latest month, via IBN join)
+# Repo join key: wealth.cust_internet_banking_nbr = dig_customer.reltibn
+# Digital User / enrolled = reltibn exists in Dig_Customer for latest month
 # ==========================================================
-digital_ibn_any = (
-    digital.groupBy("reltibn")
-           .agg(
-               F.lit(1).alias("is_enrolled_any"),
-               F.max(F.when(F.col("digitally_active_flag") == "Digital Active", F.lit(1)).otherwise(F.lit(0))).alias("is_active_any")
-           )
+latest_month = dig_customer.select(F.max("month_dt").alias("mx")).first()["mx"]
+print("Latest month_dt within 07/01–12/31:", latest_month)
+
+dig_enrolled_latest = (
+    dig_customer
+    .filter(F.col("month_dt") == F.lit(latest_month))
+    .select(F.upper(F.trim(F.col("reltibn").cast("string"))).alias("cust_internet_banking_nbr"))
+    .where(F.col("cust_internet_banking_nbr").isNotNull() & (F.length("cust_internet_banking_nbr") > 0))
+    .dropDuplicates()
 )
 
 wealth_rcif = (
-    wealth_base.alias("w")
-    .join(digital_ibn_any.alias("d"), F.col("w.cust_internet_banking_nbr") == F.col("d.reltibn"), "left")
-    .withColumn("digital_flag",
-                F.when(F.col("d.is_enrolled_any") == 1, F.lit("Digital User")).otherwise(F.lit("Non Digital User")))
-    .withColumn("digitally_active_flag",
-                F.when(F.col("d.is_active_any") == 1, F.lit("Digital Active")).otherwise(F.lit("Non Digital Active")))
-    .select(
-        "w.business_date","w.rcif_number","w.ip_id","w.cust_internet_banking_nbr",
-        "w.business_group","w.division","w.accts_cnt",
-        "digital_flag","digitally_active_flag"
+    wealth_base
+    .withColumn("cust_internet_banking_nbr", F.upper(F.trim(F.col("cust_internet_banking_nbr").cast("string"))))
+    .join(dig_enrolled_latest.withColumn("is_digital_user", F.lit(1)), on="cust_internet_banking_nbr", how="left")
+    .withColumn(
+        "digital_flag",
+        F.when(F.col("is_digital_user") == 1, F.lit("Digital User")).otherwise(F.lit("Non Digital User"))
     )
+    .drop("is_digital_user")
 )
 
 # ==========================================================
-# 3) INVESTPATH — unchanged
+# 3) INVESTPATH (unchanged)
 # ==========================================================
 inv_ind = (
     INVOLVED_PARTY.alias("ind")
@@ -364,18 +364,15 @@ wealth_rcif.selectExpr("count(distinct rcif_number) as wealth_rcif").show(trunca
 print("WEALTH total accounts = SUM(accts_cnt) (expect ~303k):")
 wealth_rcif.selectExpr("sum(accts_cnt) as wealth_accounts_total").show(truncate=False)
 
-latest_month = digital.select(F.max("month_dt").alias("mx")).first()["mx"]
-print("Latest month_dt in DIGITAL within 07/01–12/31:", latest_month)
-
 print("DIGITAL active distinct reltibn (latest month) expect 3428446:")
 digital.filter(
     (F.col("month_dt") == F.lit(latest_month)) &
     (F.col("digitally_active_flag") == "Digital Active")
 ).selectExpr("count(distinct reltibn) as digital_active_ibn").show(truncate=False)
 
-print("WEALTH digital ACTIVE RCIF (active ANY month via IBN) expect ~121k:")
-wealth_rcif.filter(F.col("digitally_active_flag") == "Digital Active") \
-    .selectExpr("count(distinct rcif_number) as wealth_digital_active_rcif").show(truncate=False)
+print("WEALTH digital RCIF (Digital User / ENROLLED, latest month) expect ~121k:")
+wealth_rcif.filter(F.col("digital_flag") == "Digital User") \
+    .selectExpr("count(distinct rcif_number) as wealth_digital_rcif").show(truncate=False)
 
 print("INVESTPATH accounts=114, funded=108, customers(ip_id)=119:")
 investpath.selectExpr(
