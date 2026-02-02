@@ -1,12 +1,15 @@
 from pyspark.sql import SparkSession, functions as F
-from pyspark.sql.window import Window
 
 # ==========================================================
 # CONFIG
 # ==========================================================
 DB = "dm_ib_dev"
-START_DATE = "2025-07-01"
-END_DATE   = "2025-12-31"
+
+# >>> CHANGE ONLY THESE TWO <<<
+START_DATE = "2025-08-01"
+END_DATE   = "2026-01-01"   # if this is not month-end, code will exclude partial month from "latest month"
+# >>> CHANGE ONLY THESE TWO <<<
+
 DROP_AND_RECREATE = True
 
 WIC_FQN = f"{DB}.wic2"   # wealth RCIF DIM (1 row per RCIF)
@@ -17,19 +20,14 @@ WID_FQN = f"{DB}.wid2"   # digital monthly FACT (month-end)
 AR_SOURCE_SYSTEM_LIST = ['BI','RN','TR','DA','SV','CC','LS','MG','TM','PC','LO','BW','CS','IC','MA','PF','PR','SD','CM','EL']
 AR_CLOSED_ONLY = "N"
 
-# Wealth population filter (this is what keeps Wealth Users ~269k)
+# Wealth population filter (this is what keeps Wealth Users around 269k)
 WEALTH_SEG_KEEP = ["IS_CT","IS_IT","REGIS_FC","REGIS","PWM"]
 WEALTH_BG_KEEP  = ["Private Wealth","Institutional Services","Investment Services"]
-
-# InvestPath filters (kept for wia2 in case you want to slice IP vs non-IP later)
-INV_ACCOUNT_TYPE_CODE = "IP"
-INV_AR_SOURCE_SYSTEM  = "RN"
-INV_CLOSED_ONLY       = "N"
 
 # ==========================================================
 # Spark
 # ==========================================================
-def get_spark(app_name="final_3table_wealth_digital_core"):
+def get_spark(app_name="final_3table_core_fixed"):
     spark = (
         SparkSession.builder
         .appName(app_name)
@@ -98,9 +96,8 @@ ar_closed_col   = first_existing_col(ARRANGEMENT, "closed_ind", "closed_indicato
 ar_seg_col      = first_existing_col(ARRANGEMENT, "business_service_segment_type_code", "business_service_segment_code", "segment_type_code")
 ar_open_col     = first_existing_col(ARRANGEMENT, "open_date", "account_open_date")
 ar_balance_col  = first_existing_col(ARRANGEMENT, "current_balance_amt", "balance", "current_balance_amount")
-ar_acct_type_col= first_existing_col(ARRANGEMENT, "account_type_code", "acct_type_code")
 
-# Wealth snapshot date = last business_date in window
+# Wealth snapshot date = last business_date in the window
 last_date = (
     INVOLVED_PARTY
     .where((F.to_date("business_date") >= start_dt) & (F.to_date("business_date") <= end_dt))
@@ -110,6 +107,7 @@ last_date = (
 
 # ==========================================================
 # 1) DIGITAL FACT (wid2) — month-end grain + flags + state_name
+#    CRITICAL FIX: exclude partial-month month_dt beyond END_DATE
 # ==========================================================
 ibn_col  = first_existing_col(DBM, "relt_ibn", "ibn")
 rcif_col = first_existing_col(DBM, "rcif_customer_nbr", "rcif_cust_nbr", "rcif_nbr")
@@ -122,7 +120,7 @@ digital_raw = (
     DBM
     .where((F.to_date("ods_business_dt") >= start_dt) & (F.to_date("ods_business_dt") <= end_dt))
     .select(
-        F.last_day(F.to_date("ods_business_dt")).alias("month_dt"),         # ✅ month-end
+        F.last_day(F.to_date("ods_business_dt")).alias("month_dt"),  # month-end bucket
         F.to_date("ods_business_dt").alias("ods_business_dt"),
         F.upper(F.trim(F.col(ibn_col).cast("string"))).alias("reltibn"),
         F.col(rcif_col).cast("string").alias("rcif_customer_nbr"),
@@ -131,6 +129,8 @@ digital_raw = (
         (F.col(state_col).cast("string").alias("state_name") if state_col else F.lit(None).cast("string").alias("state_name"))
     )
     .where(F.col("reltibn").isNotNull() & (F.length("reltibn") > 0))
+    # ✅ CORE FIX: If END_DATE is mid-month (like 2026-01-01), do NOT allow month_dt (Jan31) to be included
+    .where(F.last_day(F.to_date("ods_business_dt")) <= end_dt)
 )
 
 wid2 = (
@@ -170,24 +170,18 @@ wid2 = (
         ).otherwise(F.lit("Non Digital Active"))
     )
     .withColumn("digital_flag", F.lit("Digital User"))
-    .select(
-        "month_dt","ods_business_dt","reltibn","rcif_customer_nbr","state_name",
-        "mobile_activity_flag","mobile_flag","olb_active_flag","olb_flag",
-        "digitally_active_flag","digital_flag",
-        "olb_last_login_dt","mob_last_login_dt"
-    )
 )
 
 latest_month = wid2.select(F.max("month_dt").alias("mx")).first()["mx"]
 
-# Latest-month RCIF -> state mapping (to put state_name on wealth/accounts)
+# latest-month RCIF -> state mapping
 rcif_state_latest = (
     wid2.where(F.col("month_dt") == F.lit(latest_month))
         .select(F.col("rcif_customer_nbr").alias("rcif_number"), F.col("state_name"))
         .dropDuplicates(["rcif_number"])
 )
 
-# Latest-month active RCIF list (for 121k enrollment)
+# latest-month active RCIF list (for ~121k enrollment)
 active_rcif_latest = (
     wid2.where((F.col("month_dt") == F.lit(latest_month)) & (F.col("digitally_active_flag") == "Digital Active"))
         .select(F.col("rcif_customer_nbr").alias("rcif_number"))
@@ -195,7 +189,7 @@ active_rcif_latest = (
 )
 
 # ==========================================================
-# 2) WEALTH ACCOUNTS FACT (wia2) — arrangement grain (THIS fixes 29M nonsense)
+# 2) WEALTH ACCOUNTS FACT (wia2) — arrangement grain (correct accounts)
 # ==========================================================
 ind = (
     INVOLVED_PARTY.alias("ind")
@@ -252,13 +246,12 @@ wia2_raw = (
         F.col(f"ar.{ar_src_col}").alias("ar_source_system_code"),
         F.col(f"ar.{ar_arr_col}").alias("arrangement_id"),
         F.to_date(F.col(f"ar.{ar_open_col}")).alias("open_date"),
-        F.col(f"ar.{ar_balance_col}").alias("balance"),
-        F.col(f"ar.{ar_acct_type_col}").alias("account_type_code")
+        F.col(f"ar.{ar_balance_col}").alias("balance")
     )
     .dropna(subset=["rcif_number", "arrangement_id"])
 )
 
-# ✅ Apply wealth population filter (this is what keeps Wealth Users ~269k)
+# ✅ Apply wealth population filter (core to 269k / 303k)
 wia2_filtered = (
     wia2_raw.where(
         (F.col("seg_code").isin(WEALTH_SEG_KEEP)) |
@@ -266,22 +259,21 @@ wia2_filtered = (
     )
 )
 
-# De-dup at arrangement_id + rcif_number (prevents multi-holder duplication)
+# ✅ De-dupe at arrangement_id + rcif_number
 wia2 = (
     wia2_filtered
     .dropDuplicates(["arrangement_id", "rcif_number"])
     .join(rcif_state_latest, on="rcif_number", how="left")
     .select(
         "business_date","rcif_number","ip_id","arrangement_id","open_date","balance",
-        "seg_code","ar_source_system_code","account_type_code",
+        "seg_code","ar_source_system_code",
         "customer_internet_banking_number","business_group","state_name"
     )
 )
 
 # ==========================================================
-# 3) WEALTH RCIF DIM (wic2) — 1 row per RCIF (THIS fixes 10M “wealth users” nonsense)
+# 3) WEALTH RCIF DIM (wic2) — 1 row per RCIF + division + accts_cnt + enrollment flag
 # ==========================================================
-# Aggregate counts for division + accts_cnt
 wic_counts = (
     wia2.groupBy("rcif_number")
         .agg(
@@ -330,12 +322,12 @@ wic2 = (
              .otherwise(F.lit("Corporate & Institutional Trust"))
         )
     )
-    .join(active_rcif_latest.withColumn("is_digital_active_latest", F.lit(1)), on="rcif_number", how="left")
+    .join(active_rcif_latest.withColumn("is_active_latest", F.lit(1)), on="rcif_number", how="left")
     .withColumn(
         "digital_enrollment_flag_latest_month",
-        F.when(F.col("is_digital_active_latest") == 1, F.lit("Digital Active")).otherwise(F.lit("Non Digital Active"))
+        F.when(F.col("is_active_latest") == 1, F.lit("Digital Active")).otherwise(F.lit("Non Digital Active"))
     )
-    .drop("is_digital_active_latest")
+    .drop("is_active_latest")
     .select(
         "business_date",
         "rcif_number",
@@ -351,15 +343,17 @@ wic2 = (
 )
 
 # ==========================================================
-# SANITY OUTPUTS (the only ones that matter)
+# SANITY OUTPUTS (these should now align to the snapshot definition)
 # ==========================================================
-print("WIC2 distinct RCIF (expect ~269148):")
-wic2.selectExpr("count(*) as wic2_rows", "count(distinct rcif_number) as wealth_users").show(truncate=False)
+print("Latest month used for snapshot:", latest_month)
 
-print("WIA2 distinct arrangements (expect ~303414):")
+print("Wealth Users (expect ~269148):")
+wic2.selectExpr("count(distinct rcif_number) as wealth_users").show(truncate=False)
+
+print("Accounts Total (expect ~303k):")
 wia2.selectExpr("count(distinct arrangement_id) as accounts_total").show(truncate=False)
 
-print("WID2 digital active IBN latest month (expect ~3427877):")
+print("Top Digital Active IBN latest month (expect ~3427877):")
 wid2.where((F.col("month_dt")==F.lit(latest_month)) & (F.col("digitally_active_flag")=="Digital Active")) \
    .selectExpr("count(distinct reltibn) as digital_active_ibn_latest").show(truncate=False)
 
@@ -368,7 +362,7 @@ wic2.where(F.col("digital_enrollment_flag_latest_month")=="Digital Active") \
    .selectExpr("count(distinct rcif_number) as digital_enrollments_wealth").show(truncate=False)
 
 # ==========================================================
-# WRITE TABLES (3 only)
+# WRITE TABLES
 # ==========================================================
 if DROP_AND_RECREATE:
     spark.sql(f"DROP TABLE IF EXISTS {WIC_FQN}")
