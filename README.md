@@ -9,9 +9,9 @@ START_DATE = "2025-08-01"
 END_DATE   = "2026-01-31"
 
 # ==========================================================
-# Spark (same style as your other code)
+# Spark (same style)
 # ==========================================================
-def get_spark(app_name="wid2_windowed_snapshot"):
+def get_spark(app_name="wid2_final_windowed"):
     spark = (
         SparkSession.builder
         .appName(app_name)
@@ -27,13 +27,13 @@ spark = get_spark()
 spark.sql(f"USE {DB}")
 
 # ==========================================================
-# Source tables (NO guard rails)
+# Source tables (NO guardrails)
 # ==========================================================
-DBM = spark.table(f"{DB}.digital_banking_master")  # << dm_ib_dev.digital_banking_master
-IP  = spark.table("eil.d_involved_party_h")        # use d_ as per your screenshots
+DBM = spark.table(f"{DB}.digital_banking_master")  # dm_ib_dev.digital_banking_master
+IP  = spark.table("eil.d_involved_party_h")
 
 # ==========================================================
-# 1) Find snapshot date WITHIN window
+# 1) Snapshot date WITHIN window
 # ==========================================================
 snapshot_dt = (
     DBM
@@ -46,8 +46,8 @@ snapshot_dt = (
 print(f"Window: {START_DATE} -> {END_DATE} | Snapshot date used: {snapshot_dt}")
 
 # ==========================================================
-# 2) Dig_Customer (snapshot only) — GROUP BY ibn + ods_business_dt
-#    NOTE: ibn column name is 'ibn' (per your message)
+# 2) Dig_Customer (DBM-only) at snapshot
+#    - IBN column is 'ibn'
 # ==========================================================
 dig_customer = (
     DBM
@@ -56,7 +56,7 @@ dig_customer = (
         F.upper(F.trim(F.col("ibn").cast("string"))).alias("reltibn"),
         F.to_date("ods_business_dt").alias("ods_business_dt"),
         F.to_date(F.col("olb_last_login_date")).alias("lst_login_olb"),
-        F.to_date(F.col("mob_last_login_date")).alias("lst_login_mob")
+        F.to_date(F.col("mob_last_login_date")).alias("lst_login_mob"),
     )
     .where(F.col("reltibn").isNotNull() & (F.length("reltibn") > 0))
     .groupBy("reltibn", "ods_business_dt")
@@ -67,7 +67,29 @@ dig_customer = (
 )
 
 # ==========================================================
-# 3) RCIF mapping (snapshot on IP side) — JOIN via cust_internet_banking_nbr = ibn
+# 3) KPI (THIS is what your dashboard measure means)
+#    "distinctcount(digital[reltibn]) filtered to Digital Active"
+#    IMPORTANT: This must be DBM-only (dig_customer), NOT wid2.
+# ==========================================================
+dig_active = (
+    dig_customer
+    .withColumn(
+        "digitally_active_flag",
+        F.when(
+            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90) |
+            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90),
+            F.lit("Digital Active")
+        ).otherwise(F.lit("Non Digital Active"))
+    )
+)
+
+print("✅ KPI: Digital Active IBN (DBM-only, matches dashboard definition)")
+dig_active.where(F.col("digitally_active_flag") == "Digital Active") \
+    .selectExpr("count(distinct reltibn) as digital_active_ibn") \
+    .show(truncate=False)
+
+# ==========================================================
+# 4) RCIF mapping from involved_party (for relationships in dashboard)
 # ==========================================================
 ip_snapshot_dt = (
     IP.select(F.max(F.to_date("business_date")).alias("dt"))
@@ -89,10 +111,10 @@ rcif_map = (
 )
 
 # ==========================================================
-# 4) wid2 FINAL (same flag logic as your SQL)
+# 5) wid2 = dig_active joined to RCIF mapping (for Power BI relationships)
 # ==========================================================
 wid2 = (
-    dig_customer
+    dig_active
     .join(rcif_map, on="reltibn", how="inner")
     .withColumn(
         "mobile_active_flag",
@@ -111,14 +133,6 @@ wid2 = (
     .withColumn(
         "olb_flag",
         F.when(F.col("lst_login_olb").isNull(), F.lit("Non OLB User")).otherwise(F.lit("OLB User"))
-    )
-    .withColumn(
-        "digitally_active_flag",
-        F.when(
-            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90) |
-            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90),
-            F.lit("Digital Active")
-        ).otherwise(F.lit("Non Digital Active"))
     )
     .withColumn(
         "digital_flag",
@@ -141,10 +155,10 @@ wid2 = (
     )
 )
 
-# ==========================================================
-# SANITY
-# ==========================================================
-print("Digital Active IBN on snapshot day:")
+print("ℹ️ Coverage check only (Digital Active IBN AFTER RCIF join; will be lower than KPI)")
 wid2.where(F.col("digitally_active_flag") == "Digital Active") \
-    .selectExpr("count(distinct reltibn) as digital_active_ibn") \
+    .selectExpr("count(distinct reltibn) as digital_active_ibn_with_rcif") \
     .show(truncate=False)
+
+# If you want to save it as wid2 table:
+# wid2.write.mode("overwrite").saveAsTable(f"{DB}.wid2")
