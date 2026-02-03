@@ -8,10 +8,15 @@ DB = "dm_ib_dev"
 START_DATE = "2025-08-01"
 END_DATE   = "2026-01-31"
 
+AR_SOURCE_LIST = [
+    'DA','SV','CC','MG','LS','TM','PC','LO','BW','CM','CS','EL','IC','MA','PF','PR','SD',
+    'TR','BI','RN','IS_CT','IS_IT','PWM'
+]
+
 # ==========================================================
-# Spark (same style)
+# Spark
 # ==========================================================
-def get_spark(app_name="wid2_exact_source_logic"):
+def get_spark(app_name="wid2_exact_source_sql"):
     spark = (
         SparkSession.builder
         .appName(app_name)
@@ -29,35 +34,41 @@ spark.sql(f"USE {DB}")
 # ==========================================================
 # TABLES (no guardrails)
 # ==========================================================
-DBM  = spark.table(f"{DB}.digital_banking_master")                # dm_ib_dev.digital_banking_master
-IP   = spark.table("eil.d_involved_party_h")                      # ip
-A2I  = spark.table("eil.d_arrangement_to_involved_party_relationship_h")  # a2i
-AR   = spark.table("eil.d_arrangement_h")                         # ar
-ADDR = spark.table("eil.d_involved_party_address_h")              # addr
+DBM  = spark.table(f"{DB}.digital_banking_master")  # dm_ib_dev.digital_banking_master
+IP   = spark.table("eil.d_involved_party_h")
+A2I  = spark.table("eil.d_arrangement_to_involved_party_relationship_h")
+AR   = spark.table("eil.d_arrangement_h")
+ADDR = spark.table("eil.d_involved_party_address_h")
 
 # ==========================================================
-# Dig_Customer (EXACT source logic, but MAX date within window)
-#   Source SQL:
-#     where ods_business_dt = (select max(ods_business_dt) from digital_banking_master)
-#     group by relt_ibn, ods_business_dt
+# 0) Snapshot dates (GLOBAL vs WINDOW) - for debugging
 # ==========================================================
-snapshot_dt = (
-    DBM
-    .where((F.to_date("ods_business_dt") >= F.lit(START_DATE)) &
-           (F.to_date("ods_business_dt") <= F.lit(END_DATE)))
+global_snapshot_dt = DBM.select(F.max(F.to_date("ods_business_dt")).alias("dt")).first()["dt"]
+
+window_snapshot_dt = (
+    DBM.where(
+        (F.to_date("ods_business_dt") >= F.lit(START_DATE)) &
+        (F.to_date("ods_business_dt") <= F.lit(END_DATE))
+    )
     .select(F.max(F.to_date("ods_business_dt")).alias("dt"))
     .first()["dt"]
 )
 
-print(f"Window: {START_DATE} -> {END_DATE} | Snapshot ods_business_dt used: {snapshot_dt}")
+print(f"GLOBAL max ods_business_dt: {global_snapshot_dt}")
+print(f"WINDOW ({START_DATE}..{END_DATE}) max ods_business_dt: {window_snapshot_dt}")
 
+# We will use WINDOW snapshot for comparability (as you requested)
+snapshot_dt = window_snapshot_dt
+print(f"✅ Using snapshot_dt = {snapshot_dt}")
+
+# ==========================================================
+# 1) Dig_Customer (exact: snapshot only, group by ibn + ods_business_dt)
+# ==========================================================
 dig_customer = (
     DBM
     .where(F.to_date("ods_business_dt") == F.lit(snapshot_dt))
     .select(
-        # your env: relt_ibn is actually ibn
         F.upper(F.trim(F.col("ibn").cast("string"))).alias("reltibn"),
-        F.max(F.to_date("olb_last_login_date")).over(Window.partitionBy()).alias("dummy1"),  # not used; kept simple
         F.to_date("ods_business_dt").alias("ods_business_dt"),
         F.to_date(F.col("olb_last_login_date")).alias("lst_login_olb"),
         F.to_date(F.col("mob_last_login_date")).alias("lst_login_mob"),
@@ -71,11 +82,30 @@ dig_customer = (
 )
 
 # ==========================================================
-# rc (EXACT source join chain)
+# 1A) Digital Active IBN KPI (DBM-only)
+#     This is the dashboard measure if it uses digital table only.
+# ==========================================================
+dig_active = (
+    dig_customer
+    .withColumn(
+        "Digitally_Active_Flag",
+        F.when(
+            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90) |
+            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90),
+            F.lit("Digital Active")
+        ).otherwise(F.lit("Non Digital Active"))
+    )
+)
+
+print("A) DBM-only Digital Active IBN (distinct ibn where Digital Active):")
+dig_active.where(F.col("Digitally_Active_Flag") == "Digital Active") \
+    .selectExpr("count(distinct reltibn) as active_ibn_dbm") \
+    .show(truncate=False)
+
+# ==========================================================
+# 2) rc CTE (exact join chain + filters)
 # ==========================================================
 ip_snapshot_dt = IP.select(F.max(F.to_date("business_date")).alias("dt")).first()["dt"]
-
-AR_SOURCE_LIST = ['DA','SV','CC','MG','LS','TM','PC','LO','BW','CM','CS','EL','IC','MA','PF','PR','SD','TR','BI','RN','IS_CT','IS_IT','PWM']
 
 rc = (
     IP.alias("ip")
@@ -103,7 +133,7 @@ rc = (
     .where(F.to_date("ip.business_date") == F.lit(ip_snapshot_dt))
     .where(F.col("ip.source_system_code") == F.lit("CF"))
     .where(F.coalesce(F.col("ip.deceased_ind"), F.lit("N")) == F.lit("N"))
-    # -- and ip.birth_date is not null  (your SQL had it commented out)
+    # birth_date filter was commented out in your screenshot, so we do NOT enforce it
     .groupBy(
         F.col("ip.involved_party_id"),
         F.col("ip.cust_internet_banking_nbr"),
@@ -119,26 +149,26 @@ rc = (
     )
     .select(
         F.col("RCIF_NUMBER"),
-        F.col("involved_party_id").alias("involved_party_id"),
-        F.col("cust_internet_banking_nbr").alias("cust_internet_banking_nbr"),
-        F.col("involved_party_tax_id_nbr").alias("involved_party_tax_id_nbr"),
-        F.col("birth_date").alias("birth_date"),
-        F.col("involved_party_name").alias("involved_party_name"),
-        F.col("city_name").alias("city_name"),
-        F.col("state_name").alias("state_name"),
-        F.col("country_name").alias("country_name"),
+        F.col("involved_party_id"),
+        F.col("cust_internet_banking_nbr"),
+        F.col("involved_party_tax_id_nbr"),
+        F.col("birth_date"),
+        F.col("involved_party_name"),
+        F.col("city_name"),
+        F.col("state_name"),
+        F.col("country_name"),
     )
 )
 
 # ==========================================================
-# RCIF_Dig (EXACT source logic)
-#   left join Dig_Customer c on rc.cust_internet_banking_nbr = c.reltibn
+# 3) RCIF_Dig (left join rc to Dig_Customer on cust_internet_banking_nbr = reltibn)
 # ==========================================================
 rc_norm = rc.withColumn("cust_ibn_norm", F.upper(F.trim(F.col("cust_internet_banking_nbr").cast("string"))))
-dc_norm = dig_customer.withColumn("reltibn_norm", F.upper(F.trim(F.col("reltibn").cast("string"))))
+dc_norm = dig_active.withColumn("reltibn_norm", F.upper(F.trim(F.col("reltibn").cast("string"))))
 
 joined = rc_norm.join(dc_norm, rc_norm.cust_ibn_norm == dc_norm.reltibn_norm, "left")
 
+# row_number() over(partition by RCIF_NUMBER order by cust_internet_banking_nbr)
 w = Window.partitionBy("RCIF_NUMBER").orderBy(F.col("cust_internet_banking_nbr"))
 
 wid2 = (
@@ -154,6 +184,7 @@ wid2 = (
          .when(F.col("birth_date") >= F.lit("1997-01-01"), F.lit("Centennial (1997-???)"))
          .otherwise(F.lit("Unknown"))
     )
+    # Flags EXACT (same as your SQL)
     .withColumn(
         "Mobile_Active_Flag",
         F.when(F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90, F.lit("Mobile Active"))
@@ -213,18 +244,21 @@ wid2 = (
 )
 
 # ==========================================================
-# SANITY (same metric style)
+# Debug counts (this tells you EXACTLY where 3.27M is coming from)
 # ==========================================================
-print("Digital Active IBN (DBM-only, snapshot day, exact CASE):")
-dig_customer.where(
-    (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90) |
-    (F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90)
-).selectExpr("count(distinct reltibn) as digital_active_ibn").show(truncate=False)
-
-print("Digital Active IBN (from wid2 where Digital_flag='Digital User'):")
+print("B) wid2 Digital Active IBN (post RCIF join path):")
 wid2.where(F.col("Digitally_Active_Flag") == "Digital Active") \
-   .selectExpr("count(distinct reltibn) as digital_active_ibn_wid2") \
+   .selectExpr("count(distinct reltibn) as active_ibn_wid2") \
    .show(truncate=False)
+
+print("C) How many Digital Active IBNs are LOST because they do not map to rc.cust_internet_banking_nbr:")
+active_ibn_dbm = dig_active.where(F.col("Digitally_Active_Flag") == "Digital Active") \
+                           .select("reltibn").dropDuplicates()
+mapped_ibn = rc_norm.select(F.col("cust_ibn_norm").alias("reltibn")).dropDuplicates()
+
+active_ibn_dbm.join(mapped_ibn, "reltibn", "left_anti") \
+    .selectExpr("count(*) as active_ibn_missing_in_rc") \
+    .show(truncate=False)
 
 # If you want to save:
 # wid2.write.mode("overwrite").saveAsTable(f"{DB}.wid2")
