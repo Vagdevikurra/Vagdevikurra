@@ -1,204 +1,60 @@
 from pyspark.sql import SparkSession, functions as F
 
-spark = SparkSession.builder.getOrCreate()
-
-DB = "dm_ib_dev"
-WIC_FQN = f"{DB}.wic2"
-
-# Source tables (match your SQL)
-IND_TBL = "eil.m_involved_party_h"
-A2I_TBL = "eil.m_arrangement_to_involved_party_relationship_h"
-AR_TBL  = "eil.m_arrangement_h"
-
-# Filters (match your SQL)
-AR_SOURCE_SYSTEM_LIST = ['BI','RN','TR','DA','SV','CC','LS','MG','TM','PC','LO','BW','CS','IC','MA','PF','PR','SD','CM','EL']
-AR_CLOSED_ONLY = "N"
-IND_SOURCE_SYSTEM = "CF"
-
 # ==========================================================
-# 1) AS-OF business_date: latest business_date in last 6 months
-#    (intent of your last_ip_date join)
+# Spark
 # ==========================================================
-as_of_dt = (
-    spark.table(IND_TBL)
-    .select(F.to_date("business_date").alias("bd"))
-    .where(F.to_date("business_date") >= F.add_months(F.current_date(), -6))
-    .agg(F.max("bd").alias("as_of_dt"))
-    .collect()[0]["as_of_dt"]
+spark = (
+    SparkSession.builder
+    .appName("digital_active_0801_0131")
+    .enableHiveSupport()
+    .getOrCreate()
 )
-if as_of_dt is None:
-    raise RuntimeError("No business_date found in last 6 months in eil.m_involved_party_h")
+spark.sparkContext.setLogLevel("WARN")
+
+spark.sql("USE dm_ib_dev")
+
+DBM = spark.table("dm_ib_dev.digital_banking_master")
+
+START_DATE = "2025-08-01"
+END_DATE   = "2026-01-31"
 
 # ==========================================================
-# 2) involved_party_h at AS-OF date + CF + not deceased
-#    Keep only columns needed for joins + group classification
+# 1) Filter DIGITAL data to 08/01–01/31 (same as Hive WHERE)
 # ==========================================================
-ind = (
-    spark.table(IND_TBL).alias("ind")
-    .where(F.to_date("ind.business_date") == F.lit(as_of_dt))
-    .where(F.col("ind.source_system_code") == F.lit(IND_SOURCE_SYSTEM))
-    .where(F.coalesce(F.col("ind.deceased_ind"), F.lit("N")) == F.lit("N"))
+digital_window = (
+    DBM
+    .where(
+        (F.to_date("ods_business_dt") >= F.lit(START_DATE)) &
+        (F.to_date("ods_business_dt") <= F.lit(END_DATE))
+    )
     .select(
-        F.to_date("ind.business_date").alias("business_date"),
-        F.col("ind.involved_party_id").alias("ip_id"),
-        F.col("ind.rcif_cust_nbr").alias("rcif_number"),
-        F.col("ind.cust_internet_banking_nbr").alias("cust_internet_banking_nbr"),
-        F.col("ind.private_client_code"),
-        F.col("ind.private_client_trust_code"),
-        F.col("ind.source_system_code").alias("ind_source_system_code"),
+        F.upper(F.trim(F.col("ibn").cast("string"))).alias("reltibn"),
+        F.to_date("ods_business_dt").alias("ods_business_dt"),
+        F.to_date(F.col("olb_last_login_date")).alias("lst_login_olb"),
+        F.to_date(F.col("mob_last_login_date")).alias("lst_login_mob"),
+    )
+    .where(F.col("reltibn").isNotNull() & (F.length("reltibn") > 0))
+)
+
+# ==========================================================
+# 2) Digitally Active flag (EXACT rule)
+# ==========================================================
+digital_active = (
+    digital_window
+    .withColumn(
+        "digitally_active_flag",
+        F.when(
+            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90) |
+            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90),
+            F.lit("Digital Active")
+        ).otherwise(F.lit("Non Digital Active"))
     )
 )
 
 # ==========================================================
-# 3) relationship table (only join keys + arrangement ids)
+# 3) FINAL KPI — EXACT Hive equivalent
 # ==========================================================
-a2i = (
-    spark.table(A2I_TBL).alias("a2i")
-    .select(
-        F.to_date("a2i.business_date").alias("business_date"),
-        F.col("a2i.involved_party_id").alias("ip_id"),
-        F.col("a2i.source_system_code").alias("a2i_source_system_code"),
-        F.col("a2i.arrangement_id"),
-        F.col("a2i.arrangement_source_system_code"),
-    )
-)
-
-# ==========================================================
-# 4) arrangement table (only what is needed for filters + division logic)
-# ==========================================================
-ar = (
-    spark.table(AR_TBL).alias("ar")
-    .select(
-        F.to_date("ar.business_date").alias("business_date"),
-        F.col("ar.arrangement_id"),
-        F.col("ar.source_system_code").alias("ar_source_system_code"),
-        F.col("ar.closed_ind"),
-        F.col("ar.business_service_segment_type_code"),
-    )
-    .where(F.col("ar.source_system_code").isin(AR_SOURCE_SYSTEM_LIST))
-    .where(F.col("ar.closed_ind") == F.lit(AR_CLOSED_ONLY))
-)
-
-# ==========================================================
-# 5) Join chain (exactly like your SQL)
-# ==========================================================
-j = (
-    ind.join(
-        a2i,
-        on=[
-            ind["ip_id"] == a2i["ip_id"],
-            ind["business_date"] == a2i["business_date"],
-            ind["ind_source_system_code"] == a2i["a2i_source_system_code"],
-        ],
-        how="inner",
-    )
-    .join(
-        ar,
-        on=[
-            a2i["arrangement_id"] == ar["arrangement_id"],
-            a2i["arrangement_source_system_code"] == ar["ar_source_system_code"],
-            a2i["business_date"] == ar["business_date"],
-        ],
-        how="inner",
-    )
-)
-
-# ==========================================================
-# 6) Business_Group logic (match your SQL)
-# ==========================================================
-business_group_expr = (
-    F.when(F.col("private_client_code").isin("039", "539", "339"), F.lit("Private Wealth"))
-     .when(F.col("private_client_trust_code").isin("239", "739"), F.lit("Private Wealth"))
-     .otherwise(
-         F.when(F.col("business_service_segment_type_code").isin("IS_CT", "IS_IT"), F.lit("Institutional Services"))
-          .when(F.col("business_service_segment_type_code").isin("REGIS_FC", "REGIS"), F.lit("Investment Services"))
-          .when(F.col("business_service_segment_type_code") == F.lit("PWM"), F.lit("Private Wealth"))
-          .otherwise(F.concat(F.col("business_service_segment_type_code"), F.lit(": Category??")))
-     )
-)
-
-# ==========================================================
-# 7) Aggregate to RCIF + ip_id grain (needed for division + accts_cnt)
-#    Keep helper counts only temporarily (not in final output)
-# ==========================================================
-agg = (
-    j.withColumn("business_group", business_group_expr)
-     .groupBy(
-         "business_date",
-         "ip_id",
-         "cust_internet_banking_nbr",
-         "rcif_number",
-         "business_group"
-     )
-     .agg(
-         F.countDistinct(F.when(F.col("business_service_segment_type_code") == "IS_CT", F.col("arrangement_id"))).alias("Corporate_Trust_Count"),
-         F.countDistinct(F.when(F.col("business_service_segment_type_code") == "IS_IT", F.col("arrangement_id"))).alias("Institutional_Trust_Count"),
-         F.countDistinct(F.when(F.col("business_service_segment_type_code") == "REGIS_FC", F.col("arrangement_id"))).alias("Investment_Count"),
-         F.countDistinct(F.when(F.col("business_service_segment_type_code") == "REGIS", F.col("arrangement_id"))).alias("Insurance_Count"),
-         F.countDistinct(F.when(F.col("business_service_segment_type_code") == "PWM", F.col("arrangement_id"))).alias("PWM_Count"),
-         F.countDistinct(F.when(F.col("ar_source_system_code") == "TR", F.col("arrangement_id"))).alias("Trust_Count"),
-         F.countDistinct(F.when(F.col("ar_source_system_code").isin(
-             "DA","SV","CC","MG","LS","TM","PC","LO","BW","CM","CS","EL","IC","MA","PF","PR","SD"
-         ), F.col("arrangement_id"))).alias("Banking_Count"),
-         F.count(F.col("arrangement_id")).alias("accts_cnt"),
-     )
-)
-
-# ==========================================================
-# 8) Division logic (match your SQL)
-# ==========================================================
-division_expr = (
-    F.when(
-        F.col("business_group") == "Private Wealth",
-        F.when((F.col("Trust_Count") > 0) & (F.col("Banking_Count") > 0), F.lit("Banking & IM&T"))
-         .otherwise(
-             F.when((F.col("Investment_Count") + F.col("Trust_Count") > 0) & (F.col("Banking_Count") == 0), F.lit("Investments Only"))
-              .otherwise(F.lit("Banking only"))
-         )
-    )
-    .when(
-        F.col("business_group") == "Investment Services",
-        F.when((F.col("Investment_Count") > 0) & (F.col("Insurance_Count") == 0), F.lit("Investment"))
-         .when((F.col("Investment_Count") == 0) & (F.col("Insurance_Count") > 0), F.lit("Insurance"))
-         .otherwise(F.lit("Insurance & Investment"))
-    )
-    .otherwise(
-        F.when((F.col("Corporate_Trust_Count") > 0) & (F.col("Institutional_Trust_Count") == 0), F.lit("Corporate Trust"))
-         .when((F.col("Corporate_Trust_Count") == 0) & (F.col("Institutional_Trust_Count") > 0), F.lit("Institutional Trust"))
-         .when(F.col("PWM_Count") > 0, F.lit("Banking only"))
-         .otherwise(F.lit("Corporate & Institutional Trust"))
-    )
-)
-
-# Simple digital flag (presence of IBN). Replace later if you want "digitally active" from wid2.
-digital_flag_expr = F.when(F.col("cust_internet_banking_nbr").isNotNull(), F.lit(1)).otherwise(F.lit(0))
-
-wic2_df = (
-    agg.withColumn("division", division_expr)
-       .withColumn("digital_flag", digital_flag_expr)
-       .select(
-           "business_date",
-           "ip_id",
-           "cust_internet_banking_nbr",
-           "rcif_number",
-           "business_group",
-           "division",
-           "accts_cnt",
-           "digital_flag",
-       )
-)
-
-# ==========================================================
-# 9) Write table
-# ==========================================================
-spark.sql(f"DROP TABLE IF EXISTS {WIC_FQN}")
-(
-    wic2_df.write
-    .mode("overwrite")
-    .format("parquet")
-    .saveAsTable(WIC_FQN)
-)
-
-print("AS-OF business_date:", as_of_dt)
-print("wic2 rows:", wic2_df.count())
-print("wic2 distinct rcif:", wic2_df.select("rcif_number").distinct().count())
+print("✅ Digital Active IBN (08/01–01/31):")
+digital_active.where(F.col("digitally_active_flag") == "Digital Active") \
+    .selectExpr("count(distinct reltibn) as digital_active_ibn_0801_0131") \
+    .show(truncate=False)
