@@ -43,9 +43,9 @@ Dig_Customer = spark.sql(f"""
         max(dbm.mob_last_login_date) as lst_login_mob,
         max(dbm.ods_business_dt) AS ods_business_dt
     FROM {DMIB_DB}.digital_banking_master dbm
-    WHERE dbm.ods_business_dt >= date_sub(trunc(cast(now() as date), 'MM'), INTERVAL 6 MONTHS)
-        AND dbm.ods_business_dt < trunc(cast(now() as date), 'MM')
-    GROUP BY TRUNC(ods_business_dt, 'MM'),
+    WHERE dbm.ods_business_dt >= add_months(trunc(current_date, 'MM'), -6)
+        AND dbm.ods_business_dt < trunc(current_date, 'MM')
+    GROUP BY TRUNC(dbm.ods_business_dt, 'MM'),
         dbm.relt_ibn,
         dbm.rcif_customer_nbr
 """)
@@ -166,13 +166,13 @@ add_rcifs = spark.sql(f"""
     FROM (
         SELECT rcif_cust_nbr 
         FROM {EIL_DB}.m_involved_party_h
-        WHERE cast(business_date as date) >= add_months(cast(now() as date), -6)
+        WHERE cast(business_date as date) >= add_months(current_date, -6)
         
         UNION
         
         SELECT rcif_customer_nbr 
         FROM {DMIB_DB}.digital_banking_master
-        WHERE ods_business_dt >= add_months(cast(now() as date), -6)
+        WHERE ods_business_dt >= add_months(current_date, -6)
     ) add_rcifs
 """)
 
