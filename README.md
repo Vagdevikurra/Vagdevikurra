@@ -237,7 +237,6 @@ PWI = spark.sql(f"""
         ind.rcif_cust_nbr AS RCIF_NUMBER,
         ind.involved_party_id as ip_id,
         ind.cust_internet_banking_nbr,
-        ind.involved_party_id as ip_id,
         -- sum(ar.current_balance_amt) as balance,
         
         CASE
