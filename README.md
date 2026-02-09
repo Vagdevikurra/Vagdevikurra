@@ -37,15 +37,31 @@ last_date = spark.sql(f"""
 
 print(f"   Using latest business_date: {last_date}")
 
-# Get distinct dates from last 6 months
+# Get month-end dates from last 6 months
+# These should be: 2025-08-31, 2025-09-30, 2025-10-31, 2025-11-30, 2025-12-31, 2026-01-31
 last_ip_dates = spark.sql(f"""
-    SELECT distinct business_date as last_dt
-    FROM {EIL_DB}.m_involved_party_h
-    WHERE cast(business_date as date) >= add_months(current_date, -6)
+    WITH all_dates AS (
+        SELECT distinct business_date as last_dt
+        FROM {EIL_DB}.m_involved_party_h
+        WHERE cast(business_date as date) >= date('2025-08-01')
+            AND cast(business_date as date) <= date('2026-01-31')
+    )
+    SELECT last_dt
+    FROM all_dates
+    WHERE day(last_dt) >= 28
+        AND (
+            (month(last_dt) = 8 AND day(last_dt) = 31) OR
+            (month(last_dt) = 9 AND day(last_dt) = 30) OR
+            (month(last_dt) = 10 AND day(last_dt) = 31) OR
+            (month(last_dt) = 11 AND day(last_dt) = 30) OR
+            (month(last_dt) = 12 AND day(last_dt) = 31) OR
+            (month(last_dt) = 1 AND day(last_dt) = 31)
+        )
 """)
 last_ip_dates.createOrReplaceTempView("last_ip_date")
 
-print(f"   Found {last_ip_dates.count()} distinct business dates in last 6 months")
+print(f"   Found {last_ip_dates.count()} month-end dates:")
+last_ip_dates.orderBy("last_dt").show()
 
 # Now build PWI exactly as original
 PWI = spark.sql(f"""
@@ -363,6 +379,38 @@ print("CONSOLIDATION COMPLETE")
 print("=" * 80)
 
 # Quick validation
-print("\nQuick Validation:")
-spark.sql("SELECT COUNT(DISTINCT rcif_number) as wealth_customers FROM PWI").show()
-spark.sql("SELECT SUM(accts_cnt) as total_accounts FROM PWI").show()
+print("\n📊 VALIDATION - Comparing to Expected Numbers:")
+print("-" * 80)
+
+print("\n1. PWI/Wealth Table:")
+pwi_total_rows = spark.sql("SELECT COUNT(*) as cnt FROM PWI").collect()[0]['cnt']
+pwi_distinct_rcif = spark.sql("SELECT COUNT(DISTINCT RCIF_NUMBER) as cnt FROM PWI").collect()[0]['cnt']
+pwi_total_accts = spark.sql("SELECT SUM(accts_cnt) as cnt FROM PWI").collect()[0]['cnt']
+pwi_distinct_dates = spark.sql("SELECT COUNT(DISTINCT business_date) as cnt FROM PWI").collect()[0]['cnt']
+
+print(f"   Total rows: {pwi_total_rows:,} (Expected: ~1,800,000)")
+print(f"   Distinct RCIFs: {pwi_distinct_rcif:,} (Expected: ~269,000)")
+print(f"   Total accounts (sum): {pwi_total_accts:,} (Expected: ~303,000)")
+print(f"   Distinct business_dates: {pwi_distinct_dates} (Expected: 6 month-ends)")
+
+print("\n2. wics1 Account Fact:")
+wics1_rows = spark.sql(f"SELECT COUNT(*) as cnt FROM {DEFAULT_DB}.wics1").collect()[0]['cnt']
+wics1_accts = spark.sql(f"SELECT SUM(accts_cnt) as cnt FROM {DEFAULT_DB}.wics1").collect()[0]['cnt']
+wics1_rcifs = spark.sql(f"SELECT COUNT(DISTINCT rcif_number) as cnt FROM {DEFAULT_DB}.wics1").collect()[0]['cnt']
+
+print(f"   Total rows: {wics1_rows:,}")
+print(f"   Total accounts (sum): {wics1_accts:,} (Expected: ~303,000)")
+print(f"   Distinct RCIFs: {wics1_rcifs:,}")
+
+print("\n3. Business Group Breakdown:")
+spark.sql("SELECT Business_Group, COUNT(DISTINCT RCIF_NUMBER) as customers FROM PWI GROUP BY Business_Group ORDER BY customers DESC").show(truncate=False)
+
+print("\n4. Date Distribution:")
+spark.sql("SELECT business_date, COUNT(DISTINCT RCIF_NUMBER) as customers FROM PWI GROUP BY business_date ORDER BY business_date").show()
+
+print("\n" + "=" * 80)
+if pwi_distinct_rcif and abs(pwi_distinct_rcif - 269000) < 10000:
+    print("✅ SUCCESS! Wealth customers ~269k")
+else:
+    print(f"❌ WARNING! Got {pwi_distinct_rcif:,}, Expected ~269,000")
+print("=" * 80)
