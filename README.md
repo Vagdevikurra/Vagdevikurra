@@ -8,30 +8,28 @@ EIL_DB = "eil"
 DMIB_DB = "dm_ib"
 
 START_DT = "2025-08-01"
-END_DT   = "2026-01-31"   # fixed window to match your checks
+END_DT   = "2026-01-31"   # your fixed window (Aug-Jan)
 
 spark = (
     SparkSession.builder
-    .appName("wealth_digital_consolidation_fixed_grain")
+    .appName("wealth_digital_consolidation_FINAL")
     .enableHiveSupport()
     .getOrCreate()
 )
 spark.sparkContext.setLogLevel("WARN")
 
-print("="*100)
-print("BUILD: Wealth + Digital consolidated (fixed grain, fixed window)")
+print("="*120)
+print("FINAL BUILD: Wealth + Digital consolidated (fixed grain, exact source_system list, exact window)")
 print(f"Window: {START_DT} to {END_DT}")
-print("="*100)
+print("="*120)
 
 # =====================================================================================
 # 0) Month-end business dates within window (robust)
 # =====================================================================================
-month_ends = spark.sql(f"""
+spark.sql(f"""
+CREATE OR REPLACE TEMP VIEW month_ends AS
 WITH m AS (
-  SELECT
-    business_date,
-    year(business_date)  as yy,
-    month(business_date) as mm
+  SELECT business_date, year(business_date) yy, month(business_date) mm
   FROM {EIL_DB}.m_involved_party_h
   WHERE cast(business_date as date) >= date('{START_DT}')
     AND cast(business_date as date) <= date('{END_DT}')
@@ -40,81 +38,83 @@ SELECT max(business_date) as business_date
 FROM m
 GROUP BY yy, mm
 """)
-month_ends.createOrReplaceTempView("month_ends")
 
-print("\n[Step 0] Month-ends selected:")
-month_ends.orderBy("business_date").show(truncate=False)
-print(f"Month-end count = {month_ends.count()} (expect 6)")
+print("\n[Step 0] Month-ends selected (must be 6):")
+spark.sql("SELECT * FROM month_ends ORDER BY business_date").show(truncate=False)
+
+# Latest month-end in our window (should be END_DT)
+latest_dt = spark.sql("SELECT max(business_date) as dt FROM month_ends").collect()[0]["dt"]
+print(f"Latest month-end in window = {latest_dt}")
 
 # =====================================================================================
-# 1) Wealth Fact at correct grain
-#    - Count DISTINCT arrangement_id to avoid relationship duplicates
-#    - Aggregate at (business_date, ip_id, rcif, ibn, business_group) then compute division
+# 1) WEALTH (PWI-style) at correct grain
+#    IMPORTANT:
+#      - Use full source_system_code list INCLUDING RN + BW as in your screenshot
+#      - Count DISTINCT arrangement_id to avoid relationship duplication
 # =====================================================================================
-print("\n[Step 1] Building wealth base + aggregate...")
 
-wealth_base = spark.sql(f"""
-WITH base AS (
-  SELECT
-    cast(ind.business_date as date) as business_date,
-    ind.involved_party_id           as ip_id,
-    cast(ind.rcif_cust_nbr as string) as rcif_number,
-    ind.cust_internet_banking_nbr   as ibn,
+# Full list aligned to what you showed (includes RN and BW)
+WEALTH_SRC_LIST = "('BI','BN','BW','TR','DA','SV','CC','MG','LS','TM','PC','LO','BM','CS','IC','MA','PF','PR','SD','CN','EL','RN','IS_CT','IS_IT','PWM')"
 
+spark.sql(f"""
+CREATE OR REPLACE TEMP VIEW wealth_base AS
+SELECT
+  cast(ind.business_date as date)             as business_date,
+  ind.involved_party_id                       as ip_id,
+  cast(ind.rcif_cust_nbr as string)           as rcif_number,
+  ind.cust_internet_banking_nbr               as ibn,
+
+  CASE
+    WHEN ind.private_client_code in ('039','539','339') THEN 'Private Wealth'
+    WHEN ind.private_client_trust_code in ('239','739') THEN 'Private Wealth'
+    ELSE CASE
+      WHEN ar.business_service_segment_type_code in ('IS_CT','IS_IT') THEN 'Institutional Services'
+      WHEN ar.business_service_segment_type_code in ('REGIS_FC','REGIS') THEN 'Investment Services'
+      WHEN ar.business_service_segment_type_code = 'PWM' THEN 'Private Wealth'
+      ELSE concat(ar.business_service_segment_type_code, 'Category2??')
+    END
+  END as business_group,
+
+  ar.arrangement_id,
+  ar.source_system_code,
+  ar.business_service_segment_type_code,
+
+  ind.private_client_code,
+  ind.private_client_trust_code
+
+FROM {EIL_DB}.m_involved_party_h ind
+JOIN month_ends d
+  ON ind.business_date = d.business_date
+
+JOIN {EIL_DB}.d_arrangement_to_involved_party_relationship_h a2i
+  ON ind.involved_party_id = a2i.involved_party_id
+ AND ind.business_date = a2i.business_date
+ AND ind.source_system_code = a2i.source_system_code
+
+JOIN {EIL_DB}.d_arrangement_h ar
+  ON a2i.arrangement_id = ar.arrangement_id
+ AND a2i.arrangement_source_system_code = ar.source_system_code
+ AND a2i.business_date = ar.business_date
+
+WHERE ind.source_system_code = 'CF'
+  AND nvl(ind.deceased_ind,'N') = 'N'
+  AND ar.closed_ind = 'N'
+  AND ar.source_system_code in {WEALTH_SRC_LIST}
+
+  AND (
     CASE
-      WHEN ind.private_client_code in ('039','539','339') THEN 'Private Wealth'
-      WHEN ind.private_client_trust_code in ('239','739') THEN 'Private Wealth'
+      WHEN ind.private_client_code in ('039','539','339') THEN 1
+      WHEN ind.private_client_trust_code in ('239','739') THEN 1
       ELSE CASE
-        WHEN ar.business_service_segment_type_code in ('IS_CT','IS_IT') THEN 'Institutional Services'
-        WHEN ar.business_service_segment_type_code in ('REGIS_FC','REGIS') THEN 'Investment Services'
-        WHEN ar.business_service_segment_type_code = 'PWM' THEN 'Private Wealth'
-        ELSE ar.business_service_segment_type_code
+        WHEN ar.business_service_segment_type_code in ('IS_CT','IS_IT','REGIS_FC','REGIS','PWM') THEN 1
+        ELSE 0
       END
-    END as business_group,
-
-    ar.arrangement_id,
-    ar.source_system_code,
-    ar.business_service_segment_type_code,
-
-    ind.private_client_code,
-    ind.private_client_trust_code
-
-  FROM {EIL_DB}.m_involved_party_h ind
-  JOIN month_ends d
-    ON ind.business_date = d.business_date
-
-  JOIN {EIL_DB}.d_arrangement_to_involved_party_relationship_h a2i
-    ON ind.involved_party_id = a2i.involved_party_id
-   AND ind.business_date = a2i.business_date
-   AND ind.source_system_code = a2i.source_system_code
-
-  JOIN {EIL_DB}.d_arrangement_h ar
-    ON a2i.arrangement_id = ar.arrangement_id
-   AND a2i.arrangement_source_system_code = ar.source_system_code
-   AND a2i.business_date = ar.business_date
-   AND ar.closed_ind = 'N'
-   AND ar.source_system_code in (
-      'BI','BN','TR','DA','SV','CC','MG','LS','TM','PC','LO','BM','CS','IC','MA','PF','PR','SD','CN','EL'
-   )
-
-  WHERE ind.source_system_code = 'CF'
-    AND nvl(ind.deceased_ind,'N') = 'N'
-    AND (
-      CASE
-        WHEN ind.private_client_code in ('039','539','339') THEN 1
-        WHEN ind.private_client_trust_code in ('239','739') THEN 1
-        ELSE CASE
-          WHEN ar.business_service_segment_type_code in ('IS_CT','IS_IT','REGIS_FC','REGIS','PWM') THEN 1
-          ELSE 0
-        END
-      END
-    ) = 1
-)
-SELECT * FROM base
+    END
+  ) = 1
 """)
-wealth_base.createOrReplaceTempView("wealth_base")
 
-wealth_agg = spark.sql("""
+spark.sql("""
+CREATE OR REPLACE TEMP VIEW wealth_agg AS
 SELECT
   business_date,
   ip_id,
@@ -136,9 +136,8 @@ FROM wealth_base
 GROUP BY business_date, ip_id, rcif_number, ibn, business_group
 """)
 
-# Division logic exactly like your original (but now applied at correct grain)
-wic2_wealth_fact = (
-    wealth_agg
+wealth_fact_df = (
+    spark.table("wealth_agg")
     .withColumn(
         "division",
         F.when(F.col("business_group") == "Private Wealth",
@@ -159,31 +158,13 @@ wic2_wealth_fact = (
     .select("business_date","rcif_number","business_group","division","accts_cnt")
 )
 
-wic2_wealth_fact.createOrReplaceTempView("wic2_wealth_fact")
-
-print("\nWealth fact sanity:")
-spark.sql("""
-SELECT
-  count(*) as rows,
-  count(distinct rcif_number) as distinct_rcif,
-  sum(accts_cnt) as total_accts
-FROM wic2_wealth_fact
-""").show(truncate=False)
-
-spark.sql("""
-SELECT business_date, count(distinct rcif_number) as rcifs
-FROM wic2_wealth_fact
-GROUP BY business_date
-ORDER BY business_date
-""").show(truncate=False)
+wealth_fact_df.createOrReplaceTempView("wic2_wealth_fact")
 
 # =====================================================================================
-# 2) Customer base (RCIF) at correct grain (dedupe address!)
-#    - IMPORTANT: do NOT join arrangements here (that explodes customers)
+# 2) CUSTOMER BASE (RCIF) — correct grain, NO arrangement join, dedup address
 # =====================================================================================
-print("\n[Step 2] Building RCIF customer base (deduped address)...")
-
-rcif_customer = spark.sql(f"""
+spark.sql(f"""
+CREATE OR REPLACE TEMP VIEW rcif_customer AS
 WITH ip AS (
   SELECT
     involved_party_id as ip_id,
@@ -211,30 +192,17 @@ SELECT
   ip.rcif_number,
   ip.ip_id,
   ip.ibn,
-  a.state_name,
-  ip.birth_date
+  a.state_name
 FROM ip
 LEFT JOIN addr_ranked a
   ON ip.ip_id = a.ip_id AND a.rn = 1
 """)
-rcif_customer.createOrReplaceTempView("rcif_customer")
-
-print("\nRCIF customer sanity (should NOT be millions exploded):")
-spark.sql("""
-SELECT
-  count(*) as rows,
-  count(distinct rcif_number) as distinct_rcif,
-  count(distinct ip_id) as distinct_ip
-FROM rcif_customer
-""").show(truncate=False)
 
 # =====================================================================================
-# 3) Digital at correct grain
-#    - collapse digital_banking_master to ONE row per IBN for the window
+# 3) DIGITAL — collapse to 1 row per IBN in the window (no month grain)
 # =====================================================================================
-print("\n[Step 3] Building Digital (1 row per IBN for window)...")
-
-digital_ibn = spark.sql(f"""
+spark.sql(f"""
+CREATE OR REPLACE TEMP VIEW digital_ibn AS
 WITH dig AS (
   SELECT
     relt_ibn,
@@ -264,64 +232,45 @@ SELECT
     else 'Non Digital Active'
   end as digitally_active_flag,
 
-  case when relt_ibn is null then 'Non Digital User' else 'Digital User' end as digital_flag
+  'Digital User' as digital_flag
 FROM dig
 WHERE relt_ibn is not null
 """)
-digital_ibn.createOrReplaceTempView("digital_ibn")
 
-print("\nDigital IBN sanity:")
+# Join customer->digital at IBN, then collapse to 1 row per RCIF
 spark.sql("""
-SELECT
-  count(*) as rows,
-  count(distinct ibn) as distinct_ibn
-FROM digital_ibn
-""").show(truncate=False)
-
-# =====================================================================================
-# 4) Join RCIF customer to digital on IBN, then collapse to 1 row per RCIF
-# =====================================================================================
-print("\n[Step 4] Building wia2_customer (1 row per RCIF)...")
-
-rcif_digital_join = spark.sql("""
+CREATE OR REPLACE TEMP VIEW rcif_digital_join AS
 SELECT
   c.rcif_number,
-  c.ip_id,
-  c.ibn,
   c.state_name,
-  c.birth_date,
-
+  c.ibn,
+  d.digitally_active_flag,
+  d.digital_flag,
   d.mobile_flag,
   d.mobile_active_flag,
   d.olb_flag,
-  d.olb_active_flag,
-  d.digitally_active_flag,
-  d.digital_flag
+  d.olb_active_flag
 FROM rcif_customer c
 LEFT JOIN digital_ibn d
   ON c.ibn = d.ibn
 """)
-rcif_digital_join.createOrReplaceTempView("rcif_digital_join")
 
-# Collapse flags to RCIF-level (MAX of "Active"/"User" based on priority)
-wia2_customer = spark.sql("""
+spark.sql(f"""
+CREATE OR REPLACE TEMP VIEW wia2_customer AS
 WITH ranked AS (
   SELECT
     rcif_number,
     max(state_name) as state_name,
-
-    -- pick any ibn as primary (optional)
     max(ibn) as primary_ibn,
 
-    -- collapse flags: if any IBN is active/user, mark RCIF as active/user
-    max(case when mobile_flag = 'Mobile User' then 1 else 0 end) as mobile_user_bin,
-    max(case when mobile_active_flag = 'Mobile Active' then 1 else 0 end) as mobile_active_bin,
+    max(case when digital_flag='Digital User' then 1 else 0 end) as digital_user_bin,
+    max(case when digitally_active_flag='Digital Active' then 1 else 0 end) as digital_active_bin,
 
-    max(case when olb_flag = 'OLB User' then 1 else 0 end) as olb_user_bin,
-    max(case when olb_active_flag = 'OLB Active' then 1 else 0 end) as olb_active_bin,
+    max(case when mobile_flag='Mobile User' then 1 else 0 end) as mobile_user_bin,
+    max(case when mobile_active_flag='Mobile Active' then 1 else 0 end) as mobile_active_bin,
 
-    max(case when digitally_active_flag = 'Digital Active' then 1 else 0 end) as digital_active_bin,
-    max(case when digital_flag = 'Digital User' then 1 else 0 end) as digital_user_bin
+    max(case when olb_flag='OLB User' then 1 else 0 end) as olb_user_bin,
+    max(case when olb_active_flag='OLB Active' then 1 else 0 end) as olb_active_bin
   FROM rcif_digital_join
   GROUP BY rcif_number
 )
@@ -330,34 +279,22 @@ SELECT
   state_name,
   primary_ibn,
 
+  case when digital_user_bin=1 then 'Digital User' else 'Non Digital User' end as digital_flag,
+  case when digital_active_bin=1 then 'Digital Active' else 'Non Digital Active' end as digitally_active_flag,
+
   case when mobile_user_bin=1 then 'Mobile User' else 'Non Mobile User' end as mobile_flag,
   case when mobile_active_bin=1 then 'Mobile Active' else 'Non Mobile Active' end as mobile_active_flag,
 
   case when olb_user_bin=1 then 'OLB User' else 'Non OLB User' end as olb_flag,
-  case when olb_active_bin=1 then 'OLB Active' else 'Non OLB Active' end as olb_active_flag,
-
-  case when digital_user_bin=1 then 'Digital User' else 'Non Digital User' end as digital_flag,
-  case when digital_active_bin=1 then 'Digital Active' else 'Non Digital Active' end as digitally_active_flag
+  case when olb_active_bin=1 then 'OLB Active' else 'Non OLB Active' end as olb_active_flag
 FROM ranked
 """)
 
-wia2_customer.createOrReplaceTempView("wia2_customer")
-
-print("\nwia2_customer sanity:")
-spark.sql("""
-SELECT
-  count(*) as rows,
-  count(distinct rcif_number) as distinct_rcif,
-  sum(case when digitally_active_flag='Digital Active' then 1 else 0 end) as digital_active_rcifs
-FROM wia2_customer
-""").show(truncate=False)
-
 # =====================================================================================
-# 5) Optional: RCIF set (union wealth RCIFs + digital RCIFs within window)
+# 4) OPTIONAL RCIF SET (wealth+digital union) — your “RCIF number” table concept
 # =====================================================================================
-print("\n[Step 5] Optional RCIF set table (union wealth+digital)...")
-
-wir2_rcif_set = spark.sql(f"""
+spark.sql(f"""
+CREATE OR REPLACE TEMP VIEW wir2_rcif_set AS
 WITH wealth_rcifs AS (
   SELECT distinct cast(rcif_cust_nbr as string) as rcif_number
   FROM {EIL_DB}.m_involved_party_h
@@ -377,24 +314,70 @@ FROM (
   SELECT * FROM digital_rcifs
 ) u
 """)
-wir2_rcif_set.createOrReplaceTempView("wir2_rcif_set")
 
+# =====================================================================================
+# 5) PRINT THE NUMBERS THAT MATTER (no “nonsense”)
+# =====================================================================================
+print("\n" + "="*120)
+print("VALIDATION OUTPUTS (these are the numbers you care about)")
+print("="*120)
+
+# Wealth distinct RCIF across 6 months
 spark.sql("""
-SELECT count(*) as rcif_count FROM wir2_rcif_set
+SELECT
+  count(distinct rcif_number) as wealth_rcifs_all_6mo
+FROM wic2_wealth_fact
+""").show(truncate=False)
+
+# Wealth distinct RCIF on latest month-end only (this is typically your ~269k target)
+spark.sql(f"""
+SELECT
+  count(distinct rcif_number) as wealth_rcifs_latest
+FROM wic2_wealth_fact
+WHERE business_date = date('{END_DT}')
+""").show(truncate=False)
+
+# Wealth accounts sum on latest month-end only (this is typically your ~303k target)
+spark.sql(f"""
+SELECT
+  sum(accts_cnt) as wealth_accounts_latest
+FROM wic2_wealth_fact
+WHERE business_date = date('{END_DT}')
+""").show(truncate=False)
+
+# Wealth accounts sum across all 6 months (will be bigger; this is normal)
+spark.sql("""
+SELECT
+  sum(accts_cnt) as wealth_accounts_all_6mo
+FROM wic2_wealth_fact
+""").show(truncate=False)
+
+# Digital active IBN in window (closest to your “~3.4M” style metric if that was IBN-based)
+spark.sql(f"""
+SELECT
+  count(distinct ibn) as digital_active_ibn_window
+FROM digital_ibn
+WHERE digitally_active_flag = 'Digital Active'
+""").show(truncate=False)
+
+# Digital active RCIF (collapsed)
+spark.sql("""
+SELECT
+  count(*) as digital_active_rcif_window
+FROM wia2_customer
+WHERE digitally_active_flag = 'Digital Active'
 """).show(truncate=False)
 
 # =====================================================================================
 # 6) WRITE TABLES
 # =====================================================================================
-print("\n[Step 6] Writing tables...")
-
-wia2_customer.write.mode("overwrite").saveAsTable(f"{DEFAULT_DB}.wia2_customer")
-wic2_wealth_fact.write.mode("overwrite").saveAsTable(f"{DEFAULT_DB}.wic2_wealth_fact")
-wir2_rcif_set.write.mode("overwrite").saveAsTable(f"{DEFAULT_DB}.wir2_rcif_set")
+print("\nWriting final tables...")
+spark.table("wia2_customer").write.mode("overwrite").saveAsTable(f"{DEFAULT_DB}.wia2_customer")
+spark.table("wic2_wealth_fact").write.mode("overwrite").saveAsTable(f"{DEFAULT_DB}.wic2_wealth_fact")
+spark.table("wir2_rcif_set").write.mode("overwrite").saveAsTable(f"{DEFAULT_DB}.wir2_rcif_set")
 
 print(f"✓ Saved: {DEFAULT_DB}.wia2_customer")
 print(f"✓ Saved: {DEFAULT_DB}.wic2_wealth_fact")
 print(f"✓ Saved: {DEFAULT_DB}.wir2_rcif_set")
-
 print("\nDONE.")
-print("="*100)
+print("="*120)
