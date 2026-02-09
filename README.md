@@ -1,271 +1,87 @@
-Got it. You want **Hive SQL** that matches those DAX measures so you can compare **actual vs expected** and then you’ll tell me what’s off. Below are **1:1 SQL equivalents** using your new tables.
+Use your **current tables**. Don’t rerun Spark yet.
 
-I’m going to assume these tables/columns (based on what we built):
+Right now we have **one clear situation**:
 
-* **Wealth fact**: `dm_ib_dev.wic2_wealth_fact`
+* Wealth table is correct (268,984 RCIF ✅)
+* All digital measures are 0 because **customer/digital table is wrong** (empty, bad flags, bad RCIF format, or missing IBNs)
 
-  * `business_date`, `rcif_number`, `accts_cnt`, `business_group`, `division`
-* **Customer/digital dim**: `dm_ib_dev.wia2_customer`
+The fastest fix is:
 
-  * `rcif_number`, `primary_ibn`, `digital_flag`, `digitally_active_flag`, `state_name`
-* **InvestPath** (if you also created it): `dm_ib_dev.inv` or `dm_ib_dev.wia2_investpath` (you’ll replace table name)
+1. **Run 4 tiny Hive queries (takes 2 minutes)** to pinpoint *exactly* which of the 4 causes it is
+2. Then I’ll give you a **new complete Spark script** that fixes only what’s broken (customer + digital join + account counting), and keeps your wealth RCIF stable.
 
-If your table names differ, just swap them.
+So: **do NOT guess and do NOT rerun yet.** Run these:
 
 ---
 
-# 0) Get latest wealth snapshot date (use this in all “latest” measures)
+## Run these 4 Hive SQL checks (copy/paste)
+
+### A) Is `wia2_customer` populated + does it have IBNs?
 
 ```sql
-WITH mx AS (
-  SELECT max(business_date) as latest_dt
-  FROM dm_ib_dev.wic2_wealth_fact
-)
-SELECT * FROM mx;
+SELECT
+  count(*) as rows,
+  count(distinct rcif_number) as rcifs,
+  count(distinct primary_ibn) as ibns,
+  sum(case when primary_ibn is null then 1 else 0 end) as null_ibn_rows
+FROM dm_ib_dev.wia2_customer;
 ```
 
----
-
-# 1) Wealth Customers (DAX: DISTINCTCOUNT(Wealth[pw1.rcifnumber]))
+### B) What are the actual values in the flags? (your filters might not match)
 
 ```sql
-WITH mx AS (SELECT max(business_date) as dt FROM dm_ib_dev.wic2_wealth_fact)
-SELECT count(distinct w.rcif_number) as wealthcustomer
-FROM dm_ib_dev.wic2_wealth_fact w
-JOIN mx ON w.business_date = mx.dt;
-```
-
----
-
-# 2) Wealth Accounts (DAX: COUNT / SUM of Wealth[pw1.acctsCnt])
-
-Your DAX looks like `COUNT(Wealth[pw1.acctsCnt])` but what you really want is total accounts.
-Use **SUM(accts_cnt)**:
-
-```sql
-WITH mx AS (SELECT max(business_date) as dt FROM dm_ib_dev.wic2_wealth_fact)
-SELECT sum(w.accts_cnt) as accounts
-FROM dm_ib_dev.wic2_wealth_fact w
-JOIN mx ON w.business_date = mx.dt;
-```
-
----
-
-# 3) Top of company Digital Active (DAX: DISTINCTCOUNT(Digital[reltibn]) filtered DigitalActive)
-
-This is IBN-based:
-
-```sql
-SELECT count(distinct primary_ibn) as top_company_digital_active_ibn
+SELECT digitally_active_flag, count(*) as cnt
 FROM dm_ib_dev.wia2_customer
-WHERE digitally_active_flag = 'Digital Active'
-  AND primary_ibn is not null;
+GROUP BY digitally_active_flag
+ORDER BY cnt DESC;
 ```
 
----
+```sql
+SELECT digital_flag, count(*) as cnt
+FROM dm_ib_dev.wia2_customer
+GROUP BY digital_flag
+ORDER BY cnt DESC;
+```
 
-# 4) Digital Enrollment Wealth (DAX: CALCULATE(Wealth[wealthcustomer], RCIF[rcifdig.digitalflag]="Digital User")
-
-Interpretation = **Wealth RCIFs who are Digital Users**.
+### C) Does wealth RCIF match customer RCIF at all?
 
 ```sql
 WITH mx AS (SELECT max(business_date) as dt FROM dm_ib_dev.wic2_wealth_fact),
 wealth_latest AS (
-  SELECT distinct rcif_number
+  SELECT distinct cast(rcif_number as string) as rcif_number
   FROM dm_ib_dev.wic2_wealth_fact w
   JOIN mx ON w.business_date = mx.dt
-)
-SELECT count(distinct w.rcif_number) as digital_enrollment_wealth
-FROM wealth_latest w
-JOIN dm_ib_dev.wia2_customer c
-  ON w.rcif_number = c.rcif_number
-WHERE c.digital_flag = 'Digital User';
-```
-
----
-
-# 5) Wealth Digitally Active Customers (intersection measure you described)
-
-**Wealth RCIFs ∩ Digital Active**
-
-```sql
-WITH mx AS (SELECT max(business_date) as dt FROM dm_ib_dev.wic2_wealth_fact),
-wealth_latest AS (
-  SELECT distinct rcif_number
-  FROM dm_ib_dev.wic2_wealth_fact w
-  JOIN mx ON w.business_date = mx.dt
-)
-SELECT count(distinct w.rcif_number) as wealth_digital_active_customers
-FROM wealth_latest w
-JOIN dm_ib_dev.wia2_customer c
-  ON w.rcif_number = c.rcif_number
-WHERE c.digitally_active_flag = 'Digital Active';
-```
-
----
-
-# 6) Wealth Digitally Active Penetration (DAX: Accounts / WealthCustomers)
-
-You said ~6.5-ish: `Accounts / Wealth[wealthcustomer]`
-
-```sql
-WITH mx AS (SELECT max(business_date) as dt FROM dm_ib_dev.wic2_wealth_fact),
-wealth_latest AS (
-  SELECT *
-  FROM dm_ib_dev.wic2_wealth_fact w
-  JOIN mx ON w.business_date = mx.dt
-),
-wealthcustomer AS (
-  SELECT count(distinct rcif_number) as cnt FROM wealth_latest
-),
-accounts AS (
-  SELECT sum(accts_cnt) as cnt FROM wealth_latest
-)
-SELECT
-  a.cnt as accounts,
-  wc.cnt as wealthcustomer,
-  (a.cnt * 1.0) / wc.cnt as accounts_per_wealth_customer
-FROM accounts a
-CROSS JOIN wealthcustomer wc;
-```
-
----
-
-# 7) Digital Wealth Penetration (your DAX had an INTERSECT with Digital Active)
-
-This is basically:
-**(Wealth RCIFs who are Digital Active) / (Wealth RCIFs)**
-
-```sql
-WITH mx AS (SELECT max(business_date) as dt FROM dm_ib_dev.wic2_wealth_fact),
-wealth_latest AS (
-  SELECT distinct rcif_number
-  FROM dm_ib_dev.wic2_wealth_fact w
-  JOIN mx ON w.business_date = mx.dt
-),
-wealth_total AS (
-  SELECT count(*) as cnt FROM wealth_latest
-),
-wealth_digital_active AS (
-  SELECT count(distinct w.rcif_number) as cnt
-  FROM wealth_latest w
-  JOIN dm_ib_dev.wia2_customer c
-    ON w.rcif_number = c.rcif_number
-  WHERE c.digitally_active_flag = 'Digital Active'
-)
-SELECT
-  wda.cnt as wealth_digital_active_rcif,
-  wt.cnt  as wealth_rcif,
-  (wda.cnt * 1.0) / wt.cnt as digital_wealth_penetration
-FROM wealth_digital_active wda
-CROSS JOIN wealth_total wt;
-```
-
----
-
-# 8) Digital Wealth “IBN penetration” (you had rcif / distinct ibn)
-
-Your line:
-`DISTINCTCOUNT(Wealth[rcifnumber]) / DISTINCTCOUNT(RCIF[rcifdig.custinternetbankingnbr])`
-
-SQL equivalent (wealth RCIFs / wealth IBNs):
-
-```sql
-WITH mx AS (SELECT max(business_date) as dt FROM dm_ib_dev.wic2_wealth_fact),
-wealth_latest AS (
-  SELECT distinct rcif_number
-  FROM dm_ib_dev.wic2_wealth_fact w
-  JOIN mx ON w.business_date = mx.dt
-),
-wealth_ibn AS (
-  SELECT distinct c.primary_ibn
-  FROM wealth_latest w
-  JOIN dm_ib_dev.wia2_customer c
-    ON w.rcif_number = c.rcif_number
-  WHERE c.primary_ibn is not null
 )
 SELECT
   (SELECT count(*) FROM wealth_latest) as wealth_rcifs,
-  (SELECT count(*) FROM wealth_ibn)    as wealth_ibns,
-  (SELECT count(*) FROM wealth_latest) * 1.0 / (SELECT count(*) FROM wealth_ibn) as rcif_per_ibn
-;
-```
-
----
-
-# 9) InvestPath measures (if you have investpath table)
-
-From your screenshot:
-
-* InvestPath Customers = DISTINCTCOUNT(InvestPath[ipid]) ~100
-* # Accounts = DISTINCTCOUNT(InvestPath[accounts]) ~110
-* AUM = SUM(InvestPath[balance]) ~1.52m
-* Avg balance per IP account = AUM / #Accounts
-* Funded accounts = DISTINCTCOUNT(accounts) where balance > 0
-
-If your invest table is `dm_ib_dev.inv` with columns:
-`ip_id`, `act_cnt` (account id), `balance`
-
-Use:
-
-```sql
-SELECT
-  count(distinct ip_id) as investpath_customers,
-  count(distinct act_cnt) as investpath_accounts,
-  sum(balance) as aum,
-  sum(balance) / count(distinct act_cnt) as avg_balance_per_account,
-  count(distinct case when balance > 0 then act_cnt end) as funded_accounts
-FROM dm_ib_dev.inv;
-```
-
-(Replace `dm_ib_dev.inv` with your real invest table name.)
-
----
-
-# 10) State slice versions (since you mentioned state visuals)
-
-### Wealth customers by state (latest)
-
-```sql
-WITH mx AS (SELECT max(business_date) as dt FROM dm_ib_dev.wic2_wealth_fact),
-wealth_latest AS (
-  SELECT distinct rcif_number
-  FROM dm_ib_dev.wic2_wealth_fact w
-  JOIN mx ON w.business_date = mx.dt
-)
-SELECT
-  c.state_name,
-  count(distinct w.rcif_number) as wealth_customers
+  (SELECT count(distinct cast(rcif_number as string)) FROM dm_ib_dev.wia2_customer) as customer_rcifs,
+  count(*) as matched_rcifs
 FROM wealth_latest w
 JOIN dm_ib_dev.wia2_customer c
-  ON w.rcif_number = c.rcif_number
-GROUP BY c.state_name
-ORDER BY wealth_customers DESC;
-```
-
-### Digital active IBN by state
-
-```sql
-SELECT
-  state_name,
-  count(distinct primary_ibn) as digital_active_ibn
-FROM dm_ib_dev.wia2_customer
-WHERE digitally_active_flag='Digital Active'
-  AND primary_ibn is not null
-GROUP BY state_name
-ORDER BY digital_active_ibn DESC;
+  ON cast(w.rcif_number as string) = cast(c.rcif_number as string);
 ```
 
 ---
 
-## What I need from you after you run these
+## After you paste those 4 outputs
 
-Just paste the outputs for:
+I will give you a **full new Spark code** that fixes all issues at once:
 
-1. wealthcustomer
-2. accounts
-3. digital_active_ibn
-4. digital_enrollment_wealth
-5. wealth_digital_active_customers
+✅ Fix digital = not 0 (correct IBN join + correct flags + correct snapshot date)
+✅ Fix wealth accounts inflation (composite key counting)
+✅ Keep wealth RCIF ≈ 269k stable
+✅ Output final 2–3 tables for Power BI
 
-…and tell me what you expected for each. Then I’ll tell you exactly which part is still mismatched (join key vs definition vs date window vs grain).
+---
+
+### Why I’m not dumping “new full code” immediately
+
+Because if your issue is simply:
+
+* flags are `'Digital Active '` (extra space) OR
+* rcif has leading zeros mismatch OR
+* your `wia2_customer` table wrote empty
+
+…then a full rebuild isn’t needed, and you’ll waste hours again.
+
+Run those 4 checks, paste results, and I’ll respond with the final corrected end-to-end Spark script.
