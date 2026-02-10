@@ -1,7 +1,18 @@
-Top Company Digital Active :=
+Digital Enrollment – Wealth :=
+VAR _latestDate =
+    [Latest Wealth Date]
+RETURN
 CALCULATE (
-    DISTINCTCOUNT ( wia2_customer[primary_ibn] ),
-    REMOVEFILTERS ( wic2_wealth_fact ),
-    wia2_customer[digitally_active_flag] = "Digital Active",
-    NOT ISBLANK ( wia2_customer[primary_ibn] )
+    DISTINCTCOUNT ( wic2_wealth_fact[rcif_number] ),
+
+    -- lock to latest wealth snapshot
+    FILTER (
+        ALL ( wic2_wealth_fact ),
+        wic2_wealth_fact[business_date] = _latestDate
+    ),
+
+    -- apply enrollment filter from customer table
+    KEEPFILTERS (
+        wia2_customer[digital_flag] = "Digital User"
+    )
 )
