@@ -1,23 +1,7 @@
-Digital Active Wealth :=
-VAR _latestDate =
-    [Latest Wealth Date]
-RETURN
+Top Company Digital Active :=
 CALCULATE (
-    DISTINCTCOUNT ( wic2_wealth_fact[rcif_number] ),
-    FILTER (
-        ALL ( wic2_wealth_fact ),
-        wic2_wealth_fact[business_date] = _latestDate
-    ),
-    wia2_customer[digitally_active_flag] = "Digital Active"
-)
-Wealth Accounts :=
-VAR _latestDate =
-    [Latest Wealth Date]
-RETURN
-CALCULATE (
-    SUM ( wic2_wealth_fact[accts_cnt] ),
-    FILTER (
-        ALL ( wic2_wealth_fact ),
-        wic2_wealth_fact[business_date] = _latestDate
-    )
+    DISTINCTCOUNT ( wia2_customer[primary_ibn] ),
+    REMOVEFILTERS ( wic2_wealth_fact ),
+    wia2_customer[digitally_active_flag] = "Digital Active",
+    NOT ISBLANK ( wia2_customer[primary_ibn] )
 )
