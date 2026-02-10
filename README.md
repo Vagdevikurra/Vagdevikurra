@@ -1,284 +1,311 @@
-Perfect — we *can* add InvestPath **without messing up Wealth** by doing it in a controlled way:
+# ============================================================
+# WIC2: Keep Wealth rows intact + append InvestPath as extra slice
+# Single fact table (3-table model safe pattern)
+# ============================================================
 
-✅ Keep **wealth rows exactly as-is**
-✅ Append **investpath rows as a separate “slice”** inside the same fact table
-✅ Ensure every Wealth measure filters **division != 'InvestPath'** (or `fact_type = 'WEALTH'`) so Wealth numbers never get inflated
-
-Below is the clean pattern that works and keeps your model at **3 tables**.
-
----
-
-## A) What we will do (safe design)
-
-### Keep your existing 3 tables
-
-* `wic2_wealth_fact`  ✅ (we will *extend* it)
-* `wia2_customer` ✅
-* `wir2_rcif_set` ✅ (optional/disconnected)
-
-### Add InvestPath into `wic2_wealth_fact` as extra rows
-
-We’ll add these columns to the fact (nullable for Wealth rows):
-
-* `fact_type`  → `'WEALTH'` or `'INVESTPATH'`
-* `ip_id`
-* `ip_account_id` (arrangement_id)
-* `ip_balance`
-* `ip_open_date`
-
-For Wealth rows:
-
-* `fact_type = 'WEALTH'`
-* `ip_* = NULL`
-
-For InvestPath rows:
-
-* `fact_type = 'INVESTPATH'`
-* `business_date = latest_date` (same as wealth latest)
-* `rcif_number` populated
-* `accts_cnt = 1`
-* `division = 'InvestPath'`
-* `business_group = 'Investment Services'` (or whatever you want)
-* `ip_*` populated
-
-**This guarantees Wealth counts won’t change** as long as Wealth measures filter `fact_type = 'WEALTH'`.
-
----
-
-## B) Spark code (append InvestPath into the same fact)
-
-> Replace database/schema names with yours. I’ll assume:
->
-> * wealth fact temp view already exists as `wic2_wealth_fact_base` (your current final wealth fact before saving)
-> * investpath source is from `eil.d_involved_party_h`, `eil.d_arrangement_to_involved_party_relationship_h`, `eil.d_arrangement_h` (from your screenshot)
-
-```python
-# ------------------------------------------------------------
-# 0) Config
-# ------------------------------------------------------------
-DEFAULT_DB = "dm_ib_dev"  # change if needed
+from pyspark.sql import SparkSession, functions as F, types as T
 
 # ------------------------------------------------------------
-# 1) Get latest business_date (same logic you used for wealth)
+# 0) Spark / Hive "connection" (works in Databricks + spark-submit)
 # ------------------------------------------------------------
-mx = spark.sql("""
+try:
+    spark  # noqa: F821
+except NameError:
+    spark = (
+        SparkSession.builder
+        .appName("WIC2 Wealth + InvestPath Union")
+        .enableHiveSupport()
+        .config("spark.sql.adaptive.enabled", "true")
+        .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+        .config("spark.sql.shuffle.partitions", "800")
+        .config("spark.sql.broadcastTimeout", "1200")
+        .getOrCreate()
+    )
+
+# Common tuning (safe in most managed clusters)
+spark.conf.set("spark.sql.adaptive.enabled", "true")
+spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
+spark.conf.set("spark.sql.shuffle.partitions", "800")
+spark.conf.set("spark.sql.broadcastTimeout", "1200")
+
+# If your environment honors these Hive settings
+try:
+    spark.sql("SET hive.exec.dynamic.partition=true")
+    spark.sql("SET hive.exec.dynamic.partition.mode=nonstrict")
+except Exception:
+    pass
+
+# ------------------------------------------------------------
+# 1) Config (change these ONLY)
+# ------------------------------------------------------------
+DEFAULT_DB = "dm_ib_dev"          # your target DB
+WEALTH_FACT_TABLE = "wic2_wealth_fact"  # existing wealth-only fact table name
+FULL_WEALTH_TABLE = f"{DEFAULT_DB}.{WEALTH_FACT_TABLE}"
+
+# Source tables (do not change unless your schema differs)
+T_INVP = "eil.d_involved_party_h"
+T_A2I  = "eil.d_arrangement_to_involved_party_relationship_h"
+T_AR   = "eil.d_arrangement_h"
+
+# InvestPath filters (adjust if your codes differ)
+INV_INVP_SOURCE_SYSTEM = "CF"
+INV_AR_SOURCE_SYSTEM   = "RN"
+INV_AR_ACCOUNT_TYPE    = "IP"
+
+# ------------------------------------------------------------
+# 2) Helper: align schemas so UNION never fails
+# ------------------------------------------------------------
+def align_to_columns(df, ordered_cols_with_types):
+    """
+    ordered_cols_with_types: list of tuples -> [(col_name, spark_type), ...]
+    Ensures df has ALL cols, casts them, and returns in EXACT order.
+    Missing cols are created as NULL of the right type.
+    """
+    for c, typ in ordered_cols_with_types:
+        if c not in df.columns:
+            df = df.withColumn(c, F.lit(None).cast(typ))
+        else:
+            df = df.withColumn(c, F.col(c).cast(typ))
+    return df.select([c for c, _ in ordered_cols_with_types])
+
+# ------------------------------------------------------------
+# 3) Read existing Wealth fact (must already exist and be correct)
+# ------------------------------------------------------------
+wealth_df = spark.table(FULL_WEALTH_TABLE)
+wealth_df.createOrReplaceTempView("wealth_fact_existing")
+
+# Auto-detect whether state_name exists in wealth table
+HAS_STATE = "state_name" in wealth_df.columns
+
+# Build final fact schema (include state_name only if present)
+FACT_COLS = [
+    ("business_date",   T.DateType()),
+    ("rcif_number",     T.StringType()),
+    ("business_group",  T.StringType()),
+    ("division",        T.StringType()),
+    ("accts_cnt",       T.IntegerType()),
+]
+if HAS_STATE:
+    FACT_COLS.append(("state_name", T.StringType()))
+
+FACT_COLS += [
+    ("fact_type",       T.StringType()),
+    ("ip_id",           T.StringType()),
+    ("ip_account_id",   T.StringType()),
+    ("ip_balance",      T.DoubleType()),
+    ("ip_open_date",    T.DateType()),
+]
+
+print("Wealth table:", FULL_WEALTH_TABLE)
+print("Detected state_name:", HAS_STATE)
+print("Final FACT_COLS order:", [c for c, _ in FACT_COLS])
+
+# ------------------------------------------------------------
+# 4) Get latest business_date (same dt for IP slice)
+# ------------------------------------------------------------
+mx = spark.sql(f"""
   SELECT MAX(CAST(business_date AS date)) AS dt
-  FROM eil.d_involved_party_h
+  FROM {T_INVP}
 """).collect()[0]["dt"]
 
-print("Latest business_date =", mx)
+if mx is None:
+    raise RuntimeError(f"Could not find MAX(business_date) in {T_INVP}")
 
+print("Latest business_date =", mx)
 spark.sql(f"CREATE OR REPLACE TEMP VIEW mx_dt AS SELECT DATE('{mx}') AS dt")
 
 # ------------------------------------------------------------
-# 2) Wealth fact (your existing result)
-#    Assume you already built it as temp view wic2_wealth_fact (WEALTH only)
-#    If you saved it already, you can read it back from Hive instead.
+# 5) Wealth rows: add fact_type + InvestPath nullable columns
+#    IMPORTANT: Wealth rows are kept exactly as-is, plus extra columns
 # ------------------------------------------------------------
-wealth_df = spark.table(f"{DEFAULT_DB}.wic2_wealth_fact")  # OR your temp view
-wealth_df.createOrReplaceTempView("wealth_fact_existing")
+# Minimal select for wealth (keep your existing wealth columns here)
+# If you have MORE wealth columns you want to keep, add them to FACT_COLS + select below.
+if HAS_STATE:
+    wealth_typed_sql = """
+    CREATE OR REPLACE TEMP VIEW wealth_fact_typed AS
+    SELECT
+      CAST(business_date AS date) AS business_date,
+      CAST(rcif_number AS string) AS rcif_number,
+      CAST(business_group AS string) AS business_group,
+      CAST(division AS string) AS division,
+      CAST(accts_cnt AS int) AS accts_cnt,
+      CAST(state_name AS string) AS state_name,
 
-# Add investpath columns (NULL) + fact_type
+      'WEALTH' AS fact_type,
+      CAST(NULL AS string) AS ip_id,
+      CAST(NULL AS string) AS ip_account_id,
+      CAST(NULL AS double) AS ip_balance,
+      CAST(NULL AS date) AS ip_open_date
+    FROM wealth_fact_existing
+    """
+else:
+    wealth_typed_sql = """
+    CREATE OR REPLACE TEMP VIEW wealth_fact_typed AS
+    SELECT
+      CAST(business_date AS date) AS business_date,
+      CAST(rcif_number AS string) AS rcif_number,
+      CAST(business_group AS string) AS business_group,
+      CAST(division AS string) AS division,
+      CAST(accts_cnt AS int) AS accts_cnt,
+
+      'WEALTH' AS fact_type,
+      CAST(NULL AS string) AS ip_id,
+      CAST(NULL AS string) AS ip_account_id,
+      CAST(NULL AS double) AS ip_balance,
+      CAST(NULL AS date) AS ip_open_date
+    FROM wealth_fact_existing
+    """
+
+spark.sql(wealth_typed_sql)
+
+# ------------------------------------------------------------
+# 6) InvestPath rows (latest dt only)
+# ------------------------------------------------------------
+if HAS_STATE:
+    ip_sql = f"""
+    CREATE OR REPLACE TEMP VIEW investpath_rows AS
+    WITH dt AS (SELECT dt FROM mx_dt),
+    inv AS (
+      SELECT
+        CAST(ind.rcif_cust_nbr AS string)         AS rcif_number,
+        CAST(ind.involved_party_id AS string)    AS ip_id,
+        CAST(ar.arrangement_id AS string)        AS ip_account_id,
+        CAST(ar.current_balance_amt AS double)   AS ip_balance,
+        CAST(ar.open_date AS date)               AS ip_open_date
+      FROM {T_INVP} ind
+      JOIN dt ON CAST(ind.business_date AS date) = dt.dt
+      JOIN {T_A2I} a2i
+        ON ind.involved_party_id = a2i.involved_party_id
+       AND ind.business_date = a2i.business_date
+       AND ind.source_system_code = a2i.source_system_code
+      JOIN {T_AR} ar
+        ON a2i.arrangement_id = ar.arrangement_id
+       AND a2i.arrangement_source_system_code = ar.source_system_code
+       AND a2i.business_date = ar.business_date
+      WHERE ind.source_system_code = '{INV_INVP_SOURCE_SYSTEM}'
+        AND NVL(ind.deceased_ind, 'N') = 'N'
+        AND ar.closed_ind = 'N'
+        AND ar.account_type_code = '{INV_AR_ACCOUNT_TYPE}'
+        AND ar.source_system_code = '{INV_AR_SOURCE_SYSTEM}'
+    )
+    SELECT
+      (SELECT dt FROM mx_dt)         AS business_date,
+      rcif_number,
+      'Investment Services'         AS business_group,
+      'InvestPath'                  AS division,
+      1                             AS accts_cnt,
+      CAST(NULL AS string)          AS state_name,
+
+      'INVESTPATH'                  AS fact_type,
+      ip_id,
+      ip_account_id,
+      ip_balance,
+      ip_open_date
+    FROM inv
+    WHERE rcif_number IS NOT NULL
+    """
+else:
+    ip_sql = f"""
+    CREATE OR REPLACE TEMP VIEW investpath_rows AS
+    WITH dt AS (SELECT dt FROM mx_dt),
+    inv AS (
+      SELECT
+        CAST(ind.rcif_cust_nbr AS string)         AS rcif_number,
+        CAST(ind.involved_party_id AS string)    AS ip_id,
+        CAST(ar.arrangement_id AS string)        AS ip_account_id,
+        CAST(ar.current_balance_amt AS double)   AS ip_balance,
+        CAST(ar.open_date AS date)               AS ip_open_date
+      FROM {T_INVP} ind
+      JOIN dt ON CAST(ind.business_date AS date) = dt.dt
+      JOIN {T_A2I} a2i
+        ON ind.involved_party_id = a2i.involved_party_id
+       AND ind.business_date = a2i.business_date
+       AND ind.source_system_code = a2i.source_system_code
+      JOIN {T_AR} ar
+        ON a2i.arrangement_id = ar.arrangement_id
+       AND a2i.arrangement_source_system_code = ar.source_system_code
+       AND a2i.business_date = ar.business_date
+      WHERE ind.source_system_code = '{INV_INVP_SOURCE_SYSTEM}'
+        AND NVL(ind.deceased_ind, 'N') = 'N'
+        AND ar.closed_ind = 'N'
+        AND ar.account_type_code = '{INV_AR_ACCOUNT_TYPE}'
+        AND ar.source_system_code = '{INV_AR_SOURCE_SYSTEM}'
+    )
+    SELECT
+      (SELECT dt FROM mx_dt)         AS business_date,
+      rcif_number,
+      'Investment Services'         AS business_group,
+      'InvestPath'                  AS division,
+      1                             AS accts_cnt,
+
+      'INVESTPATH'                  AS fact_type,
+      ip_id,
+      ip_account_id,
+      ip_balance,
+      ip_open_date
+    FROM inv
+    WHERE rcif_number IS NOT NULL
+    """
+
+spark.sql(ip_sql)
+
+# ------------------------------------------------------------
+# 7) Union wealth + investpath safely (schema aligned)
+# ------------------------------------------------------------
+wealth_typed_df = spark.table("wealth_fact_typed")
+ip_rows_df      = spark.table("investpath_rows")
+
+wealth_aligned = align_to_columns(wealth_typed_df, FACT_COLS)
+ip_aligned     = align_to_columns(ip_rows_df, FACT_COLS)
+
+final_df = wealth_aligned.unionByName(ip_aligned)
+final_df.createOrReplaceTempView("wic2_wealth_fact_final")
+
+# ------------------------------------------------------------
+# 8) VALIDATIONS (must match Wealth before/after)
+# ------------------------------------------------------------
+print("\n--- Wealth baseline (from existing wealth table) ---")
 spark.sql("""
-CREATE OR REPLACE TEMP VIEW wealth_fact_typed AS
+WITH dt AS (SELECT MAX(CAST(business_date AS date)) AS dt FROM wealth_fact_existing)
 SELECT
-  business_date,
-  rcif_number,
-  business_group,
-  division,
-  accts_cnt,
-  -- keep any other wealth columns you already have here (state_name, etc.)
-  state_name,
-
-  'WEALTH' AS fact_type,
-  CAST(NULL AS string) AS ip_id,
-  CAST(NULL AS string) AS ip_account_id,
-  CAST(NULL AS double) AS ip_balance,
-  CAST(NULL AS date) AS ip_open_date
-FROM wealth_fact_existing
-""")
-
-# ------------------------------------------------------------
-# 3) InvestPath rows (latest dt only)
-# ------------------------------------------------------------
-spark.sql("""
-CREATE OR REPLACE TEMP VIEW investpath_rows AS
-WITH dt AS (SELECT dt FROM mx_dt),
-inv AS (
-  SELECT
-    CAST(ind.rcif_cust_nbr AS string) AS rcif_number,
-    CAST(ind.involved_party_id AS string) AS ip_id,
-    CAST(ar.arrangement_id AS string) AS ip_account_id,
-    CAST(ar.current_balance_amt AS double) AS ip_balance,
-    CAST(ar.open_date AS date) AS ip_open_date
-  FROM eil.d_involved_party_h ind
-  JOIN dt ON CAST(ind.business_date AS date) = dt.dt
-  JOIN eil.d_arrangement_to_involved_party_relationship_h a2i
-    ON ind.involved_party_id = a2i.involved_party_id
-   AND ind.business_date = a2i.business_date
-   AND ind.source_system_code = a2i.source_system_code
-  JOIN eil.d_arrangement_h ar
-    ON a2i.arrangement_id = ar.arrangement_id
-   AND a2i.arrangement_source_system_code = ar.source_system_code
-   AND a2i.business_date = ar.business_date
-  WHERE ind.source_system_code = 'CF'
-    AND NVL(ind.deceased_ind, 'N') = 'N'
-    AND ar.closed_ind = 'N'
-    AND ar.account_type_code = 'IP'
-    AND ar.source_system_code = 'RN'
-)
-SELECT
-  (SELECT dt FROM mx_dt) AS business_date,
-  rcif_number,
-  'Investment Services' AS business_group,
-  'InvestPath' AS division,
-  1 AS accts_cnt,
-  CAST(NULL AS string) AS state_name, -- optional, unless you want to join address
-  'INVESTPATH' AS fact_type,
-  ip_id,
-  ip_account_id,
-  ip_balance,
-  ip_open_date
-FROM inv
-WHERE rcif_number IS NOT NULL
-""")
-
-# ------------------------------------------------------------
-# 4) Union wealth + investpath into one final fact
-# ------------------------------------------------------------
-spark.sql("""
-CREATE OR REPLACE TEMP VIEW wic2_wealth_fact_final AS
-SELECT * FROM wealth_fact_typed
-UNION ALL
-SELECT * FROM investpath_rows
-""")
-
-# ------------------------------------------------------------
-# 5) Validation checks (VERY important)
-# ------------------------------------------------------------
-# Wealth counts should match your current wealth counts (latest dt)
-spark.sql("""
-WITH dt AS (SELECT MAX(business_date) AS dt FROM wealth_fact_existing)
-SELECT
-  (SELECT dt FROM dt) AS dt,
-  COUNT(DISTINCT CASE WHEN business_date = (SELECT dt FROM dt) THEN rcif_number END) AS wealth_rcifs_latest,
-  SUM(CASE WHEN business_date = (SELECT dt FROM dt) THEN accts_cnt ELSE 0 END) AS wealth_accounts_latest
+  (SELECT dt FROM dt) AS latest_dt,
+  COUNT(DISTINCT CASE WHEN CAST(business_date AS date)=(SELECT dt FROM dt) THEN rcif_number END) AS wealth_rcifs_latest,
+  SUM(CASE WHEN CAST(business_date AS date)=(SELECT dt FROM dt) THEN accts_cnt ELSE 0 END)        AS wealth_accounts_latest
 FROM wealth_fact_existing
 """).show(truncate=False)
 
+print("\n--- Wealth after (filtered to fact_type='WEALTH') ---")
 spark.sql("""
-WITH dt AS (SELECT MAX(business_date) AS dt FROM wealth_fact_existing)
+WITH dt AS (SELECT MAX(CAST(business_date AS date)) AS dt FROM wealth_fact_existing)
 SELECT
-  COUNT(DISTINCT CASE WHEN fact_type='WEALTH' AND business_date=(SELECT dt FROM dt) THEN rcif_number END) AS wealth_rcifs_latest_after,
-  SUM(CASE WHEN fact_type='WEALTH' AND business_date=(SELECT dt FROM dt) THEN accts_cnt ELSE 0 END) AS wealth_accounts_latest_after
+  COUNT(DISTINCT CASE WHEN fact_type='WEALTH' AND CAST(business_date AS date)=(SELECT dt FROM dt) THEN rcif_number END) AS wealth_rcifs_latest_after,
+  SUM(CASE WHEN fact_type='WEALTH' AND CAST(business_date AS date)=(SELECT dt FROM dt) THEN accts_cnt ELSE 0 END)        AS wealth_accounts_latest_after
 FROM wic2_wealth_fact_final
 """).show(truncate=False)
 
-# InvestPath basic counts
+print("\n--- InvestPath stats (new slice) ---")
 spark.sql("""
 SELECT
-  COUNT(*) AS ip_rows,
-  COUNT(DISTINCT ip_id) AS ip_customers,
+  COUNT(*)                      AS ip_rows,
+  COUNT(DISTINCT ip_id)         AS ip_customers,
   COUNT(DISTINCT ip_account_id) AS ip_accounts,
-  SUM(ip_balance) AS ip_aum,
+  SUM(ip_balance)               AS ip_aum,
   SUM(CASE WHEN ip_balance > 0 THEN 1 ELSE 0 END) AS ip_funded_accounts
 FROM wic2_wealth_fact_final
 WHERE fact_type='INVESTPATH'
 """).show(truncate=False)
 
 # ------------------------------------------------------------
-# 6) Save back to same table (overwrite) - ONLY after validation matches
+# 9) Save overwrite (ONLY after validation looks good)
 # ------------------------------------------------------------
-spark.table("wic2_wealth_fact_final").write.mode("overwrite").saveAsTable(f"{DEFAULT_DB}.wic2_wealth_fact")
-print("Saved:", f"{DEFAULT_DB}.wic2_wealth_fact")
-```
+# If you want a safety net, you can save to a new table first, then swap names.
+# Example: f"{DEFAULT_DB}.wic2_wealth_fact_tmp"
 
-### Why this won’t mess up Wealth
-
-Because Wealth measures will filter `fact_type = 'WEALTH'` (or `division <> 'InvestPath'`), and the Wealth rows remain unchanged.
-
----
-
-## C) Power BI DAX for InvestPath (pointing to same `wic2_wealth_fact`)
-
-### InvestPath Customers
-
-```DAX
-InvestPath Customers =
-CALCULATE(
-    DISTINCTCOUNT ( wic2_wealth_fact[ip_id] ),
-    wic2_wealth_fact[fact_type] = "INVESTPATH"
+(
+    spark.table("wic2_wealth_fact_final")
+    .write
+    .mode("overwrite")
+    .saveAsTable(FULL_WEALTH_TABLE)
 )
-```
 
-### InvestPath Accounts
-
-```DAX
-InvestPath Accounts =
-CALCULATE(
-    DISTINCTCOUNT ( wic2_wealth_fact[ip_account_id] ),
-    wic2_wealth_fact[fact_type] = "INVESTPATH"
-)
-```
-
-### InvestPath AUM
-
-```DAX
-InvestPath AUM =
-CALCULATE(
-    SUM ( wic2_wealth_fact[ip_balance] ),
-    wic2_wealth_fact[fact_type] = "INVESTPATH"
-)
-```
-
-### InvestPath Funded Accounts
-
-```DAX
-InvestPath Funded Accounts =
-CALCULATE(
-    DISTINCTCOUNT ( wic2_wealth_fact[ip_account_id] ),
-    wic2_wealth_fact[fact_type] = "INVESTPATH",
-    wic2_wealth_fact[ip_balance] > 0
-)
-```
-
-### Average Balance per InvestPath Account
-
-```DAX
-InvestPath Avg Balance per Account =
-DIVIDE( [InvestPath AUM], [InvestPath Accounts] )
-```
-
----
-
-## D) Update your existing Wealth measures (to stay pure Wealth)
-
-Wherever you compute Wealth customers/accounts, add:
-
-* `wic2_wealth_fact[fact_type] = "WEALTH"`
-
-Example:
-
-```DAX
-Wealth Customers =
-VAR dt = [Latest Wealth Date]
-RETURN
-CALCULATE(
-    DISTINCTCOUNT ( wic2_wealth_fact[rcif_number] ),
-    wic2_wealth_fact[business_date] = dt,
-    wic2_wealth_fact[fact_type] = "WEALTH"
-)
-```
-
-That one line prevents InvestPath rows from ever inflating Wealth.
-
----
-
-## Quick question (so I don’t guess wrong and break it)
-
-In your `wic2_wealth_fact` right now, do you already have a `state_name` column saved?
-
-* If **yes**, we keep it and set NULL for InvestPath rows (safe).
-* If **no**, remove `state_name` from the union on both sides.
-
-If you tell me “state_name exists / doesn’t exist”, I’ll paste the final version with the exact column list so your `UNION ALL` never fails.
+print("✅ Saved final combined fact table to:", FULL_WEALTH_TABLE)
