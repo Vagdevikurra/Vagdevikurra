@@ -1,12 +1,12 @@
 # ============================================================
 # WIC2: Keep Wealth rows intact + append InvestPath as extra slice
-# Single fact table (3-table model safe pattern)
+# Fixed validation (no fact_type used on wealth_fact_existing)
 # ============================================================
 
 from pyspark.sql import SparkSession, functions as F, types as T
 
 # ------------------------------------------------------------
-# 0) Spark / Hive "connection" (works in Databricks + spark-submit)
+# 0) Spark / Hive (works in Databricks + spark-submit)
 # ------------------------------------------------------------
 try:
     spark  # noqa: F821
@@ -22,13 +22,11 @@ except NameError:
         .getOrCreate()
     )
 
-# Common tuning (safe in most managed clusters)
 spark.conf.set("spark.sql.adaptive.enabled", "true")
 spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
 spark.conf.set("spark.sql.shuffle.partitions", "800")
 spark.conf.set("spark.sql.broadcastTimeout", "1200")
 
-# If your environment honors these Hive settings
 try:
     spark.sql("SET hive.exec.dynamic.partition=true")
     spark.sql("SET hive.exec.dynamic.partition.mode=nonstrict")
@@ -36,13 +34,13 @@ except Exception:
     pass
 
 # ------------------------------------------------------------
-# 1) Config (change these ONLY)
+# 1) Config (change ONLY these)
 # ------------------------------------------------------------
-DEFAULT_DB = "dm_ib_dev"          # your target DB
-WEALTH_FACT_TABLE = "wic2_wealth_fact"  # existing wealth-only fact table name
+DEFAULT_DB = "dm_ib_dev"
+WEALTH_FACT_TABLE = "wic2_wealth_fact"   # existing wealth-only fact table
 FULL_WEALTH_TABLE = f"{DEFAULT_DB}.{WEALTH_FACT_TABLE}"
 
-# Source tables (do not change unless your schema differs)
+# Source tables
 T_INVP = "eil.d_involved_party_h"
 T_A2I  = "eil.d_arrangement_to_involved_party_relationship_h"
 T_AR   = "eil.d_arrangement_h"
@@ -56,11 +54,6 @@ INV_AR_ACCOUNT_TYPE    = "IP"
 # 2) Helper: align schemas so UNION never fails
 # ------------------------------------------------------------
 def align_to_columns(df, ordered_cols_with_types):
-    """
-    ordered_cols_with_types: list of tuples -> [(col_name, spark_type), ...]
-    Ensures df has ALL cols, casts them, and returns in EXACT order.
-    Missing cols are created as NULL of the right type.
-    """
     for c, typ in ordered_cols_with_types:
         if c not in df.columns:
             df = df.withColumn(c, F.lit(None).cast(typ))
@@ -69,15 +62,13 @@ def align_to_columns(df, ordered_cols_with_types):
     return df.select([c for c, _ in ordered_cols_with_types])
 
 # ------------------------------------------------------------
-# 3) Read existing Wealth fact (must already exist and be correct)
+# 3) Read existing Wealth fact (must already be correct)
 # ------------------------------------------------------------
 wealth_df = spark.table(FULL_WEALTH_TABLE)
 wealth_df.createOrReplaceTempView("wealth_fact_existing")
 
-# Auto-detect whether state_name exists in wealth table
 HAS_STATE = "state_name" in wealth_df.columns
 
-# Build final fact schema (include state_name only if present)
 FACT_COLS = [
     ("business_date",   T.DateType()),
     ("rcif_number",     T.StringType()),
@@ -116,12 +107,9 @@ spark.sql(f"CREATE OR REPLACE TEMP VIEW mx_dt AS SELECT DATE('{mx}') AS dt")
 
 # ------------------------------------------------------------
 # 5) Wealth rows: add fact_type + InvestPath nullable columns
-#    IMPORTANT: Wealth rows are kept exactly as-is, plus extra columns
 # ------------------------------------------------------------
-# Minimal select for wealth (keep your existing wealth columns here)
-# If you have MORE wealth columns you want to keep, add them to FACT_COLS + select below.
 if HAS_STATE:
-    wealth_typed_sql = """
+    spark.sql("""
     CREATE OR REPLACE TEMP VIEW wealth_fact_typed AS
     SELECT
       CAST(business_date AS date) AS business_date,
@@ -137,9 +125,9 @@ if HAS_STATE:
       CAST(NULL AS double) AS ip_balance,
       CAST(NULL AS date) AS ip_open_date
     FROM wealth_fact_existing
-    """
+    """)
 else:
-    wealth_typed_sql = """
+    spark.sql("""
     CREATE OR REPLACE TEMP VIEW wealth_fact_typed AS
     SELECT
       CAST(business_date AS date) AS business_date,
@@ -154,9 +142,7 @@ else:
       CAST(NULL AS double) AS ip_balance,
       CAST(NULL AS date) AS ip_open_date
     FROM wealth_fact_existing
-    """
-
-spark.sql(wealth_typed_sql)
+    """)
 
 # ------------------------------------------------------------
 # 6) InvestPath rows (latest dt only)
@@ -262,24 +248,46 @@ final_df = wealth_aligned.unionByName(ip_aligned)
 final_df.createOrReplaceTempView("wic2_wealth_fact_final")
 
 # ------------------------------------------------------------
-# 8) VALIDATIONS (must match Wealth before/after)
+# 8) VALIDATIONS (FIXED)
+#   - Baseline uses wealth_fact_existing (NO fact_type)
+#   - After uses wic2_wealth_fact_final (WITH fact_type)
 # ------------------------------------------------------------
-print("\n--- Wealth baseline (from existing wealth table) ---")
+print("\n--- Wealth baseline (existing) ---")
 spark.sql("""
-WITH dt AS (SELECT MAX(CAST(business_date AS date)) AS dt FROM wealth_fact_existing)
+WITH dt AS (
+  SELECT MAX(CAST(business_date AS date)) AS dt
+  FROM wealth_fact_existing
+)
 SELECT
   (SELECT dt FROM dt) AS latest_dt,
-  COUNT(DISTINCT CASE WHEN CAST(business_date AS date)=(SELECT dt FROM dt) THEN rcif_number END) AS wealth_rcifs_latest,
-  SUM(CASE WHEN CAST(business_date AS date)=(SELECT dt FROM dt) THEN accts_cnt ELSE 0 END)        AS wealth_accounts_latest
+  COUNT(DISTINCT CASE
+      WHEN CAST(business_date AS date) = (SELECT dt FROM dt)
+      THEN rcif_number
+  END) AS wealth_rcifs_latest,
+  SUM(CASE
+      WHEN CAST(business_date AS date) = (SELECT dt FROM dt)
+      THEN accts_cnt ELSE 0
+  END) AS wealth_accounts_latest
 FROM wealth_fact_existing
 """).show(truncate=False)
 
-print("\n--- Wealth after (filtered to fact_type='WEALTH') ---")
+print("\n--- Wealth after union (filtered to WEALTH) ---")
 spark.sql("""
-WITH dt AS (SELECT MAX(CAST(business_date AS date)) AS dt FROM wealth_fact_existing)
+WITH dt AS (
+  SELECT MAX(CAST(business_date AS date)) AS dt
+  FROM wealth_fact_existing
+)
 SELECT
-  COUNT(DISTINCT CASE WHEN fact_type='WEALTH' AND CAST(business_date AS date)=(SELECT dt FROM dt) THEN rcif_number END) AS wealth_rcifs_latest_after,
-  SUM(CASE WHEN fact_type='WEALTH' AND CAST(business_date AS date)=(SELECT dt FROM dt) THEN accts_cnt ELSE 0 END)        AS wealth_accounts_latest_after
+  COUNT(DISTINCT CASE
+      WHEN fact_type='WEALTH'
+       AND CAST(business_date AS date) = (SELECT dt FROM dt)
+      THEN rcif_number
+  END) AS wealth_rcifs_latest_after,
+  SUM(CASE
+      WHEN fact_type='WEALTH'
+       AND CAST(business_date AS date) = (SELECT dt FROM dt)
+      THEN accts_cnt ELSE 0
+  END) AS wealth_accounts_latest_after
 FROM wic2_wealth_fact_final
 """).show(truncate=False)
 
@@ -298,9 +306,6 @@ WHERE fact_type='INVESTPATH'
 # ------------------------------------------------------------
 # 9) Save overwrite (ONLY after validation looks good)
 # ------------------------------------------------------------
-# If you want a safety net, you can save to a new table first, then swap names.
-# Example: f"{DEFAULT_DB}.wic2_wealth_fact_tmp"
-
 (
     spark.table("wic2_wealth_fact_final")
     .write
