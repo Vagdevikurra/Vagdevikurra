@@ -1,35 +1,220 @@
-let
-    // ===== CHANGE THIS if your table name differs in Power Query =====
-    WealthTable = #"wic2_wealth_fact",
+Yes 👍 — below is a **complete, clean DAX pack** that matches **exactly** the SQL logic and numbers you validated.
 
-    // Ensure the column is type date
-    Dates = List.Transform( List.RemoveNulls(WealthTable[business_date]), each Date.From(_) ),
+These measures assume:
 
-    MinDate = List.Min(Dates),
-    MaxDate = List.Max(Dates),
+* Fact table: **`wic2_wealth_fact`**
+* Customer/digital table: **`wia2_customer`**
+* Relationship:
+  `wic2_wealth_fact[rcif_number]` → `wia2_customer[rcif_number]`
+  (**Many-to-one**, single direction from `wia2_customer` → `wic2_wealth_fact`)
 
-    // Floor/Ceiling (month boundaries)
-    FloorDate = Date.StartOfMonth(MinDate),
-    CeilingDate = Date.EndOfMonth(MaxDate),
+---
 
-    DayCount = Duration.Days(CeilingDate - FloorDate) + 1,
-    DateList = List.Dates(FloorDate, DayCount, #duration(1,0,0,0)),
+# 0️⃣ Helper: Latest Business Date (VERY IMPORTANT)
 
-    Calendar = Table.FromList(DateList, Splitter.SplitByNothing(), {"Date"}, null, ExtraValues.Error),
-    #"Changed Type" = Table.TransformColumnTypes(Calendar, {{"Date", type date}}),
+Use this everywhere so visuals never drift.
 
-    // Standard calendar attributes
-    #"Added Year" = Table.AddColumn(#"Changed Type", "Year", each Date.Year([Date]), Int64.Type),
-    #"Added Month Number" = Table.AddColumn(#"Added Year", "Month Number", each Date.Month([Date]), Int64.Type),
-    #"Added Month Name" = Table.AddColumn(#"Added Month Number", "Month Name", each Date.ToText([Date], "MMM"), type text),
-    #"Added YearMonth" = Table.AddColumn(#"Added Month Name", "YearMonth", each Date.ToText([Date], "yyyy-MM"), type text),
-    #"Added Quarter" = Table.AddColumn(#"Added YearMonth", "Quarter", each "Q" & Text.From(Date.QuarterOfYear([Date])), type text),
-    #"Added StartOfMonth" = Table.AddColumn(#"Added Quarter", "Start of Month", each Date.StartOfMonth([Date]), type date),
-    #"Added EndOfMonth" = Table.AddColumn(#"Added StartOfMonth", "End of Month", each Date.EndOfMonth([Date]), type date),
+```DAX
+Latest Wealth Date :=
+CALCULATE (
+    MAX ( wic2_wealth_fact[business_date] ),
+    ALL ( wic2_wealth_fact )
+)
+```
 
-    // Helpful flags
-    Today = Date.From(DateTime.LocalNow()),
-    #"Added IsToday" = Table.AddColumn(#"Added EndOfMonth", "Is Today", each [Date] = Today, type logical),
-    #"Added IsMonthEnd" = Table.AddColumn(#"Added IsToday", "Is Month End", each [Date] = Date.EndOfMonth([Date]), type logical)
-in
-    #"Added IsMonthEnd"
+---
+
+# 1️⃣ Wealth Customers (≈ 268,984)
+
+```DAX
+Wealth Customers :=
+CALCULATE (
+    DISTINCTCOUNT ( wic2_wealth_fact[rcif_number] ),
+    wic2_wealth_fact[business_date] = [Latest Wealth Date]
+)
+```
+
+---
+
+# 2️⃣ Wealth Accounts (≈ 676k)
+
+```DAX
+Wealth Accounts :=
+CALCULATE (
+    SUM ( wic2_wealth_fact[accts_cnt] ),
+    wic2_wealth_fact[business_date] = [Latest Wealth Date]
+)
+```
+
+---
+
+# 3️⃣ Accounts per Wealth Customer (≈ 2.5)
+
+```DAX
+Accounts per Wealth Customer :=
+DIVIDE (
+    [Wealth Accounts],
+    [Wealth Customers]
+)
+```
+
+---
+
+# 4️⃣ Top of Company – Digital Active (IBN based ≈ 3.5M)
+
+```DAX
+Top Company Digital Active (IBN) :=
+CALCULATE (
+    DISTINCTCOUNT ( wia2_customer[primary_ibn] ),
+    wia2_customer[digitally_active_flag] = "Digital Active",
+    NOT ISBLANK ( wia2_customer[primary_ibn] )
+)
+```
+
+---
+
+# 5️⃣ Digital Enrollment – Wealth (≈ 129,271)
+
+> **This is the ~120k number you expected**
+
+```DAX
+Digital Enrollment – Wealth :=
+CALCULATE (
+    [Wealth Customers],
+    wia2_customer[digital_flag] = "Digital User"
+)
+```
+
+---
+
+# 6️⃣ Digital Active – Wealth (≈ 99,382)
+
+```DAX
+Digital Active – Wealth :=
+CALCULATE (
+    [Wealth Customers],
+    wia2_customer[digitally_active_flag] = "Digital Active"
+)
+```
+
+---
+
+# 7️⃣ Digital Enrollment Penetration – Wealth
+
+```DAX
+Digital Enrollment Penetration :=
+DIVIDE (
+    [Digital Enrollment – Wealth],
+    [Wealth Customers]
+)
+```
+
+---
+
+# 8️⃣ Digital Active Penetration – Wealth
+
+```DAX
+Digital Active Penetration :=
+DIVIDE (
+    [Digital Active – Wealth],
+    [Wealth Customers]
+)
+```
+
+---
+
+# 9️⃣ Wealth Customers by Business Group
+
+(Use in matrix / bar charts)
+
+```DAX
+Wealth Customers by Group :=
+CALCULATE (
+    DISTINCTCOUNT ( wic2_wealth_fact[rcif_number] ),
+    wic2_wealth_fact[business_date] = [Latest Wealth Date]
+)
+```
+
+👉 Slice by:
+
+* `wic2_wealth_fact[business_group]`
+* `wic2_wealth_fact[division]`
+
+---
+
+# 🔟 Wealth Customers by State
+
+```DAX
+Wealth Customers by State :=
+CALCULATE (
+    DISTINCTCOUNT ( wic2_wealth_fact[rcif_number] ),
+    wic2_wealth_fact[business_date] = [Latest Wealth Date]
+)
+```
+
+👉 Slice by:
+
+* `wia2_customer[state_name]`
+
+---
+
+# 1️⃣1️⃣ Digital Active Wealth by State
+
+```DAX
+Digital Active Wealth by State :=
+CALCULATE (
+    [Wealth Customers],
+    wia2_customer[digitally_active_flag] = "Digital Active"
+)
+```
+
+---
+
+# 1️⃣2️⃣ Digital Enrollment Wealth by State
+
+```DAX
+Digital Enrollment Wealth by State :=
+CALCULATE (
+    [Wealth Customers],
+    wia2_customer[digital_flag] = "Digital User"
+)
+```
+
+---
+
+# ✅ IMPORTANT NOTES (PLEASE READ)
+
+### ✔️ Why this works
+
+* Uses **latest business_date explicitly**
+* Matches your **validated SQL results**
+* Separates **Enrollment vs Active** correctly
+* Avoids double counting from multiple month-ends
+
+### ❌ What NOT to do
+
+* Do NOT use `COUNTROWS(wic2_wealth_fact)`
+* Do NOT let visuals auto-sum without filtering latest date
+* Do NOT mix Digital User and Digital Active in same KPI
+
+---
+
+# 🧪 Final cross-check (should match SQL exactly)
+
+| Measure                          | Expected |
+| -------------------------------- | -------- |
+| Wealth Customers                 | ~268,984 |
+| Wealth Accounts                  | ~676,792 |
+| Digital Enrollment – Wealth      | ~129,271 |
+| Digital Active – Wealth          | ~99,382  |
+| Top Company Digital Active (IBN) | ~3.56M   |
+
+---
+
+If you want, next I can:
+
+* Review your **actual Power BI file screenshots**
+* Optimize visuals (avoid implicit measures)
+* Lock these measures so future data refreshes don’t break them
+
+But yes — **you are done with Spark**. 🚀
