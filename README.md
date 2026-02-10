@@ -1,6 +1,6 @@
 # ============================================================
 # WIC2: Keep Wealth rows intact + append InvestPath as extra slice
-# Fixed validation (no fact_type used on wealth_fact_existing)
+# COMPLETE FIXED CODE (validation rewritten to DataFrame API)
 # ============================================================
 
 from pyspark.sql import SparkSession, functions as F, types as T
@@ -65,8 +65,6 @@ def align_to_columns(df, ordered_cols_with_types):
 # 3) Read existing Wealth fact (must already be correct)
 # ------------------------------------------------------------
 wealth_df = spark.table(FULL_WEALTH_TABLE)
-wealth_df.createOrReplaceTempView("wealth_fact_existing")
-
 HAS_STATE = "state_name" in wealth_df.columns
 
 FACT_COLS = [
@@ -103,50 +101,45 @@ if mx is None:
     raise RuntimeError(f"Could not find MAX(business_date) in {T_INVP}")
 
 print("Latest business_date =", mx)
-spark.sql(f"CREATE OR REPLACE TEMP VIEW mx_dt AS SELECT DATE('{mx}') AS dt")
 
 # ------------------------------------------------------------
 # 5) Wealth rows: add fact_type + InvestPath nullable columns
 # ------------------------------------------------------------
+wealth_fact_existing = wealth_df  # keep as DF
+
 if HAS_STATE:
-    spark.sql("""
-    CREATE OR REPLACE TEMP VIEW wealth_fact_typed AS
-    SELECT
-      CAST(business_date AS date) AS business_date,
-      CAST(rcif_number AS string) AS rcif_number,
-      CAST(business_group AS string) AS business_group,
-      CAST(division AS string) AS division,
-      CAST(accts_cnt AS int) AS accts_cnt,
-      CAST(state_name AS string) AS state_name,
-
-      'WEALTH' AS fact_type,
-      CAST(NULL AS string) AS ip_id,
-      CAST(NULL AS string) AS ip_account_id,
-      CAST(NULL AS double) AS ip_balance,
-      CAST(NULL AS date) AS ip_open_date
-    FROM wealth_fact_existing
-    """)
+    wealth_fact_typed = wealth_fact_existing.select(
+        F.to_date("business_date").alias("business_date"),
+        F.col("rcif_number").cast("string").alias("rcif_number"),
+        F.col("business_group").cast("string").alias("business_group"),
+        F.col("division").cast("string").alias("division"),
+        F.col("accts_cnt").cast("int").alias("accts_cnt"),
+        F.col("state_name").cast("string").alias("state_name"),
+        F.lit("WEALTH").alias("fact_type"),
+        F.lit(None).cast("string").alias("ip_id"),
+        F.lit(None).cast("string").alias("ip_account_id"),
+        F.lit(None).cast("double").alias("ip_balance"),
+        F.lit(None).cast("date").alias("ip_open_date"),
+    )
 else:
-    spark.sql("""
-    CREATE OR REPLACE TEMP VIEW wealth_fact_typed AS
-    SELECT
-      CAST(business_date AS date) AS business_date,
-      CAST(rcif_number AS string) AS rcif_number,
-      CAST(business_group AS string) AS business_group,
-      CAST(division AS string) AS division,
-      CAST(accts_cnt AS int) AS accts_cnt,
-
-      'WEALTH' AS fact_type,
-      CAST(NULL AS string) AS ip_id,
-      CAST(NULL AS string) AS ip_account_id,
-      CAST(NULL AS double) AS ip_balance,
-      CAST(NULL AS date) AS ip_open_date
-    FROM wealth_fact_existing
-    """)
+    wealth_fact_typed = wealth_fact_existing.select(
+        F.to_date("business_date").alias("business_date"),
+        F.col("rcif_number").cast("string").alias("rcif_number"),
+        F.col("business_group").cast("string").alias("business_group"),
+        F.col("division").cast("string").alias("division"),
+        F.col("accts_cnt").cast("int").alias("accts_cnt"),
+        F.lit("WEALTH").alias("fact_type"),
+        F.lit(None).cast("string").alias("ip_id"),
+        F.lit(None).cast("string").alias("ip_account_id"),
+        F.lit(None).cast("double").alias("ip_balance"),
+        F.lit(None).cast("date").alias("ip_open_date"),
+    )
 
 # ------------------------------------------------------------
-# 6) InvestPath rows (latest dt only)
+# 6) InvestPath rows (latest dt only) using Spark SQL (same logic)
 # ------------------------------------------------------------
+spark.sql(f"CREATE OR REPLACE TEMP VIEW mx_dt AS SELECT DATE('{mx}') AS dt")
+
 if HAS_STATE:
     ip_sql = f"""
     CREATE OR REPLACE TEMP VIEW investpath_rows AS
@@ -181,7 +174,6 @@ if HAS_STATE:
       'InvestPath'                  AS division,
       1                             AS accts_cnt,
       CAST(NULL AS string)          AS state_name,
-
       'INVESTPATH'                  AS fact_type,
       ip_id,
       ip_account_id,
@@ -223,7 +215,6 @@ else:
       'Investment Services'         AS business_group,
       'InvestPath'                  AS division,
       1                             AS accts_cnt,
-
       'INVESTPATH'                  AS fact_type,
       ip_id,
       ip_account_id,
@@ -234,83 +225,79 @@ else:
     """
 
 spark.sql(ip_sql)
+ip_rows_df = spark.table("investpath_rows")
 
 # ------------------------------------------------------------
 # 7) Union wealth + investpath safely (schema aligned)
 # ------------------------------------------------------------
-wealth_typed_df = spark.table("wealth_fact_typed")
-ip_rows_df      = spark.table("investpath_rows")
-
-wealth_aligned = align_to_columns(wealth_typed_df, FACT_COLS)
+wealth_aligned = align_to_columns(wealth_fact_typed, FACT_COLS)
 ip_aligned     = align_to_columns(ip_rows_df, FACT_COLS)
 
 final_df = wealth_aligned.unionByName(ip_aligned)
 final_df.createOrReplaceTempView("wic2_wealth_fact_final")
 
 # ------------------------------------------------------------
-# 8) VALIDATIONS (FIXED)
-#   - Baseline uses wealth_fact_existing (NO fact_type)
-#   - After uses wic2_wealth_fact_final (WITH fact_type)
+# 8) VALIDATIONS (DataFrame API only — avoids Spark SQL binder errors)
 # ------------------------------------------------------------
-print("\n--- Wealth baseline (existing) ---")
-spark.sql("""
-WITH dt AS (
-  SELECT MAX(CAST(business_date AS date)) AS dt
-  FROM wealth_fact_existing
+latest_dt = wealth_fact_existing.select(F.max(F.to_date("business_date")).alias("dt")).collect()[0]["dt"]
+print("\nLatest wealth_dt used for validation:", latest_dt)
+
+# Baseline wealth (existing table)
+baseline_df = (
+    wealth_fact_existing
+    .withColumn("bdt", F.to_date("business_date"))
+    .where(F.col("bdt") == F.lit(latest_dt))
+    .agg(
+        F.countDistinct(F.col("rcif_number")).alias("wealth_rcifs_latest"),
+        F.sum(F.col("accts_cnt").cast("long")).alias("wealth_accounts_latest")
+    )
 )
-SELECT
-  (SELECT dt FROM dt) AS latest_dt,
-  COUNT(DISTINCT CASE
-      WHEN CAST(business_date AS date) = (SELECT dt FROM dt)
-      THEN rcif_number
-  END) AS wealth_rcifs_latest,
-  SUM(CASE
-      WHEN CAST(business_date AS date) = (SELECT dt FROM dt)
-      THEN accts_cnt ELSE 0
-  END) AS wealth_accounts_latest
-FROM wealth_fact_existing
-""").show(truncate=False)
+
+print("\n--- Wealth baseline (existing) ---")
+baseline_df.show(truncate=False)
+
+# Wealth after union (filtered to WEALTH)
+after_df = (
+    final_df
+    .where((F.col("fact_type") == F.lit("WEALTH")) & (F.col("business_date") == F.lit(latest_dt)))
+    .agg(
+        F.countDistinct(F.col("rcif_number")).alias("wealth_rcifs_latest_after"),
+        F.sum(F.col("accts_cnt").cast("long")).alias("wealth_accounts_latest_after")
+    )
+)
 
 print("\n--- Wealth after union (filtered to WEALTH) ---")
-spark.sql("""
-WITH dt AS (
-  SELECT MAX(CAST(business_date AS date)) AS dt
-  FROM wealth_fact_existing
+after_df.show(truncate=False)
+
+# InvestPath stats
+ip_stats_df = (
+    final_df
+    .where(F.col("fact_type") == F.lit("INVESTPATH"))
+    .agg(
+        F.count(F.lit(1)).alias("ip_rows"),
+        F.countDistinct("ip_id").alias("ip_customers"),
+        F.countDistinct("ip_account_id").alias("ip_accounts"),
+        F.sum(F.col("ip_balance").cast("double")).alias("ip_aum"),
+        F.sum(F.when(F.col("ip_balance") > 0, F.lit(1)).otherwise(F.lit(0))).alias("ip_funded_accounts")
+    )
 )
-SELECT
-  COUNT(DISTINCT CASE
-      WHEN fact_type='WEALTH'
-       AND CAST(business_date AS date) = (SELECT dt FROM dt)
-      THEN rcif_number
-  END) AS wealth_rcifs_latest_after,
-  SUM(CASE
-      WHEN fact_type='WEALTH'
-       AND CAST(business_date AS date) = (SELECT dt FROM dt)
-      THEN accts_cnt ELSE 0
-  END) AS wealth_accounts_latest_after
-FROM wic2_wealth_fact_final
-""").show(truncate=False)
 
 print("\n--- InvestPath stats (new slice) ---")
-spark.sql("""
-SELECT
-  COUNT(*)                      AS ip_rows,
-  COUNT(DISTINCT ip_id)         AS ip_customers,
-  COUNT(DISTINCT ip_account_id) AS ip_accounts,
-  SUM(ip_balance)               AS ip_aum,
-  SUM(CASE WHEN ip_balance > 0 THEN 1 ELSE 0 END) AS ip_funded_accounts
-FROM wic2_wealth_fact_final
-WHERE fact_type='INVESTPATH'
-""").show(truncate=False)
+ip_stats_df.show(truncate=False)
+
+# Optional: hard fail if wealth changed
+base = baseline_df.collect()[0].asDict()
+aft  = after_df.collect()[0].asDict()
+if base["wealth_rcifs_latest"] != aft["wealth_rcifs_latest_after"] or base["wealth_accounts_latest"] != aft["wealth_accounts_latest_after"]:
+    raise RuntimeError(
+        f"WEALTH CHANGED! baseline_rcifs={base['wealth_rcifs_latest']} after_rcifs={aft['wealth_rcifs_latest_after']}, "
+        f"baseline_accts={base['wealth_accounts_latest']} after_accts={aft['wealth_accounts_latest_after']}"
+    )
+
+print("\n✅ Validation passed: Wealth baseline == Wealth after union")
 
 # ------------------------------------------------------------
 # 9) Save overwrite (ONLY after validation looks good)
 # ------------------------------------------------------------
-(
-    spark.table("wic2_wealth_fact_final")
-    .write
-    .mode("overwrite")
-    .saveAsTable(FULL_WEALTH_TABLE)
-)
-
+final_df.write.mode("overwrite").saveAsTable(FULL_WEALTH_TABLE)
 print("✅ Saved final combined fact table to:", FULL_WEALTH_TABLE)
