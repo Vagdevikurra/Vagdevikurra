@@ -1,266 +1,179 @@
-Got it — if you *do* keep **InvestPath inserted/unioned into the Wealth fact**, then the only safe way is:
+Yes — **you should correct it in Spark first**. DAX should be **thin**, not “patching” bad grain. Right now your symptom is classic:
 
-* **Every Wealth measure must explicitly filter `fact_type = "WEALTH"`**
-* **Every InvestPath measure must explicitly filter `fact_type = "INVESTPATH"`**
-* Anything that’s meant to be “Top of company” (wealth + investpath) must decide if it includes both or not.
+* **Wealth Customers** (distinct RCIF) is fine (~268,984)
+* **Accounts** blows up (~676k) and Accounts/User becomes ~1.6
+  ➡️ That almost always means **your wealth fact has multiple rows per RCIF at latest date**, so `SUM(accts_cnt)` is double-counting.
 
-Below is a complete DAX set you can paste and use. I’m assuming your combined fact table is **`wic2_wealth_fact`** and it has these columns (from your earlier logic):
-
-* `business_date`
-* `rcif_number`
-* `fact_type`  (values: `"WEALTH"` / `"INVESTPATH"`)
-* `accts_cnt`  (wealth accounts count)
-* `division`, `business_group`
-* InvestPath fields (if unioned): `ip_id`, `account_id`, `balance` (or your names)
-
-And your customer table is **`wia2_customer`** with:
-
-* `rcif_number`
-* `digital_flag` (“Digital User” / “Non Digital User”)
-* `digitally_active_flag` (“Digital Active” / “Non Digital Active”)
-* maybe `primary_ibn` or `ibn`
-
-And you have a **Calendar** table related to `wic2_wealth_fact[business_date]`.
+The fix is **not** a DAX trick. The fix is: **make `wic2_wealth_fact` be 1 row per (business_date, rcif_number)** (RCIF grain) and compute accounts at that grain.
 
 ---
 
-## 0) Base measures you MUST create first
+# 1) Prove the grain problem (run these in Hive/Spark SQL)
 
-### Latest Wealth Date (only WEALTH)
+### A. How many rows per RCIF at the latest date?
 
-```DAX
-Latest Wealth Date =
-CALCULATE(
-    MAX ( wic2_wealth_fact[business_date] ),
-    wic2_wealth_fact[fact_type] = "WEALTH"
+```sql
+WITH mx AS (
+  SELECT max(business_date) AS dt FROM dm_ib_dev.wic2_wealth_fact
 )
+SELECT
+  count(*) AS rows_latest,
+  count(DISTINCT rcif_number) AS rcifs_latest,
+  (count(*) - count(DISTINCT rcif_number)) AS extra_rows
+FROM dm_ib_dev.wic2_wealth_fact w
+JOIN mx ON w.business_date = mx.dt;
 ```
 
-### Latest InvestPath Date (only INVESTPATH)
+If `rows_latest` >> `rcifs_latest`, you **do not** have RCIF grain.
 
-```DAX
-Latest InvestPath Date =
-CALCULATE(
-    MAX ( wic2_wealth_fact[business_date] ),
-    wic2_wealth_fact[fact_type] = "INVESTPATH"
+### B. Show the worst offenders (RCIFs repeated)
+
+```sql
+WITH mx AS (
+  SELECT max(business_date) AS dt FROM dm_ib_dev.wic2_wealth_fact
 )
+SELECT rcif_number, count(*) AS row_cnt
+FROM dm_ib_dev.wic2_wealth_fact w
+JOIN mx ON w.business_date = mx.dt
+GROUP BY rcif_number
+HAVING count(*) > 1
+ORDER BY row_cnt DESC
+LIMIT 50;
 ```
+
+### C. Compare “sum accounts” vs “dedup accounts”
+
+```sql
+WITH mx AS (
+  SELECT max(business_date) AS dt FROM dm_ib_dev.wic2_wealth_fact
+),
+latest AS (
+  SELECT * FROM dm_ib_dev.wic2_wealth_fact w
+  JOIN mx ON w.business_date = mx.dt
+)
+SELECT
+  sum(accts_cnt) AS sum_accounts,
+  sum(max_accts_cnt) AS dedup_accounts
+FROM (
+  SELECT rcif_number,
+         max(accts_cnt) AS max_accts_cnt
+  FROM latest
+  GROUP BY rcif_number
+) x
+CROSS JOIN (
+  SELECT sum(accts_cnt) AS accts_cnt FROM latest
+) y;
+```
+
+If `sum_accounts` ≈ 676k and `dedup_accounts` drops closer to your expected band, that confirms: **duplicate RCIF rows** are inflating accounts.
 
 ---
 
-## 1) Wealth measures (always force fact_type="WEALTH")
+# 2) Correct the Spark table design (the real fix)
 
-### Wealth Customers (RCIF distinct on latest wealth date)
+### ✅ Goal table (`wic2_wealth_fact`) grain
 
-```DAX
-Wealth Customers =
-CALCULATE(
-    DISTINCTCOUNT ( wic2_wealth_fact[rcif_number] ),
-    wic2_wealth_fact[fact_type] = "WEALTH",
-    wic2_wealth_fact[business_date] = [Latest Wealth Date]
-)
-```
+**ONE row per (business_date, rcif_number)** with:
 
-### Wealth Accounts (SUM of accts_cnt on latest wealth date)
+* business_date
+* rcif_number
+* business_group (derived)
+* division (derived)
+* accts_cnt (true count at RCIF grain)
 
-> This is why you were seeing ~676k instead of 303k earlier. If you want “accounts” to behave like “accounts per customer ~5-6”, you usually want **SUM(accts_cnt)**, not DISTINCTCOUNT(rcif) or COUNTROWS.
-
-```DAX
-Wealth Accounts =
-CALCULATE(
-    SUM ( wic2_wealth_fact[accts_cnt] ),
-    wic2_wealth_fact[fact_type] = "WEALTH",
-    wic2_wealth_fact[business_date] = [Latest Wealth Date]
-)
-```
-
-### Accounts per Wealth Customer
-
-```DAX
-Accounts per Wealth Customer =
-DIVIDE( [Wealth Accounts], [Wealth Customers] )
-```
+If you need segment/division counts, compute them **inside the same RCIF aggregation**, but still output **one row**.
 
 ---
 
-## 2) Digital measures (from `wia2_customer`)
+# 3) Concrete Spark SQL pattern (use this)
 
-### Top of Company Total Digital Active (RCIF count, Digital Active)
+Below is the “safe” structure that prevents double counting. You’ll need to map your existing source joins into `wealth_arr` (arrangement grain), then aggregate.
 
-This is NOT wealth-specific — it’s across the whole customer table (top-of-company).
+### Step 1 — build arrangement-grain base (one row per arrangement_id)
 
-```DAX
-Top Company Digital Active Customers =
-CALCULATE(
-    DISTINCTCOUNT ( wia2_customer[rcif_number] ),
-    wia2_customer[digitally_active_flag] = "Digital Active"
-)
+```sql
+CREATE OR REPLACE TEMP VIEW wealth_arr AS
+SELECT
+  ind.business_date,
+  CAST(ind.rcif_cust_nbr AS STRING) AS rcif_number,
+  ar.arrangement_id,
+  ar.source_system_code,
+  ar.business_service_segment_type_code,
+  ar.closed_ind
+FROM eil_d_involved_party_h ind
+JOIN eil_d_arrangement_to_involved_party_relationship_h a2i
+  ON ind.involved_party_id = a2i.involved_party_id
+ AND ind.business_date     = a2i.business_date
+ AND ind.source_system_code= a2i.source_system_code
+JOIN eil_d_arrangement_h ar
+  ON a2i.arrangement_id               = ar.arrangement_id
+ AND a2i.arrangement_source_system_code= ar.source_system_code
+ AND a2i.business_date                = ar.business_date
+WHERE ind.source_system_code = 'CF'
+  AND nvl(ind.deceased_ind,'N') = 'N'
+  AND ar.closed_ind = 'N'
+  AND ar.source_system_code IN ('BW','RN','TR','OM','SV','CC','LS','MG','TM','PC','LO','CM','CS','EL','IC','MA','PF','PR','SD');  -- use your list
 ```
 
-### Top of Company Total Digital Users (RCIF count, Digital User)
+### Step 2 — aggregate to RCIF grain (THIS is the key)
 
-```DAX
-Top Company Digital Users =
-CALCULATE(
-    DISTINCTCOUNT ( wia2_customer[rcif_number] ),
-    wia2_customer[digital_flag] = "Digital User"
-)
+```sql
+CREATE OR REPLACE TEMP VIEW wic2_wealth_fact_fixed AS
+SELECT
+  business_date,
+  rcif_number,
+  COUNT(DISTINCT arrangement_id) AS accts_cnt,
+
+  /* Business group derived once per RCIF */
+  CASE
+    WHEN SUM(CASE WHEN business_service_segment_type_code IN ('IS_CT','IS_IT') THEN 1 ELSE 0 END) > 0
+      THEN 'Institutional Services'
+    WHEN SUM(CASE WHEN business_service_segment_type_code IN ('REGIS_FC','REGIS') THEN 1 ELSE 0 END) > 0
+      THEN 'Investment Services'
+    WHEN SUM(CASE WHEN business_service_segment_type_code IN ('PWM') THEN 1 ELSE 0 END) > 0
+      THEN 'Private Wealth'
+    ELSE 'Other'
+  END AS business_group
+
+FROM wealth_arr
+GROUP BY business_date, rcif_number;
 ```
+
+### Step 3 — overwrite your final table
+
+```sql
+INSERT OVERWRITE TABLE dm_ib_dev.wic2_wealth_fact
+SELECT * FROM wic2_wealth_fact_fixed;
+```
+
+This guarantees:
+
+* **Accounts won’t inflate**
+* Accounts/User becomes realistic
+* DAX becomes straightforward
 
 ---
 
-## 3) Wealth + Digital intersection measures
+# 4) Why your current accounts is 676k
 
-### Digital Enrollments Wealth (Wealth customers who are Digital Users)
+Because your current wealth code likely groups by **extra columns** (division/business group/segment/etc.) and produces **multiple rows per RCIF**, each carrying an `accts_cnt`. Then PBI sums all of them.
 
-```DAX
-Digital Enrollments Wealth =
-CALCULATE(
-    [Wealth Customers],
-    TREATAS(
-        FILTER(
-            VALUES ( wia2_customer[rcif_number] ),
-            wia2_customer[digital_flag] = "Digital User"
-        ),
-        wic2_wealth_fact[rcif_number]
-    )
-)
-```
-
-### Wealth Digital Active (Wealth customers who are Digital Active)
-
-```DAX
-Wealth Digital Active Customers =
-CALCULATE(
-    [Wealth Customers],
-    TREATAS(
-        FILTER(
-            VALUES ( wia2_customer[rcif_number] ),
-            wia2_customer[digitally_active_flag] = "Digital Active"
-        ),
-        wic2_wealth_fact[rcif_number]
-    )
-)
-```
-
-### Wealth Digital Active Penetration
-
-```DAX
-Wealth Digital Active Penetration =
-DIVIDE( [Wealth Digital Active Customers], [Wealth Customers] )
-```
-
-### Wealth Digital Enrollment Penetration
-
-```DAX
-Wealth Digital Enrollment Penetration =
-DIVIDE( [Digital Enrollments Wealth], [Wealth Customers] )
-```
+Fixing the grain upstream is the only clean solution.
 
 ---
 
-## 4) InvestPath measures (only if InvestPath is unioned into `wic2_wealth_fact`)
+# 5) What I want you to run next (no guessing)
 
-### InvestPath Customers (distinct IP IDs on latest investpath date)
+Run the **3 validation queries** in section #1 and paste the outputs:
 
-```DAX
-InvestPath Customers =
-CALCULATE(
-    DISTINCTCOUNT ( wic2_wealth_fact[ip_id] ),
-    wic2_wealth_fact[fact_type] = "INVESTPATH",
-    wic2_wealth_fact[business_date] = [Latest InvestPath Date]
-)
-```
+* rows_latest, rcifs_latest, extra_rows
+* top repeated RCIFs
+* sum_accounts vs dedup_accounts
 
-### InvestPath Accounts (distinct arrangement/account id on latest investpath date)
+With that, I can tell you **exactly** whether to:
 
-```DAX
-InvestPath Accounts =
-CALCULATE(
-    DISTINCTCOUNT ( wic2_wealth_fact[account_id] ),
-    wic2_wealth_fact[fact_type] = "INVESTPATH",
-    wic2_wealth_fact[business_date] = [Latest InvestPath Date]
-)
-```
+* fix grouping keys, or
+* change `accts_cnt` calc to `countDistinct(arrangement_id)`, or
+* select a single “primary” division per RCIF.
 
-### InvestPath AUM (sum balance on latest investpath date)
-
-```DAX
-InvestPath AUM =
-CALCULATE(
-    SUM ( wic2_wealth_fact[balance] ),
-    wic2_wealth_fact[fact_type] = "INVESTPATH",
-    wic2_wealth_fact[business_date] = [Latest InvestPath Date]
-)
-```
-
-### InvestPath Avg Balance per Account
-
-```DAX
-InvestPath Avg Balance per Account =
-DIVIDE( [InvestPath AUM], [InvestPath Accounts] )
-```
-
-### InvestPath Funded Accounts (balance > 0)
-
-```DAX
-InvestPath Funded Accounts =
-CALCULATE(
-    DISTINCTCOUNT ( wic2_wealth_fact[account_id] ),
-    wic2_wealth_fact[fact_type] = "INVESTPATH",
-    wic2_wealth_fact[business_date] = [Latest InvestPath Date],
-    wic2_wealth_fact[balance] > 0
-)
-```
-
----
-
-## 5) Sanity-check measures (so you can instantly see if union is breaking visuals)
-
-### Fact rows by type (card/table)
-
-```DAX
-Rows WEALTH =
-CALCULATE( COUNTROWS(wic2_wealth_fact), wic2_wealth_fact[fact_type]="WEALTH" )
-
-Rows INVESTPATH =
-CALCULATE( COUNTROWS(wic2_wealth_fact), wic2_wealth_fact[fact_type]="INVESTPATH" )
-```
-
-### RCIF count by type (latest)
-
-```DAX
-RCIF Latest WEALTH =
-CALCULATE(
-    DISTINCTCOUNT(wic2_wealth_fact[rcif_number]),
-    wic2_wealth_fact[fact_type]="WEALTH",
-    wic2_wealth_fact[business_date]=[Latest Wealth Date]
-)
-
-RCIF Latest INVESTPATH =
-CALCULATE(
-    DISTINCTCOUNT(wic2_wealth_fact[rcif_number]),
-    wic2_wealth_fact[fact_type]="INVESTPATH",
-    wic2_wealth_fact[business_date]=[Latest InvestPath Date]
-)
-```
-
----
-
-## Critical note (this is the part that decides if your report breaks)
-
-If any of your existing visuals/measures use something like:
-
-* `DISTINCTCOUNT(wic2_wealth_fact[rcif_number])`
-* `SUM(wic2_wealth_fact[accts_cnt])`
-  without filtering `fact_type`,
-  then the **InvestPath rows will contaminate Wealth visuals**.
-
-So either:
-
-1. Replace all Wealth measures with the **WEALTH-filtered** versions above, **or**
-2. Don’t union InvestPath into this table (your earlier “separate table” plan).
-
----
-
-If you paste your current column names for InvestPath inside the unioned table (is it `ip_id`/`account_id`/`balance` exactly or different?), I’ll adjust the InvestPath DAX names 1:1 so you can copy-paste with no edits.
+If you do just one thing now: **run query A** (rows vs distinct RCIF) — that will confirm the root cause immediately.
