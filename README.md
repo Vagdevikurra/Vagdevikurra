@@ -259,6 +259,9 @@ pw1_joined = (
         (a2i_m["business_date"]                  == ar_m["business_date"]),
         "inner"
     )
+    # Disambiguate arrangement_id and source_system_code — exist in both a2i_m and ar_m
+    .withColumn("ar_arrangement_id",     ar_m["arrangement_id"])
+    .withColumn("ar_source_system_code", ar_m["source_system_code"])
     # Eligibility filter AFTER join — ar_m columns now resolved
     .filter(
         F.when(F.col("private_client_code").isin("039","539","339"),     F.lit(1))
@@ -292,27 +295,27 @@ pw1 = (
     )
     .agg(
         F.countDistinct(
-            F.when(F.col("business_service_segment_type_code") == "IS_CT",                F.col("arrangement_id"))
+            F.when(F.col("business_service_segment_type_code") == "IS_CT",                F.col("ar_arrangement_id"))
         ).alias("corporate_trust_cnt"),
         F.countDistinct(
-            F.when(F.col("business_service_segment_type_code") == "IS_IT",                F.col("arrangement_id"))
+            F.when(F.col("business_service_segment_type_code") == "IS_IT",                F.col("ar_arrangement_id"))
         ).alias("institutional_trust_cnt"),
         F.countDistinct(
-            F.when(F.col("business_service_segment_type_code").isin("REGIS_FC","REGIS"),  F.col("arrangement_id"))
+            F.when(F.col("business_service_segment_type_code").isin("REGIS_FC","REGIS"),  F.col("ar_arrangement_id"))
         ).alias("investment_cnt"),
         F.countDistinct(
-            F.when(F.col("business_service_segment_type_code") == "REGIS",                F.col("arrangement_id"))
+            F.when(F.col("business_service_segment_type_code") == "REGIS",                F.col("ar_arrangement_id"))
         ).alias("insurance_cnt"),
         F.countDistinct(
-            F.when(F.col("business_service_segment_type_code") == "PWM",                  F.col("arrangement_id"))
+            F.when(F.col("business_service_segment_type_code") == "PWM",                  F.col("ar_arrangement_id"))
         ).alias("pwm_cnt"),
         F.countDistinct(
-            F.when(F.col("source_system_code") == "TR",                                   F.col("arrangement_id"))
+            F.when(F.col("ar_source_system_code") == "TR",                                F.col("ar_arrangement_id"))
         ).alias("trust_cnt"),
         F.countDistinct(
-            F.when(F.col("source_system_code").isin(BANKING_SOURCE_CODES),                F.col("arrangement_id"))
+            F.when(F.col("ar_source_system_code").isin(BANKING_SOURCE_CODES),             F.col("ar_arrangement_id"))
         ).alias("banking_cnt"),
-        F.countDistinct(F.col("arrangement_id")).alias("wealth_accts_cnt")
+        F.countDistinct(F.col("ar_arrangement_id")).alias("wealth_accts_cnt")
     )
 )
 
@@ -380,12 +383,13 @@ ip_accts_cnt = (
         (a2i_inv["business_date"]                  == ar_inv["business_date"]),
         "inner"
     )
+    .withColumn("ar_inv_arrangement_id", ar_inv["arrangement_id"])
     .groupBy(
         ind_inv["rcif_cust_nbr"].cast("string").alias("RCIF_NUMBER"),
         ind_inv["involved_party_id"].alias("ip_id")
     )
     .agg(
-        F.countDistinct(ar_inv["arrangement_id"]).alias("ip_accts_cnt")
+        F.countDistinct(F.col("ar_inv_arrangement_id")).alias("ip_accts_cnt")
     )
 )
 
@@ -426,17 +430,25 @@ all_accounts_base = (
         (a2i_a["business_date"]                  == ar_a["business_date"]),
         "inner"
     )
+    # Disambiguate columns that exist in both a2i_a and ar_a
+    .withColumn("ar_arrangement_id",      ar_a["arrangement_id"])
+    .withColumn("ar_source_system_code",  ar_a["source_system_code"])
+    .withColumn("ar_account_type_code",   ar_a["account_type_code"])
+    .withColumn("ar_open_date",           ar_a["open_date"])
+    .withColumn("ar_balance",             ar_a["current_balance_amt"])
+    .withColumn("ar_closed_ind",          ar_a["closed_ind"])
+    .withColumn("ar_bss_type_code",       ar_a["business_service_segment_type_code"])
     .withColumn("account_type",
         F.when(
-            (F.col("source_system_code") == "RN") & (F.col("account_type_code") == "IP"), F.lit("Investpath")
+            (F.col("ar_source_system_code") == "RN") & (F.col("ar_account_type_code") == "IP"), F.lit("Investpath")
         )
         .when(
-            F.col("business_service_segment_type_code").isin("IS_CT","IS_IT") |
-            F.col("source_system_code").isin("TR","BI"), F.lit("Trust")
+            F.col("ar_bss_type_code").isin("IS_CT","IS_IT") |
+            F.col("ar_source_system_code").isin("TR","BI"), F.lit("Trust")
         )
-        .when(F.col("business_service_segment_type_code").isin("REGIS_FC","REGIS"), F.lit("Investment"))
-        .when(F.col("business_service_segment_type_code") == "PWM",                 F.lit("PWM"))
-        .when(F.col("source_system_code").isin(BANKING_SOURCE_CODES),               F.lit("Banking"))
+        .when(F.col("ar_bss_type_code").isin("REGIS_FC","REGIS"), F.lit("Investment"))
+        .when(F.col("ar_bss_type_code") == "PWM",                  F.lit("PWM"))
+        .when(F.col("ar_source_system_code").isin(BANKING_SOURCE_CODES), F.lit("Banking"))
         .otherwise(F.lit("Other"))
     )
     .select(
@@ -444,24 +456,24 @@ all_accounts_base = (
         ip_a["rcif_cust_nbr"].cast("string").alias("RCIF_NUMBER"),
         ip_a["involved_party_id"].alias("ip_id"),
         ip_a["cust_internet_banking_nbr"],
-        ar_a["arrangement_id"].alias("account_number"),
-        ar_a["source_system_code"].alias("source_system"),
-        ar_a["account_type_code"],
-        ar_a["business_service_segment_type_code"],
-        ar_a["current_balance_amt"].alias("balance"),
-        ar_a["open_date"],
-        ar_a["closed_ind"],
+        F.col("ar_arrangement_id").alias("account_number"),
+        F.col("ar_source_system_code").alias("source_system"),
+        F.col("ar_account_type_code").alias("account_type_code"),
+        F.col("ar_bss_type_code").alias("business_service_segment_type_code"),
+        F.col("ar_balance").alias("balance"),
+        F.col("ar_open_date").alias("open_date"),
+        F.col("ar_closed_ind").alias("closed_ind"),
         F.col("account_type"),
         # ip_ columns — Investpath rows only, NULL for all other account types
-        F.when(F.col("account_type") == "Investpath", ar_a["arrangement_id"])
+        F.when(F.col("account_type") == "Investpath", F.col("ar_arrangement_id"))
          .otherwise(F.lit(None).cast(T.StringType())).alias("ip_account_number"),
-        F.when(F.col("account_type") == "Investpath", ar_a["open_date"])
+        F.when(F.col("account_type") == "Investpath", F.col("ar_open_date"))
          .otherwise(F.lit(None).cast(T.DateType())).alias("ip_open_date"),
-        F.when(F.col("account_type") == "Investpath", ar_a["current_balance_amt"])
+        F.when(F.col("account_type") == "Investpath", F.col("ar_balance"))
          .otherwise(F.lit(None).cast(T.DoubleType())).alias("ip_balance"),
-        F.when(F.col("account_type") == "Investpath", ar_a["source_system_code"])
+        F.when(F.col("account_type") == "Investpath", F.col("ar_source_system_code"))
          .otherwise(F.lit(None).cast(T.StringType())).alias("ip_source_system"),
-        F.when(F.col("account_type") == "Investpath", ar_a["account_type_code"])
+        F.when(F.col("account_type") == "Investpath", F.col("ar_account_type_code"))
          .otherwise(F.lit(None).cast(T.StringType())).alias("ip_account_type_code")
     )
 )
