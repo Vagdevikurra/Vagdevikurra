@@ -12,8 +12,12 @@
 
 from pyspark.sql import SparkSession, functions as F, types as T
 from pyspark.sql.window import Window
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 import calendar
+
+def parse_date(date_str):
+    """Python 3.6 safe date parser — replaces date.fromisoformat() (Python 3.7+)"""
+    return datetime.strptime(date_str, "%Y-%m-%d").date()
 
 spark = (
     SparkSession.builder
@@ -52,8 +56,8 @@ def get_valid_business_dates(spark, table: str, start: str, end: str):
     )
     existing = {row["dt"] for row in existing_df.collect()}
 
-    start_d = date.fromisoformat(start)
-    end_d   = date.fromisoformat(end)
+    start_d = parse_date(start)
+    end_d   = parse_date(end)
 
     # Generate all calendar month-ends in range
     month_ends = set()
