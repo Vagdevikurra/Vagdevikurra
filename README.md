@@ -1,23 +1,20 @@
 # =============================================================================
 # Wealth Insights - Customer & Account Tables
 # Date Range: 2025-08-01 to 2026-01-31
+# Python 3.6 compatible
 #
-# OUTPUT TABLES:
-#   dm_ib_dev.wealth_Insights_Customer  — one row per RCIF_NUMBER
-#   dm_ib_dev.wealth_Insights_Account   — one row per account
-#
-# BRIDGE KEY: RCIF_NUMBER + ip_id (involved_party_id)
-# NOTE: PC (plastic cards) and BW removed from all source code lists
+# FIXES:
+#   1. date.fromisoformat() -> datetime.strptime() for Python 3.6
+#   2. digital_banking_master_dbm -> digital_banking_master
+#   3. relt_ibn -> ibn
+#   4. Wealth eligibility filter moved AFTER all joins (fixes AnalysisException)
+#   5. business_group_expr uses F.col() instead of table refs (safe after join)
 # =============================================================================
 
 from pyspark.sql import SparkSession, functions as F, types as T
 from pyspark.sql.window import Window
 from datetime import date, timedelta, datetime
 import calendar
-
-def parse_date(date_str):
-    """Python 3.6 safe date parser — replaces date.fromisoformat() (Python 3.7+)"""
-    return datetime.strptime(date_str, "%Y-%m-%d").date()
 
 spark = (
     SparkSession.builder
@@ -33,18 +30,23 @@ final_table_customer = "wealth_Insights_Customer"
 final_table_account  = "wealth_Insights_Account"
 
 # =============================================================================
+# HELPER: Python 3.6 safe date parser
+# =============================================================================
+
+def parse_date(date_str):
+    """Replaces date.fromisoformat() which requires Python 3.7+"""
+    return datetime.strptime(date_str, "%Y-%m-%d").date()
+
+
+# =============================================================================
 # HELPER: Build valid business-date list
 # Daily tables skip weekends & holidays. We ensure every calendar month-end
-# in [START_DT, END_DT] is represented — if it falls on a weekend/holiday,
+# in [START_DT, END_DT] is represented — if it falls on a weekend/holiday
 # we roll back to the nearest prior date that actually exists in the table.
 # Covers: Aug-31, Sep-30, Oct-31, Nov-30, Dec-31, Jan-31
 # =============================================================================
 
-def get_valid_business_dates(spark, table: str, start: str, end: str):
-    """
-    Returns a sorted list of date strings representing valid business dates,
-    with month-ends always included (rolling back to last available day if needed).
-    """
+def get_valid_business_dates(spark, table, start, end):
     existing_df = (
         spark.table(table)
         .filter(
@@ -93,10 +95,10 @@ def get_valid_business_dates(spark, table: str, start: str, end: str):
 
 WEALTH_SOURCE_CODES = [
     'DA', 'SV', 'CC', 'MG', 'LS', 'TM', 'LO',
-    'CM', 'CS', 'EL', 'IC', 'MA', 'PF', 'PR', 'SD',   # Banking
-    'TR', 'BI',                                          # Trust
-    'RN',                                                # Investpath
-    'IS_CT', 'IS_IT',                                    # Institutional
+    'CM', 'CS', 'EL', 'IC', 'MA', 'PF', 'PR', 'SD',
+    'TR', 'BI',
+    'RN',
+    'IS_CT', 'IS_IT',
     'IS_IF', 'PNB'
 ]
 
@@ -105,9 +107,10 @@ BANKING_SOURCE_CODES = [
     'CM', 'CS', 'EL', 'IC', 'MA', 'PF', 'PR', 'SD'
 ]
 
+WEALTH_SEGMENT_CODES = ['IS_CT', 'IS_IT', 'REGIS_FC', 'REGIS', 'PWM']
+
 # =============================================================================
 # STEP 1: RCIF NUMBER POOL
-# Union of eil.m_involved_party_h and dm_ib.digital_banking_master
 # =============================================================================
 
 six_months_ago = F.add_months(F.current_date(), -6)
@@ -135,21 +138,21 @@ add_rcifs = (
 
 # =============================================================================
 # STEP 2: DIGITAL FLAGS
-# Source: dm_ib.digital_banking_master_dbm (monthly)
-# Captures: OLB, Mobile, Digital active/user flags + both IBNs
+# Source: dm_ib.digital_banking_master  (corrected — no _dbm suffix)
+# ibn corrected from relt_ibn
 # =============================================================================
 
 max_dbm_dt = (
-    spark.table("dm_ib.digital_banking_master_dbm")
+    spark.table("dm_ib.digital_banking_master")
     .agg(F.max("ods_business_dt"))
     .collect()[0][0]
 )
 
 dig_customer = (
-    spark.table("dm_ib.digital_banking_master_dbm")
+    spark.table("dm_ib.digital_banking_master")
     .filter(F.col("ods_business_dt") == max_dbm_dt)
     .groupBy(
-        F.col("relt_ibn"),
+        F.col("ibn"),                               # corrected from relt_ibn
         F.col("rcif_customer_nbr"),
         F.col("ods_business_dt")
     )
@@ -161,8 +164,7 @@ dig_customer = (
 
 # =============================================================================
 # STEP 3: RCIF CUSTOMER BASE
-# Source: eil.d_involved_party_h (daily) + address + arrangement tables
-# Captures: demographics, cust_internet_banking_nbr (OLB IBN)
+# Source: eil.d_involved_party_h (daily)
 # =============================================================================
 
 valid_dates_daily = get_valid_business_dates(
@@ -220,7 +222,8 @@ rc = (
 # =============================================================================
 # STEP 4: WEALTH SEGMENTATION + ACCOUNT COUNTS
 # Source: eil.m_involved_party_h (monthly)
-# Captures: Business_Group, division, all segment counts, wealth_accts_cnt
+# FIX: eligibility filter moved AFTER all joins so ar_m columns are resolved
+# FIX: business_group_expr uses F.col() not table refs (safe post-join)
 # =============================================================================
 
 valid_dates_monthly = get_valid_business_dates(
@@ -231,34 +234,13 @@ ip_m  = spark.table("eil.m_involved_party_h")
 a2i_m = spark.table("eil.m_arrangement_to_involved_party_relationship_h")
 ar_m  = spark.table("eil.m_arrangement_h")
 
-business_group_expr = (
-    F.when(ip_m["private_client_code"].isin("039","539","339"),           "Private Wealth")
-     .when(ip_m["private_client_trust_code"].isin("239","739"),           "Private Wealth")
-     .otherwise(
-         F.when(ar_m["business_service_segment_type_code"].isin("IS_CT","IS_IT"), "Institutional Services")
-          .when(ar_m["business_service_segment_type_code"].isin("REGIS_FC","REGIS"), "Investment Services")
-          .when(ar_m["business_service_segment_type_code"] == "PWM",      "Private Wealth")
-          .otherwise(F.coalesce(ar_m["business_service_segment_type_code"], F.lit("Category???")))
-     )
-)
-
-pw1 = (
+# Join first, filter eligibility after — this is the key fix
+pw1_joined = (
     ip_m
     .filter(
         F.col("business_date").isin(valid_dates_monthly) &
         (F.col("source_system_code") == "CF") &
-        (F.coalesce(F.col("deceased_ind"), F.lit("N")) == "N") &
-        (
-            F.when(ip_m["private_client_code"].isin("039","539","339"),   F.lit(1))
-             .when(ip_m["private_client_trust_code"].isin("239","739"),   F.lit(1))
-             .otherwise(
-                 F.when(
-                     ar_m["business_service_segment_type_code"].isin(
-                         "IS_CT","IS_IT","REGIS_FC","REGIS","PWM"
-                     ), F.lit(1)
-                 ).otherwise(F.lit(0))
-             ) == 1
-        )
+        (F.coalesce(F.col("deceased_ind"), F.lit("N")) == "N")
     )
     .join(
         a2i_m,
@@ -277,7 +259,32 @@ pw1 = (
         (a2i_m["business_date"]                  == ar_m["business_date"]),
         "inner"
     )
-    .withColumn("Business_Group", business_group_expr)
+    # Eligibility filter AFTER join — ar_m columns now resolved
+    .filter(
+        F.when(F.col("private_client_code").isin("039","539","339"),     F.lit(1))
+         .when(F.col("private_client_trust_code").isin("239","739"),     F.lit(1))
+         .otherwise(
+             F.when(
+                 F.col("business_service_segment_type_code").isin(WEALTH_SEGMENT_CODES),
+                 F.lit(1)
+             ).otherwise(F.lit(0))
+         ) == 1
+    )
+    # Business group uses F.col() — safe now that all tables are joined
+    .withColumn("Business_Group",
+        F.when(F.col("private_client_code").isin("039","539","339"),     F.lit("Private Wealth"))
+         .when(F.col("private_client_trust_code").isin("239","739"),     F.lit("Private Wealth"))
+         .otherwise(
+             F.when(F.col("business_service_segment_type_code").isin("IS_CT","IS_IT"),     F.lit("Institutional Services"))
+              .when(F.col("business_service_segment_type_code").isin("REGIS_FC","REGIS"),  F.lit("Investment Services"))
+              .when(F.col("business_service_segment_type_code") == "PWM",                  F.lit("Private Wealth"))
+              .otherwise(F.coalesce(F.col("business_service_segment_type_code"),           F.lit("Category???")))
+         )
+    )
+)
+
+pw1 = (
+    pw1_joined
     .groupBy(
         ip_m["rcif_cust_nbr"].cast("string").alias("RCIF_NUMBER"),
         ip_m["involved_party_id"].alias("ip_id"),
@@ -285,63 +292,57 @@ pw1 = (
     )
     .agg(
         F.countDistinct(
-            F.when(ar_m["business_service_segment_type_code"] == "IS_CT",  ar_m["arrangement_id"])
+            F.when(F.col("business_service_segment_type_code") == "IS_CT",                F.col("arrangement_id"))
         ).alias("corporate_trust_cnt"),
         F.countDistinct(
-            F.when(ar_m["business_service_segment_type_code"] == "IS_IT",  ar_m["arrangement_id"])
+            F.when(F.col("business_service_segment_type_code") == "IS_IT",                F.col("arrangement_id"))
         ).alias("institutional_trust_cnt"),
         F.countDistinct(
-            F.when(ar_m["business_service_segment_type_code"].isin("REGIS_FC","REGIS"), ar_m["arrangement_id"])
+            F.when(F.col("business_service_segment_type_code").isin("REGIS_FC","REGIS"),  F.col("arrangement_id"))
         ).alias("investment_cnt"),
         F.countDistinct(
-            F.when(ar_m["business_service_segment_type_code"] == "REGIS",  ar_m["arrangement_id"])
+            F.when(F.col("business_service_segment_type_code") == "REGIS",                F.col("arrangement_id"))
         ).alias("insurance_cnt"),
         F.countDistinct(
-            F.when(ar_m["business_service_segment_type_code"] == "PWM",    ar_m["arrangement_id"])
+            F.when(F.col("business_service_segment_type_code") == "PWM",                  F.col("arrangement_id"))
         ).alias("pwm_cnt"),
         F.countDistinct(
-            F.when(ar_m["source_system_code"] == "TR",                     ar_m["arrangement_id"])
+            F.when(F.col("source_system_code") == "TR",                                   F.col("arrangement_id"))
         ).alias("trust_cnt"),
         F.countDistinct(
-            F.when(ar_m["source_system_code"].isin(BANKING_SOURCE_CODES),  ar_m["arrangement_id"])
+            F.when(F.col("source_system_code").isin(BANKING_SOURCE_CODES),                F.col("arrangement_id"))
         ).alias("banking_cnt"),
-        # Total wealth account count across ALL sources
-        F.countDistinct(ar_m["arrangement_id"]).alias("wealth_accts_cnt")
+        F.countDistinct(F.col("arrangement_id")).alias("wealth_accts_cnt")
     )
 )
 
-# Division logic on top of pw1
 pw1_with_division = pw1.withColumn("division",
     F.when(F.col("Business_Group") == "Private Wealth",
         F.when(
-            (F.col("trust_cnt") > 0) & (F.col("banking_cnt") > 0), "Banking & IM&T"
+            (F.col("trust_cnt") > 0) & (F.col("banking_cnt") > 0), F.lit("Banking & IM&T")
         ).when(
-            (F.col("investment_cnt") + F.col("trust_cnt") > 0) & (F.col("banking_cnt") == 0),
-            "Investments Only"
-        ).otherwise("Banking only")
+            (F.col("investment_cnt") + F.col("trust_cnt") > 0) & (F.col("banking_cnt") == 0), F.lit("Investments Only")
+        ).otherwise(F.lit("Banking only"))
     )
     .when(F.col("Business_Group") == "Investment Services",
         F.when(
-            (F.col("investment_cnt") > 0) & (F.col("insurance_cnt") == 0), "Investment"
+            (F.col("investment_cnt") > 0) & (F.col("insurance_cnt") == 0), F.lit("Investment")
         ).when(
-            (F.col("investment_cnt") == 0) & (F.col("insurance_cnt") > 0), "Insurance"
-        ).otherwise("Insurance & Investment")
+            (F.col("investment_cnt") == 0) & (F.col("insurance_cnt") > 0), F.lit("Insurance")
+        ).otherwise(F.lit("Insurance & Investment"))
     )
     .otherwise(
         F.when(
-            (F.col("corporate_trust_cnt") > 0) & (F.col("institutional_trust_cnt") == 0),
-            "Corporate Trust"
+            (F.col("corporate_trust_cnt") > 0) & (F.col("institutional_trust_cnt") == 0), F.lit("Corporate Trust")
         ).when(
-            (F.col("corporate_trust_cnt") == 0) & (F.col("institutional_trust_cnt") > 0),
-            "Institutional Trust"
-        ).when(F.col("pwm_cnt") > 0, "Banking only")
-        .otherwise("Corporate & Institutional Trust")
+            (F.col("corporate_trust_cnt") == 0) & (F.col("institutional_trust_cnt") > 0), F.lit("Institutional Trust")
+        ).when(F.col("pwm_cnt") > 0, F.lit("Banking only"))
+        .otherwise(F.lit("Corporate & Institutional Trust"))
     )
 )
 
 # =============================================================================
 # STEP 5: INVESTPATH ACCOUNT COUNT PER CUSTOMER
-# Source: eil.d_involved_party_h (daily), source_system='RN', account_type='IP'
 # =============================================================================
 
 max_inv_date = (
@@ -390,8 +391,7 @@ ip_accts_cnt = (
 
 # =============================================================================
 # STEP 6: ALL ACCOUNTS BASE
-# One row per account across all wealth source codes
-# ip_ columns populated only for Investpath rows, NULL for all others
+# One row per account, ip_ columns populated for Investpath rows only
 # =============================================================================
 
 valid_dates_acct = get_valid_business_dates(
@@ -401,22 +401,6 @@ valid_dates_acct = get_valid_business_dates(
 ip_a  = spark.table("eil.d_involved_party_h")
 a2i_a = spark.table("eil.d_arrangement_to_involved_party_relationship_h")
 ar_a  = spark.table("eil.d_arrangement_h")
-
-account_type_expr = (
-    F.when(
-        (ar_a["source_system_code"] == "RN") & (ar_a["account_type_code"] == "IP"), "Investpath"
-    )
-    .when(
-        ar_a["business_service_segment_type_code"].isin("IS_CT","IS_IT") |
-        ar_a["source_system_code"].isin("TR","BI"), "Trust"
-    )
-    .when(
-        ar_a["business_service_segment_type_code"].isin("REGIS_FC","REGIS"), "Investment"
-    )
-    .when(ar_a["business_service_segment_type_code"] == "PWM", "PWM")
-    .when(ar_a["source_system_code"].isin(BANKING_SOURCE_CODES), "Banking")
-    .otherwise("Other")
-)
 
 all_accounts_base = (
     ip_a
@@ -442,15 +426,24 @@ all_accounts_base = (
         (a2i_a["business_date"]                  == ar_a["business_date"]),
         "inner"
     )
-    .withColumn("account_type", account_type_expr)
+    .withColumn("account_type",
+        F.when(
+            (F.col("source_system_code") == "RN") & (F.col("account_type_code") == "IP"), F.lit("Investpath")
+        )
+        .when(
+            F.col("business_service_segment_type_code").isin("IS_CT","IS_IT") |
+            F.col("source_system_code").isin("TR","BI"), F.lit("Trust")
+        )
+        .when(F.col("business_service_segment_type_code").isin("REGIS_FC","REGIS"), F.lit("Investment"))
+        .when(F.col("business_service_segment_type_code") == "PWM",                 F.lit("PWM"))
+        .when(F.col("source_system_code").isin(BANKING_SOURCE_CODES),               F.lit("Banking"))
+        .otherwise(F.lit("Other"))
+    )
     .select(
-        # Keys
         ip_a["business_date"].cast("date").alias("business_date"),
         ip_a["rcif_cust_nbr"].cast("string").alias("RCIF_NUMBER"),
         ip_a["involved_party_id"].alias("ip_id"),
         ip_a["cust_internet_banking_nbr"],
-
-        # Account details
         ar_a["arrangement_id"].alias("account_number"),
         ar_a["source_system_code"].alias("source_system"),
         ar_a["account_type_code"],
@@ -459,44 +452,41 @@ all_accounts_base = (
         ar_a["open_date"],
         ar_a["closed_ind"],
         F.col("account_type"),
-
-        # ip_ columns — only populated when account_type = Investpath
+        # ip_ columns — Investpath rows only, NULL for all other account types
         F.when(F.col("account_type") == "Investpath", ar_a["arrangement_id"])
-         .otherwise(F.lit(None).cast("string")).alias("ip_account_number"),
+         .otherwise(F.lit(None).cast(T.StringType())).alias("ip_account_number"),
         F.when(F.col("account_type") == "Investpath", ar_a["open_date"])
-         .otherwise(F.lit(None).cast("date")).alias("ip_open_date"),
+         .otherwise(F.lit(None).cast(T.DateType())).alias("ip_open_date"),
         F.when(F.col("account_type") == "Investpath", ar_a["current_balance_amt"])
-         .otherwise(F.lit(None).cast("double")).alias("ip_balance"),
+         .otherwise(F.lit(None).cast(T.DoubleType())).alias("ip_balance"),
         F.when(F.col("account_type") == "Investpath", ar_a["source_system_code"])
-         .otherwise(F.lit(None).cast("string")).alias("ip_source_system"),
+         .otherwise(F.lit(None).cast(T.StringType())).alias("ip_source_system"),
         F.when(F.col("account_type") == "Investpath", ar_a["account_type_code"])
-         .otherwise(F.lit(None).cast("string")).alias("ip_account_type_code")
+         .otherwise(F.lit(None).cast(T.StringType())).alias("ip_account_type_code")
     )
 )
 
 # =============================================================================
-# STEP 7: FINAL CUSTOMER TABLE
-# One row per RCIF_NUMBER — full dimension with all flags & counts
+# STEP 7: FINAL CUSTOMER TABLE — one row per RCIF_NUMBER
 # =============================================================================
 
 window_rcif = Window.partitionBy("RCIF_NUMBER").orderBy("cust_internet_banking_nbr")
 
 generation_expr = (
-    F.when((F.col("birth_date") >= "1900-01-01") & (F.col("birth_date") <= "1924-12-31"), "GI Generation (1900-1924)")
-     .when((F.col("birth_date") >= "1925-01-01") & (F.col("birth_date") <= "1945-12-31"), "Traditionalist (1925-1945)")
-     .when((F.col("birth_date") >= "1946-01-01") & (F.col("birth_date") <= "1964-12-31"), "Baby Boomer (1946-1964)")
-     .when((F.col("birth_date") >= "1965-01-01") & (F.col("birth_date") <= "1980-12-31"), "Gen X (1965-1980)")
-     .when((F.col("birth_date") >= "1981-01-01") & (F.col("birth_date") <= "1996-12-31"), "Millennial (1981-1996)")
-     .when(F.col("birth_date") >= "1997-01-01",                                           "Centennial (1997-???)")
-     .otherwise("Unknown")
+    F.when((F.col("birth_date") >= "1900-01-01") & (F.col("birth_date") <= "1924-12-31"), F.lit("GI Generation (1900-1924)"))
+     .when((F.col("birth_date") >= "1925-01-01") & (F.col("birth_date") <= "1945-12-31"), F.lit("Traditionalist (1925-1945)"))
+     .when((F.col("birth_date") >= "1946-01-01") & (F.col("birth_date") <= "1964-12-31"), F.lit("Baby Boomer (1946-1964)"))
+     .when((F.col("birth_date") >= "1965-01-01") & (F.col("birth_date") <= "1980-12-31"), F.lit("Gen X (1965-1980)"))
+     .when((F.col("birth_date") >= "1981-01-01") & (F.col("birth_date") <= "1996-12-31"), F.lit("Millennial (1981-1996)"))
+     .when( F.col("birth_date") >= "1997-01-01",                                           F.lit("Centennial (1997-???)"))
+     .otherwise(F.lit("Unknown"))
 )
 
 wealth_customer = (
     rc
-    # Left join digital flags — not all customers are digital users
     .join(
         dig_customer.select(
-            F.col("relt_ibn").alias("primary_ibn"),
+            F.col("ibn").alias("primary_ibn"),
             F.col("rcif_customer_nbr").alias("RCIF_NUMBER"),
             "ods_business_dt",
             "lst_login_olb",
@@ -505,7 +495,6 @@ wealth_customer = (
         ["RCIF_NUMBER"],
         "left"
     )
-    # Left join wealth segmentation
     .join(
         pw1_with_division.select(
             "RCIF_NUMBER", "ip_id",
@@ -518,82 +507,64 @@ wealth_customer = (
         ["RCIF_NUMBER", "ip_id"],
         "left"
     )
-    # Left join Investpath account count
     .join(ip_accts_cnt, ["RCIF_NUMBER", "ip_id"], "left")
-    # Inner join to valid RCIF pool
     .join(
         add_rcifs.withColumnRenamed("rcif_number", "RCIF_NUMBER"),
         ["RCIF_NUMBER"],
         "inner"
     )
-    # Deduplicate: one row per RCIF_NUMBER
     .withColumn("_rank", F.row_number().over(window_rcif))
     .filter(F.col("_rank") == 1)
     .drop("_rank")
-    # Derived columns
     .withColumn("customer_generation", generation_expr)
     .withColumn("mobile_active_flag",
-        F.when(F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90, "Mobile Active")
-         .otherwise("Non Mobile Active")
+        F.when(F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90, F.lit("Mobile Active"))
+         .otherwise(F.lit("Non Mobile Active"))
     )
     .withColumn("mobile_flag",
-        F.when(F.col("lst_login_mob").isNull(), "Non Mobile User").otherwise("Mobile User")
+        F.when(F.col("lst_login_mob").isNull(), F.lit("Non Mobile User")).otherwise(F.lit("Mobile User"))
     )
     .withColumn("olb_active_flag",
-        F.when(F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90, "OLB Active")
-         .otherwise("Non OLB Active")
+        F.when(F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90, F.lit("OLB Active"))
+         .otherwise(F.lit("Non OLB Active"))
     )
     .withColumn("olb_flag",
-        F.when(F.col("lst_login_olb").isNull(), "Non OLB User").otherwise("OLB User")
+        F.when(F.col("lst_login_olb").isNull(), F.lit("Non OLB User")).otherwise(F.lit("OLB User"))
     )
     .withColumn("digitally_active_flag",
         F.when(
             (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90) |
             (F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90),
-            "Digital Active"
-        ).otherwise("Non Digital Active")
+            F.lit("Digital Active")
+        ).otherwise(F.lit("Non Digital Active"))
     )
     .withColumn("digital_flag",
-        F.when(F.col("primary_ibn").isNull(), "Non Digital User").otherwise("Digital User")
+        F.when(F.col("primary_ibn").isNull(), F.lit("Non Digital User")).otherwise(F.lit("Digital User"))
     )
-    # ── Final column layout ──────────────────────────────────────────────────
     .select(
-        # ── Bridge keys ──
         F.col("business_date"),
         F.col("RCIF_NUMBER"),
-        F.col("ip_id"),                                     # bridge to Account table
-
-        # ── Identity ──
+        F.col("ip_id"),
         F.col("involved_party_name").alias("customer_name"),
         F.col("involved_party_tax_id_nbr").alias("tax_id_nbr"),
         F.col("birth_date"),
         F.col("customer_generation"),
-
-        # ── Both IBNs ──
-        F.col("cust_internet_banking_nbr").alias("olb_ibn"),    # OLB internet banking nbr
-        F.col("primary_ibn"),                                    # mobile / digital IBN
-
-        # ── Location ──
+        F.col("cust_internet_banking_nbr").alias("olb_ibn"),
+        F.col("primary_ibn"),
         F.col("city_name"),
         F.col("state_name"),
         F.col("country_name"),
-
-        # ── Wealth segmentation ──
         F.col("Business_Group").alias("business_group"),
         F.col("division"),
-
-        # ── Account counts ──
-        F.coalesce(F.col("wealth_accts_cnt"), F.lit(0)).alias("wealth_accts_cnt"),   # all wealth sources
-        F.coalesce(F.col("ip_accts_cnt"),     F.lit(0)).alias("ip_accts_cnt"),       # Investpath only
-        F.coalesce(F.col("banking_cnt"),       F.lit(0)).alias("banking_cnt"),
-        F.coalesce(F.col("investment_cnt"),    F.lit(0)).alias("investment_cnt"),
-        F.coalesce(F.col("trust_cnt"),         F.lit(0)).alias("trust_cnt"),
-        F.coalesce(F.col("insurance_cnt"),     F.lit(0)).alias("insurance_cnt"),
-        F.coalesce(F.col("pwm_cnt"),           F.lit(0)).alias("pwm_cnt"),
-        F.coalesce(F.col("corporate_trust_cnt"),     F.lit(0)).alias("corporate_trust_cnt"),
-        F.coalesce(F.col("institutional_trust_cnt"), F.lit(0)).alias("institutional_trust_cnt"),
-
-        # ── Digital flags ──
+        F.coalesce(F.col("wealth_accts_cnt"), F.lit(0)).alias("wealth_accts_cnt"),
+        F.coalesce(F.col("ip_accts_cnt"),     F.lit(0)).alias("ip_accts_cnt"),
+        F.coalesce(F.col("banking_cnt"),              F.lit(0)).alias("banking_cnt"),
+        F.coalesce(F.col("investment_cnt"),           F.lit(0)).alias("investment_cnt"),
+        F.coalesce(F.col("trust_cnt"),                F.lit(0)).alias("trust_cnt"),
+        F.coalesce(F.col("insurance_cnt"),            F.lit(0)).alias("insurance_cnt"),
+        F.coalesce(F.col("pwm_cnt"),                  F.lit(0)).alias("pwm_cnt"),
+        F.coalesce(F.col("corporate_trust_cnt"),      F.lit(0)).alias("corporate_trust_cnt"),
+        F.coalesce(F.col("institutional_trust_cnt"),  F.lit(0)).alias("institutional_trust_cnt"),
         F.col("digital_flag"),
         F.col("digitally_active_flag"),
         F.col("mobile_flag"),
@@ -606,9 +577,7 @@ wealth_customer = (
 )
 
 # =============================================================================
-# STEP 8: FINAL ACCOUNT TABLE
-# One row per account — enriched with customer context
-# ip_ columns populated for Investpath rows only, NULL elsewhere
+# STEP 8: FINAL ACCOUNT TABLE — one row per account
 # =============================================================================
 
 wealth_account = (
@@ -623,54 +592,41 @@ wealth_account = (
             "mobile_flag", "olb_flag",
             "wealth_accts_cnt", "ip_accts_cnt",
             "primary_ibn",
-            F.col("olb_ibn").alias("olb_ibn_cust"),
+            F.col("olb_ibn"),
             "state_name"
         ),
         ["RCIF_NUMBER", "ip_id"],
         "left"
     )
     .select(
-        # ── Bridge keys ──
         F.col("business_date"),
         F.col("RCIF_NUMBER"),
-        F.col("ip_id"),                                     # bridge to Customer table
-
-        # ── IBNs ──
-        F.col("cust_internet_banking_nbr").alias("olb_ibn"),
+        F.col("ip_id"),
+        F.col("olb_ibn"),
         F.col("primary_ibn"),
-
-        # ── Account details ──
         F.col("account_number"),
-        F.col("account_type"),                              # Banking/Investment/Trust/PWM/Investpath
+        F.col("account_type"),
         F.col("account_type_code"),
         F.col("source_system"),
         F.col("business_service_segment_type_code"),
         F.col("open_date"),
         F.col("balance"),
         F.col("closed_ind"),
-
-        # ── Investpath-specific columns (NULL for non-Investpath rows) ──
         F.col("ip_account_number"),
         F.col("ip_open_date"),
         F.col("ip_balance"),
         F.col("ip_source_system"),
         F.col("ip_account_type_code"),
-
-        # ── Customer context ──
         F.col("business_group"),
         F.col("division"),
         F.col("state_name"),
         F.col("customer_generation"),
-
-        # ── Digital flags ──
         F.col("digital_flag"),
         F.col("digitally_active_flag"),
         F.col("mobile_active_flag"),
         F.col("mobile_flag"),
         F.col("olb_active_flag"),
         F.col("olb_flag"),
-
-        # ── Account counts (from customer) ──
         F.col("wealth_accts_cnt"),
         F.col("ip_accts_cnt")
     )
@@ -685,7 +641,7 @@ wealth_account = (
     .write
     .mode("overwrite")
     .option("overwriteSchema", "true")
-    .saveAsTable(f"{final_db}.{final_table_customer}")
+    .saveAsTable("{}.{}".format(final_db, final_table_customer))
 )
 
 (
@@ -693,8 +649,8 @@ wealth_account = (
     .write
     .mode("overwrite")
     .option("overwriteSchema", "true")
-    .saveAsTable(f"{final_db}.{final_table_account}")
+    .saveAsTable("{}.{}".format(final_db, final_table_account))
 )
 
-print(f"✅ {final_db}.{final_table_customer} written — {wealth_customer.count()} rows")
-print(f"✅ {final_db}.{final_table_account} written  — {wealth_account.count()} rows")
+print("Done: {}.{}".format(final_db, final_table_customer))
+print("Done: {}.{}".format(final_db, final_table_account))
