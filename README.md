@@ -511,6 +511,44 @@ wealth_account = (
 )
 
 # =============================================================================
+# TABLE 3: SLIM DIGITAL TABLE
+# Source: dm_ib.digital_banking_master
+# Purpose: Powers "Top of Company Total Digital Active" KPI = 3.5M
+# One row per RCIF per month — ALL company customers not just wealth
+# Columns: RCIF_NUMBER, business_date, ibn, digitallyactiveflag
+# =============================================================================
+
+digital = (
+    spark.table("dm_ib.digital_banking_master")
+    .filter(
+        (F.col("ods_business_dt").cast("date") >= F.lit(START_DT)) &
+        (F.col("ods_business_dt").cast("date") <= F.lit(END_DT))
+    )
+    .groupBy(
+        F.col("rcif_customer_nbr").alias("RCIF_NUMBER"),
+        F.col("ods_business_dt").alias("business_date"),
+        F.col("ibn")
+    )
+    .agg(
+        F.max("olb_last_login_date").alias("lst_login_olb"),
+        F.max("mob_last_login_date").alias("lst_login_mob")
+    )
+    .withColumn("digitallyactiveflag",
+        F.when(
+            (F.datediff(F.col("business_date"), F.col("lst_login_mob")) <= 90) |
+            (F.datediff(F.col("business_date"), F.col("lst_login_olb")) <= 90),
+            F.lit("Digital Active")
+        ).otherwise(F.lit("Non Digital Active"))
+    )
+    .select(
+        "RCIF_NUMBER",
+        "business_date",
+        "ibn",
+        "digitallyactiveflag"
+    )
+)
+
+# =============================================================================
 # WRITE TABLES
 # =============================================================================
 
@@ -522,5 +560,10 @@ wealth_account.write.mode("overwrite") \
     .option("overwriteSchema", "true") \
     .saveAsTable("{}.{}".format(final_db, final_table_account))
 
+digital.write.mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable("{}.{}".format(final_db, "wealth_Insights_Digital"))
+
 print("Customer rows : {}".format(wealth_customer.count()))
 print("Account rows  : {}".format(wealth_account.count()))
+print("Digital rows  : {}".format(digital.count()))
