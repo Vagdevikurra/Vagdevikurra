@@ -1,5 +1,14 @@
 Great numbers! Let me validate:
-
+SELECT 
+    count(distinct rcif_id)                    AS total_distinct_rcif,
+    count(distinct rcif_id) FILTER (WHERE login_date >= dateadd(day, -90, max(login_date))) AS active_90d,
+    count(distinct case when channel='OLB' then rcif_id end)    AS olb_rcif,
+    count(distinct case when channel='Mobile' then rcif_id end) AS mob_rcif,
+    min(login_date) AS min_dt,
+    max(login_date) AS max_dt
+FROM dm_ib.transmit_digital_logins
+WHERE rcif_id IS NOT NULL
+  AND rcif_id != ''
 - **Wealth rows 1.6M** ✅ — 276K × 6 months = correct
 - **Digital rows 4.1M** ✅ — slightly higher than 3.4M but makes sense since transmit covers 2 years of logins so more unique RCIFs
 - **Account 125** ✅ — exact match
