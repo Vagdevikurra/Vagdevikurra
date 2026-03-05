@@ -126,6 +126,14 @@ max_login_date = (
 
 print("Max transmit login date : {}".format(max_login_date))
 
+max_dbm_dt = (
+    spark.table("dm_ib.digital_banking_master")
+    .agg(F.max("ods_business_dt"))
+    .collect()[0][0]
+)
+
+print("Max digital banking date : {}".format(max_dbm_dt))
+
 transmit = spark.table("dm_ib.transmit_digital_logins")
 
 # Get cust_internet_banking_nbr from digital_banking_master at max date
