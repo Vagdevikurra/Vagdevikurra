@@ -284,7 +284,6 @@ pw1 = (
 
 # =============================================================================
 # STEP 3: CUSTOMER BASE — one snapshot per month-end
-# Digital flags computed per snap_date for accurate 90-day window
 # =============================================================================
 
 ip_d   = spark.table("eil.d_involved_party_h")
@@ -293,10 +292,57 @@ ar_d   = spark.table("eil.d_arrangement_h")
 addr_d = spark.table("eil.d_involved_party_address_h")
 
 def build_snapshot(snap_date):
-    # Digital flags relative to snap_date — 90 days back from THIS month
-    dig_snap = (
+    return (
+        ip_d.filter(
+            (F.col("business_date") == snap_date) &
+            (F.col("source_system_code") == "CF") &
+            (F.coalesce(F.col("deceased_ind"), F.lit("N")) == "N")
+        )
+        .join(
+            a2i_d.filter(F.col("business_date") == snap_date),
+            (ip_d["involved_party_id"]  == a2i_d["involved_party_id"]) &
+            (ip_d["business_date"]      == a2i_d["business_date"]) &
+            (ip_d["source_system_code"] == a2i_d["source_system_code"]),
+            "inner"
+        )
+        .join(
+            ar_d.filter(
+                (F.col("business_date") == snap_date) &
+                F.col("source_system_code").isin(WEALTH_SOURCE_CODES)
+            ),
+            (a2i_d["arrangement_id"]                 == ar_d["arrangement_id"]) &
+            (a2i_d["arrangement_source_system_code"] == ar_d["source_system_code"]) &
+            (a2i_d["business_date"]                  == ar_d["business_date"]),
+            "inner"
+        )
+        .join(
+            addr_d.filter(F.col("business_date") == snap_date),
+            (ip_d["involved_party_id"] == addr_d["involved_party_id"]) &
+            (ip_d["business_date"]     == addr_d["business_date"]),
+            "inner"
+        )
+        .groupBy(ip_d["rcif_cust_nbr"].cast("string").alias("RCIF_NUMBER"))
+        .agg(
+            F.lit(snap_date).cast(T.DateType()).alias("business_date"),
+            F.first(ip_d["involved_party_id"]).alias("ip_id"),
+            F.first(addr_d["state_name"]).alias("state_name")
+        )
+    )
+
+rc_snapshots = [build_snapshot(d) for d in month_end_dates]
+rc = rc_snapshots[0]
+for snap in rc_snapshots[1:]:
+    rc = rc.union(snap)
+
+# =============================================================================
+# DIGITAL FLAGS PER MONTH-END SNAPSHOT
+# Compute 90-day window relative to each snap_date not global max
+# =============================================================================
+
+def build_digital_flags(snap_date):
+    return (
         transmit
-        .filter(F.col("login_date") <= snap_date)   # only logins up to snap_date
+        .filter(F.col("login_date") <= snap_date)
         .groupBy(F.col("rcif_id").alias("RCIF_NUMBER"))
         .agg(
             F.max(F.when(F.col("channel") == "Online",  F.lit(1)).otherwise(F.lit(0))).alias("olb_enrolled_flag"),
@@ -333,46 +379,14 @@ def build_snapshot(snap_date):
                 F.lit("Digital Enrolled")
             ).otherwise(F.lit("Non Digital Enrolled"))
         )
+        .withColumn("business_date", F.lit(snap_date).cast(T.DateType()))
         .drop("olb_enrolled_flag", "mob_enrolled_flag")
     )
 
-    return (
-        ip_d.filter(
-            (F.col("business_date") == snap_date) &
-            (F.col("source_system_code") == "CF") &
-            (F.coalesce(F.col("deceased_ind"), F.lit("N")) == "N")
-        )
-        .join(
-            a2i_d.filter(F.col("business_date") == snap_date),
-            (ip_d["involved_party_id"]  == a2i_d["involved_party_id"]) &
-            (ip_d["business_date"]      == a2i_d["business_date"]) &
-            (ip_d["source_system_code"] == a2i_d["source_system_code"]),
-            "inner"
-        )
-        .join(
-            ar_d.filter(
-                (F.col("business_date") == snap_date) &
-                F.col("source_system_code").isin(WEALTH_SOURCE_CODES)
-            ),
-            (a2i_d["arrangement_id"]                 == ar_d["arrangement_id"]) &
-            (a2i_d["arrangement_source_system_code"] == ar_d["source_system_code"]) &
-            (a2i_d["business_date"]                  == ar_d["business_date"]),
-            "inner"
-        )
-        .join(
-            addr_d.filter(F.col("business_date") == snap_date),
-            (ip_d["involved_party_id"] == addr_d["involved_party_id"]) &
-            (ip_d["business_date"]     == addr_d["business_date"]),
-            "inner"
-        )
-        .groupBy(ip_d["rcif_cust_nbr"].cast("string").alias("RCIF_NUMBER"))
-        .agg(
-            F.lit(snap_date).cast(T.DateType()).alias("business_date"),
-            F.first(ip_d["involved_party_id"]).alias("ip_id"),
-            F.first(addr_d["state_name"]).alias("state_name")
-        )
-        .join(dig_snap, ["RCIF_NUMBER"], "left")
-    )
+dig_snapshots = [build_digital_flags(d) for d in month_end_dates]
+digital_flags_monthly = dig_snapshots[0]
+for snap in dig_snapshots[1:]:
+    digital_flags_monthly = digital_flags_monthly.union(snap)
 
 rc_snapshots = [build_snapshot(d) for d in month_end_dates]
 rc = rc_snapshots[0]
@@ -430,9 +444,10 @@ window_dedup = Window.partitionBy("RCIF_NUMBER", "business_date").orderBy("RCIF_
 
 wealth_rows = (
     rc
-    .join(pw1,          ["RCIF_NUMBER", "ip_id"],                  "inner")
-    .join(ip_accts_cnt, ["RCIF_NUMBER", "ip_id", "business_date"], "left")
-    .join(dbm_ibn,      ["RCIF_NUMBER"],                            "left")
+    .join(pw1,                   ["RCIF_NUMBER", "ip_id"],                  "inner")
+    .join(ip_accts_cnt,          ["RCIF_NUMBER", "ip_id", "business_date"], "left")
+    .join(digital_flags_monthly, ["RCIF_NUMBER", "business_date"],          "left")
+    .join(dbm_ibn,               ["RCIF_NUMBER"],                           "left")
     .withColumn("_rank", F.row_number().over(window_dedup))
     .filter(F.col("_rank") == 1).drop("_rank")
     .select(
