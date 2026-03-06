@@ -176,6 +176,36 @@ dig_login_dates = (
         F.max("olb_last_login_date").alias("last_olb_login"),
         F.max("mob_last_login_date").alias("last_mob_login")
     )
+    # Active flags computed ONCE using max_ip_date as reference.
+    # DBM stores all-time last login — dates can be after any month-end
+    # snapshot so per-month datediff gives negatives. Single reference
+    # is correct: monthly variation comes from customer population changes.
+    .withColumn("olb_active_flag",
+        F.when(
+            F.col("last_olb_login").isNotNull() &
+            (F.datediff(F.lit(max_ip_date), F.col("last_olb_login")) <= 90),
+            F.lit("OLB Active")
+        ).otherwise(F.lit("Non OLB Active"))
+    )
+    .withColumn("mob_active_flag",
+        F.when(
+            F.col("last_mob_login").isNotNull() &
+            (F.datediff(F.lit(max_ip_date), F.col("last_mob_login")) <= 90),
+            F.lit("Mobile Active")
+        ).otherwise(F.lit("Non Mobile Active"))
+    )
+    .withColumn("digitally_active_flag",
+        F.when(
+            (
+                F.col("last_olb_login").isNotNull() &
+                (F.datediff(F.lit(max_ip_date), F.col("last_olb_login")) <= 90)
+            ) | (
+                F.col("last_mob_login").isNotNull() &
+                (F.datediff(F.lit(max_ip_date), F.col("last_mob_login")) <= 90)
+            ),
+            F.lit("Digital Active")
+        ).otherwise(F.lit("Non Digital Active"))
+    )
 )
 
 print("DBM partition      : {}".format(DBM_PARTITION))
@@ -387,42 +417,7 @@ wealth_rows = (
     .join(dig_login_dates, ["RCIF_NUMBER"],                           "left")
     .withColumn("_rank", F.row_number().over(window_dedup))
     .filter(F.col("_rank") == 1).drop("_rank")
-    # -----------------------------------------------------------------------
-    # Compute active flags using business_date (the month-end snapshot date)
-    # so each month gets its own correct 90-day window.
-    # Dec 2025 month-end => active = logged in after ~Oct 2025
-    # Aug 2025 month-end => active = logged in after ~May 2025
-    # -----------------------------------------------------------------------
-    .withColumn("olb_active_flag",
-        F.when(
-            F.col("last_olb_login").isNotNull() &
-            (F.datediff(F.col("business_date"), F.col("last_olb_login")) >= 0) &
-            (F.datediff(F.col("business_date"), F.col("last_olb_login")) <= 90),
-            F.lit("OLB Active")
-        ).otherwise(F.lit("Non OLB Active"))
-    )
-    .withColumn("mob_active_flag",
-        F.when(
-            F.col("last_mob_login").isNotNull() &
-            (F.datediff(F.col("business_date"), F.col("last_mob_login")) >= 0) &
-            (F.datediff(F.col("business_date"), F.col("last_mob_login")) <= 90),
-            F.lit("Mobile Active")
-        ).otherwise(F.lit("Non Mobile Active"))
-    )
-    .withColumn("digitally_active_flag",
-        F.when(
-            (
-                F.col("last_olb_login").isNotNull() &
-                (F.datediff(F.col("business_date"), F.col("last_olb_login")) >= 0) &
-                (F.datediff(F.col("business_date"), F.col("last_olb_login")) <= 90)
-            ) | (
-                F.col("last_mob_login").isNotNull() &
-                (F.datediff(F.col("business_date"), F.col("last_mob_login")) >= 0) &
-                (F.datediff(F.col("business_date"), F.col("last_mob_login")) <= 90)
-            ),
-            F.lit("Digital Active")
-        ).otherwise(F.lit("Non Digital Active"))
-    )
+    # Active flags come from dig_login_dates (already computed against max_ip_date)
     .select(
         F.col("RCIF_NUMBER"),
         F.col("ip_id"),
