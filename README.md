@@ -1,15 +1,15 @@
 # =============================================================================
 # Wealth Insights — Final Script
-# Date Range : 2025-08-01 to 2026-01-31  |  Python 3.6 compatible
+# Date Range : 2025-08-01 to 2026-01-31
+# Python 3.6 compatible
 #
-# TABLE 1: dm_ib_dev.wealth_Insights_Customer
-#   fact_type = "Wealth"  — one row per RCIF per month-end (~1.6M)
-#   fact_type = "Digital" — one row per RCIF at max login date (~4M)
+# OUTPUT TABLES:
+#   dm_ib_dev.wealth_Insights_Customer  — one row per RCIF per month-end
+#   dm_ib_dev.wealth_Insights_Account   — one row per InvestPath account
 #
-# TABLE 2: dm_ib_dev.wealth_Insights_Account
-#   one row per InvestPath account (~125)
-#
-# Digital source: dm_ib.transmit_digital_logins  (channel = "Online" | "Mobile")
+# DIGITAL FLAGS SOURCE: dm_ib.digital_banking_master  (partition 2026-03-02)
+# JOIN KEY            : EIL.cust_internet_banking_nbr == DBM.ibn
+# ACTIVE LOGIC        : datediff(DBM.ods_business_dt, last_login_date) <= 90
 # PC and BW excluded from all source codes
 # =============================================================================
 
@@ -40,27 +40,35 @@ def parse_date(s):
     return datetime.strptime(s, "%Y-%m-%d").date()
 
 def get_valid_business_dates(spark, table, start, end):
-    """Returns one date per calendar month — last available business day."""
-    existing = {
-        row["dt"] for row in (
-            spark.table(table)
-            .filter(
-                (F.col("business_date").cast("date") >= F.lit(start)) &
-                (F.col("business_date").cast("date") <= F.lit(end))
-            )
-            .select(F.col("business_date").cast("date").alias("dt"))
-            .distinct()
-            .collect()
+    """
+    Returns list of date strings — one per calendar month in [start,end].
+    Uses last available business day per month (handles weekend month-ends).
+    """
+    existing = set()
+    for row in (
+        spark.table(table)
+        .filter(
+            (F.col("business_date").cast("date") >= F.lit(start)) &
+            (F.col("business_date").cast("date") <= F.lit(end))
         )
-    }
+        .select(F.col("business_date").cast("date").alias("dt"))
+        .distinct()
+        .collect()
+    ):
+        existing.add(row["dt"])
+
     start_d, end_d = parse_date(start), parse_date(end)
-    month_ends, y, m = set(), start_d.year, start_d.month
+    month_ends = set()
+    y, m = start_d.year, start_d.month
     while date(y, m, 1) <= end_d:
         me = date(y, m, calendar.monthrange(y, m)[1])
         if start_d <= me <= end_d:
             month_ends.add(me)
-        if m == 12: y += 1; m = 1
-        else: m += 1
+        if m == 12:
+            y += 1; m = 1
+        else:
+            m += 1
+
     final_dates = set(existing)
     for me in month_ends:
         if me not in existing:
@@ -70,6 +78,7 @@ def get_valid_business_dates(spark, table, start, end):
                     final_dates.add(c)
                     break
                 c -= timedelta(days=1)
+
     return [str(d) for d in sorted(final_dates)]
 
 def month_key(d):
@@ -106,27 +115,16 @@ for _, grp in groupby(sorted(all_valid_dates), key=month_key):
 
 max_ip_date = month_end_dates[-1]
 
-# Max login date from transmit — used as "today" for 90-day active window
-max_login_date = (
-    spark.table("dm_ib.transmit_digital_logins")
-    .agg(F.max("login_date"))
-    .collect()[0][0]
-)
-
-print("Month-end dates    : {}".format(month_end_dates))
-print("Max IP date        : {}".format(max_ip_date))
-print("Max login date     : {}".format(max_login_date))
+print("Month-end dates : {}".format(month_end_dates))
+print("Max IP date     : {}".format(max_ip_date))
 
 # =============================================================================
-# STEP 1: DIGITAL FLAGS — exclusively from digital_banking_master
+# STEP 1: DIGITAL FLAGS — from digital_banking_master
 #
-# DBM has everything needed:
-#   ibn                 -> not null = enrolled (OLB or Mobile)
-#   olb_last_login_date -> all-time last OLB login date
-#   mob_last_login_date -> all-time last Mobile login date
-#
-# Active = logged in within 90 days of max_ip_date
-# Enrolled = has an ibn value (internet banking number assigned)
+# Partition  : 2026-03-02  (hardcoded — avoids broken Jun 2025 partitions)
+# Join key   : EIL.cust_internet_banking_nbr == DBM.ibn
+# Active flag: datediff(DBM.ods_business_dt, last_login_date) <= 90
+#              This matches exactly the original SQL logic
 # =============================================================================
 
 DBM_PARTITION = "2026-03-02"
@@ -135,56 +133,63 @@ dbm = (
     spark.table("dm_ib.digital_banking_master")
     .filter(F.col("ods_business_dt") == F.lit(DBM_PARTITION))
     .filter(
-        F.col("rcif_customer_nbr").isNotNull() &
-        (F.col("rcif_customer_nbr").cast("string") != "")
+        F.col("ibn").isNotNull() &
+        (F.col("ibn").cast("string") != "")
     )
-    .groupBy(F.col("rcif_customer_nbr").cast("string").alias("RCIF_NUMBER"))
+    .groupBy(
+        F.col("ibn").cast("string").alias("ibn"),
+        F.col("ods_business_dt").cast("date").alias("dbm_snap_dt")
+    )
     .agg(
-        F.max("olb_last_login_date").alias("last_olb_login"),
-        F.max("mob_last_login_date").alias("last_mob_login"),
-        F.max("ibn").alias("ibn")
+        F.max("olb_last_login_date").alias("lst_login_olb"),
+        F.max("mob_last_login_date").alias("lst_login_mob")
     )
-    .withColumn("olb_enrolled",
-        F.when(F.col("ibn").isNotNull(), F.lit("OLB Enrolled"))
-         .otherwise(F.lit("Non OLB Enrolled"))
-    )
-    .withColumn("mob_enrolled",
-        F.when(F.col("ibn").isNotNull(), F.lit("Mobile Enrolled"))
-         .otherwise(F.lit("Non Mobile Enrolled"))
-    )
-    .withColumn("digital_enrolled",
-        F.when(F.col("ibn").isNotNull(), F.lit("Digital Enrolled"))
-         .otherwise(F.lit("Non Digital Enrolled"))
-    )
+    # Active flag: datediff(snapshot_date, last_login) <= 90
+    # Exactly mirrors original SQL: datediff(ods_business_dt, lst_login_X) <= 90
     .withColumn("olb_active_flag",
         F.when(
-            F.col("last_olb_login").isNotNull() &
-            (F.datediff(F.lit(max_ip_date), F.col("last_olb_login")) <= 90),
+            F.col("lst_login_olb").isNotNull() &
+            (F.datediff(F.col("dbm_snap_dt"), F.col("lst_login_olb")) <= 90),
             F.lit("OLB Active")
         ).otherwise(F.lit("Non OLB Active"))
     )
     .withColumn("mob_active_flag",
         F.when(
-            F.col("last_mob_login").isNotNull() &
-            (F.datediff(F.lit(max_ip_date), F.col("last_mob_login")) <= 90),
+            F.col("lst_login_mob").isNotNull() &
+            (F.datediff(F.col("dbm_snap_dt"), F.col("lst_login_mob")) <= 90),
             F.lit("Mobile Active")
         ).otherwise(F.lit("Non Mobile Active"))
     )
     .withColumn("digitally_active_flag",
         F.when(
             (
-                F.col("last_olb_login").isNotNull() &
-                (F.datediff(F.lit(max_ip_date), F.col("last_olb_login")) <= 90)
+                F.col("lst_login_olb").isNotNull() &
+                (F.datediff(F.col("dbm_snap_dt"), F.col("lst_login_olb")) <= 90)
             ) | (
-                F.col("last_mob_login").isNotNull() &
-                (F.datediff(F.lit(max_ip_date), F.col("last_mob_login")) <= 90)
+                F.col("lst_login_mob").isNotNull() &
+                (F.datediff(F.col("dbm_snap_dt"), F.col("lst_login_mob")) <= 90)
             ),
             F.lit("Digital Active")
         ).otherwise(F.lit("Non Digital Active"))
     )
+    # Enrolled = has an IBN (internet banking number assigned)
+    .withColumn("olb_enrolled",
+        F.when(F.col("lst_login_olb").isNotNull(),
+               F.lit("OLB Enrolled")).otherwise(F.lit("Non OLB Enrolled"))
+    )
+    .withColumn("mob_enrolled",
+        F.when(F.col("lst_login_mob").isNotNull(),
+               F.lit("Mobile Enrolled")).otherwise(F.lit("Non Mobile Enrolled"))
+    )
+    .withColumn("digital_enrolled",
+        F.when(
+            F.col("lst_login_olb").isNotNull() | F.col("lst_login_mob").isNotNull(),
+            F.lit("Digital Enrolled")
+        ).otherwise(F.lit("Non Digital Enrolled"))
+    )
 )
 
-print("DBM partition      : {}".format(DBM_PARTITION))
+print("DBM partition   : {}".format(DBM_PARTITION))
 
 # =============================================================================
 # STEP 2: WEALTH SEGMENTATION  (monthly — one row per RCIF + ip_id)
@@ -245,7 +250,8 @@ pw1 = (
     )
     .groupBy(
         ip_m["rcif_cust_nbr"].cast("string").alias("RCIF_NUMBER"),
-        ip_m["involved_party_id"].alias("ip_id")
+        ip_m["involved_party_id"].alias("ip_id"),
+        ip_m["cust_internet_banking_nbr"].alias("ibn")
     )
     .agg(
         F.first("business_group").alias("business_group"),
@@ -325,6 +331,7 @@ def build_snapshot(snap_date):
         .agg(
             F.lit(snap_date).cast(T.DateType()).alias("business_date"),
             F.first(ip_d["involved_party_id"]).alias("ip_id"),
+            F.first(ip_d["cust_internet_banking_nbr"]).alias("cust_ibn"),
             F.first(addr_d["state_name"]).alias("state_name")
         )
     )
@@ -368,143 +375,60 @@ ip_accts_cnt = (
         (a2i_inv["business_date"]                  == ar_inv["business_date"]),
         "inner"
     )
-    .withColumn("ar_inv_id", ar_inv["arrangement_id"])
     .groupBy(
         ind_inv["rcif_cust_nbr"].cast("string").alias("RCIF_NUMBER"),
-        ind_inv["involved_party_id"].alias("ip_id"),
         ind_inv["business_date"].cast(T.DateType()).alias("business_date")
     )
-    .agg(F.countDistinct(F.col("ar_inv_id")).alias("ip_accts_cnt"))
+    .agg(F.countDistinct(ar_inv["arrangement_id"]).alias("ip_accts_cnt"))
 )
 
 # =============================================================================
-# STEP 5: BUILD WEALTH ROWS
-# One row per RCIF per month-end — digital flags from transmit (left join)
-# Safety dedup: row_number per RCIF + business_date
+# STEP 5: BUILD WEALTH_INSIGHTS_CUSTOMER
+#
+# Join rc (monthly RCIF snapshots)
+#   -> pw1 on RCIF_NUMBER (wealth segmentation)
+#   -> dbm on cust_ibn == ibn  (digital flags — IBN to IBN, original join key)
+#   -> ip_accts_cnt on RCIF_NUMBER + business_date
+#
+# Dedup: row_number per RCIF + business_date in case of any fan-out
 # =============================================================================
 
 window_dedup = Window.partitionBy("RCIF_NUMBER", "business_date").orderBy("RCIF_NUMBER")
 
-wealth_rows = (
+wealth_customer = (
     rc
-    .join(pw1,           ["RCIF_NUMBER", "ip_id"],                  "inner")
-    .join(ip_accts_cnt,  ["RCIF_NUMBER", "ip_id", "business_date"], "left")
-    .join(dbm,            ["RCIF_NUMBER"],                           "left")
+    .join(pw1.drop("ibn"),          ["RCIF_NUMBER"],          "inner")
+    .join(ip_accts_cnt,             ["RCIF_NUMBER", "business_date"], "left")
+    # Join DBM on IBN — the correct original join key
+    .join(dbm, rc["cust_ibn"] == dbm["ibn"], "left")
     .withColumn("_rank", F.row_number().over(window_dedup))
     .filter(F.col("_rank") == 1).drop("_rank")
-    # Active flags come from dig_login_dates (already computed against max_ip_date)
     .select(
         F.col("RCIF_NUMBER"),
-        F.col("ip_id"),
         F.col("business_date"),
         F.col("state_name"),
         F.col("business_group"),
         F.col("division"),
         F.coalesce(F.col("wealth_accts_cnt"), F.lit(0)).alias("wealth_accts_cnt"),
         F.coalesce(F.col("ip_accts_cnt"),     F.lit(0)).alias("ip_accts_cnt"),
+        # IBN from EIL (primary IBN)
+        F.col("cust_ibn").alias("ibn"),
+        # Digital flags from DBM
         F.col("digital_enrolled"),
         F.col("digitally_active_flag"),
         F.col("olb_enrolled"),
         F.col("olb_active_flag"),
         F.col("mob_enrolled"),
         F.col("mob_active_flag"),
-        F.col("last_olb_login"),
-        F.col("last_mob_login"),
-        F.lit("Wealth").alias("fact_type"),
-        F.lit(None).cast(T.StringType()).alias("ibn")
+        F.col("lst_login_olb"),
+        F.col("lst_login_mob"),
+        F.lit("Wealth").alias("fact_type")
     )
 )
 
 # =============================================================================
-# STEP 6: BUILD DIGITAL ROWS  — IBN population for penetration denominator
-#
-# Source: eil.d_involved_party_h at max_ip_date where IBN is not null
-# ibn = cust_internet_banking_nbr  (~8M rows = true digital population)
-# DAX: DISTINCTCOUNT(Customer[ibn]) where fact_type = "Digital" = denominator
-# Numerator: DISTINCTCOUNT(Customer[RCIF_NUMBER]) where fact_type = "Wealth"
-# Penetration = ~276K / ~8M = ~3.5%
-#
-# transmit active flags joined left — so all IBN holders are included
-# even if they have no transmit record (they get "Non Digital Active")
-# =============================================================================
-
-ibn_pool = (
-    spark.table("eil.d_involved_party_h")
-    .filter(
-        (F.col("business_date") == max_ip_date) &
-        (F.col("source_system_code") == "CF") &
-        F.col("cust_internet_banking_nbr").isNotNull() &
-        (F.col("cust_internet_banking_nbr").cast("string") != "")
-    )
-    .select(
-        F.col("rcif_cust_nbr").cast("string").alias("RCIF_NUMBER"),
-        F.col("cust_internet_banking_nbr").cast("string").alias("ibn")
-    )
-    .distinct()
-)
-
-# Aggregate transmit active flags per RCIF for the join
-transmit_active = (
-    transmit
-    .filter(
-        F.col("rcif_id").isNotNull() &
-        (F.col("rcif_id").cast("string") != "")
-    )
-    .groupBy(F.col("rcif_id").cast("string").alias("RCIF_NUMBER"))
-    .agg(
-        F.max(F.when(F.col("channel") == "Online", F.col("login_date"))).alias("last_olb_login"),
-        F.max(F.when(F.col("channel") == "Mobile", F.col("login_date"))).alias("last_mob_login")
-    )
-    .withColumn("digitally_active_flag",
-        F.when(
-            (
-                F.col("last_olb_login").isNotNull() &
-                (F.datediff(F.lit(max_login_date), F.col("last_olb_login")) <= 90)
-            ) | (
-                F.col("last_mob_login").isNotNull() &
-                (F.datediff(F.lit(max_login_date), F.col("last_mob_login")) <= 90)
-            ),
-            F.lit("Digital Active")
-        ).otherwise(F.lit("Non Digital Active"))
-    )
-)
-
-digital_rows = (
-    ibn_pool
-    .join(transmit_active, ["RCIF_NUMBER"], "left")
-    .withColumn("digitally_active_flag",
-        F.coalesce(F.col("digitally_active_flag"), F.lit("Non Digital Active"))
-    )
-    .withColumn("last_olb_login",
-        F.col("last_olb_login")   # null if no transmit record — that is correct
-    )
-    .withColumn("last_mob_login",
-        F.col("last_mob_login")
-    )
-    .select(
-        F.col("RCIF_NUMBER"),
-        F.lit(None).cast(T.StringType()).alias("ip_id"),
-        F.lit(max_ip_date).cast(T.DateType()).alias("business_date"),
-        F.lit(None).cast(T.StringType()).alias("state_name"),
-        F.lit(None).cast(T.StringType()).alias("business_group"),
-        F.lit(None).cast(T.StringType()).alias("division"),
-        F.lit(None).cast(T.IntegerType()).alias("wealth_accts_cnt"),
-        F.lit(None).cast(T.IntegerType()).alias("ip_accts_cnt"),
-        F.lit(None).cast(T.StringType()).alias("digital_enrolled"),
-        F.col("digitally_active_flag"),
-        F.lit(None).cast(T.StringType()).alias("olb_enrolled"),
-        F.lit(None).cast(T.StringType()).alias("olb_active_flag"),
-        F.lit(None).cast(T.StringType()).alias("mob_enrolled"),
-        F.lit(None).cast(T.StringType()).alias("mob_active_flag"),
-        F.col("last_olb_login"),
-        F.col("last_mob_login"),
-        F.lit("Digital").alias("fact_type"),
-        F.col("ibn")
-    )
-)
-
-# =============================================================================
-# STEP 7: INVESTPATH ACCOUNT TABLE
+# STEP 6: BUILD WEALTH_INSIGHTS_ACCOUNT
+# One row per InvestPath account at max_ip_date
 # =============================================================================
 
 ind_a = spark.table("eil.d_involved_party_h")
@@ -537,28 +461,20 @@ wealth_account = (
         (a2i_a["business_date"]                  == ar_a["business_date"]),
         "inner"
     )
-    .withColumn("ar_account_number", ar_a["arrangement_id"])
-    .withColumn("ar_open_date",      ar_a["open_date"])
-    .withColumn("ar_balance",        ar_a["current_balance_amt"])
-    .withColumn("is_funded",
-        F.when(ar_a["current_balance_amt"] > 0, F.lit("Funded"))
-         .otherwise(F.lit("Not Funded"))
-    )
     .select(
         ind_a["rcif_cust_nbr"].cast("string").alias("RCIF_NUMBER"),
         ind_a["involved_party_id"].alias("ip_id"),
-        F.col("ar_account_number").alias("ip_account_number"),
-        F.col("ar_open_date").alias("ip_open_date"),
-        F.col("ar_balance").alias("ip_balance"),
-        F.col("is_funded")
+        ar_a["arrangement_id"].alias("ip_account_number"),
+        ar_a["open_date"].alias("ip_open_date"),
+        ar_a["current_balance_amt"].alias("ip_balance"),
+        F.when(ar_a["current_balance_amt"] > 0,
+               F.lit("Funded")).otherwise(F.lit("Not Funded")).alias("is_funded")
     )
 )
 
 # =============================================================================
-# STEP 8: UNION + WRITE
+# STEP 7: WRITE
 # =============================================================================
-
-wealth_customer = wealth_rows.union(digital_rows)
 
 wealth_customer.repartition(200).write \
     .mode("overwrite") \
@@ -575,7 +491,8 @@ wealth_account.write \
 # =============================================================================
 
 final = spark.table("{}.{}".format(final_db, final_table_customer))
-print("Wealth rows  : {}".format(final.filter(F.col("fact_type") == "Wealth").count()))
-print("Digital rows : {}".format(final.filter(F.col("fact_type") == "Digital").count()))
-print("Total rows   : {}".format(final.count()))
+print("Wealth rows  : {}".format(final.count()))
 print("Account rows : {}".format(wealth_account.count()))
+print("OLB Active sample:")
+final.groupBy("business_date","olb_active_flag") \
+     .count().orderBy("business_date","olb_active_flag").show(20)
