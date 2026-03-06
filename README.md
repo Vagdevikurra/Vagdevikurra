@@ -6,6 +6,10 @@ SELECT
 FROM eil.d_involved_party_h e
 LEFT JOIN dm_ib.digital_banking_master d
     ON CAST(e.rcif_cust_nbr AS STRING) = CAST(d.rcif_customer_nbr AS STRING)
-WHERE e.business_date = '2026-01-31'
+WHERE e.business_date = (
+        SELECT MAX(business_date) 
+        FROM eil.d_involved_party_h 
+        WHERE source_system_code = 'CF'
+    )
   AND e.source_system_code = 'CF'
 LIMIT 1
