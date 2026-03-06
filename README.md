@@ -118,53 +118,20 @@ print("Max IP date        : {}".format(max_ip_date))
 print("Max login date     : {}".format(max_login_date))
 
 # =============================================================================
-# STEP 1a: ENROLLED FLAGS — from transmit_digital_logins
-# channel = "Online" => OLB enrolled
-# channel = "Mobile" => Mobile enrolled
-# =============================================================================
-
-transmit = spark.table("dm_ib.transmit_digital_logins")
-
-digital_flags = (
-    transmit
-    .filter(
-        F.col("rcif_id").isNotNull() &
-        (F.col("rcif_id").cast("string") != "")
-    )
-    .groupBy(F.col("rcif_id").cast("string").alias("RCIF_NUMBER"))
-    .agg(
-        F.max(F.when(F.col("channel") == "Online", F.lit(1)).otherwise(F.lit(0))).alias("_olb_enr"),
-        F.max(F.when(F.col("channel") == "Mobile", F.lit(1)).otherwise(F.lit(0))).alias("_mob_enr")
-    )
-    .withColumn("olb_enrolled",
-        F.when(F.col("_olb_enr") == 1, F.lit("OLB Enrolled"))
-         .otherwise(F.lit("Non OLB Enrolled"))
-    )
-    .withColumn("mob_enrolled",
-        F.when(F.col("_mob_enr") == 1, F.lit("Mobile Enrolled"))
-         .otherwise(F.lit("Non Mobile Enrolled"))
-    )
-    .withColumn("digital_enrolled",
-        F.when(
-            (F.col("_olb_enr") == 1) | (F.col("_mob_enr") == 1),
-            F.lit("Digital Enrolled")
-        ).otherwise(F.lit("Non Digital Enrolled"))
-    )
-    .drop("_olb_enr", "_mob_enr")
-)
-
-# =============================================================================
-# STEP 1b: LAST LOGIN DATES — from digital_banking_master
-# Filter to EXACT partition 2026-03-02 (latest healthy partition).
-# Filtering to a single partition avoids scanning broken Jun 2025 partitions.
-# olb_last_login_date / mob_last_login_date are all-time dates — accurate
-# for computing 90-day active window at any month-end snapshot.
-# Join key: rcif_customer_nbr -> RCIF_NUMBER (confirmed match with EIL)
+# STEP 1: DIGITAL FLAGS — exclusively from digital_banking_master
+#
+# DBM has everything needed:
+#   ibn                 -> not null = enrolled (OLB or Mobile)
+#   olb_last_login_date -> all-time last OLB login date
+#   mob_last_login_date -> all-time last Mobile login date
+#
+# Active = logged in within 90 days of max_ip_date
+# Enrolled = has an ibn value (internet banking number assigned)
 # =============================================================================
 
 DBM_PARTITION = "2026-03-02"
 
-dig_login_dates = (
+dbm = (
     spark.table("dm_ib.digital_banking_master")
     .filter(F.col("ods_business_dt") == F.lit(DBM_PARTITION))
     .filter(
@@ -174,12 +141,21 @@ dig_login_dates = (
     .groupBy(F.col("rcif_customer_nbr").cast("string").alias("RCIF_NUMBER"))
     .agg(
         F.max("olb_last_login_date").alias("last_olb_login"),
-        F.max("mob_last_login_date").alias("last_mob_login")
+        F.max("mob_last_login_date").alias("last_mob_login"),
+        F.max("ibn").alias("ibn")
     )
-    # Active flags computed ONCE using max_ip_date as reference.
-    # DBM stores all-time last login — dates can be after any month-end
-    # snapshot so per-month datediff gives negatives. Single reference
-    # is correct: monthly variation comes from customer population changes.
+    .withColumn("olb_enrolled",
+        F.when(F.col("ibn").isNotNull(), F.lit("OLB Enrolled"))
+         .otherwise(F.lit("Non OLB Enrolled"))
+    )
+    .withColumn("mob_enrolled",
+        F.when(F.col("ibn").isNotNull(), F.lit("Mobile Enrolled"))
+         .otherwise(F.lit("Non Mobile Enrolled"))
+    )
+    .withColumn("digital_enrolled",
+        F.when(F.col("ibn").isNotNull(), F.lit("Digital Enrolled"))
+         .otherwise(F.lit("Non Digital Enrolled"))
+    )
     .withColumn("olb_active_flag",
         F.when(
             F.col("last_olb_login").isNotNull() &
@@ -413,8 +389,7 @@ wealth_rows = (
     rc
     .join(pw1,           ["RCIF_NUMBER", "ip_id"],                  "inner")
     .join(ip_accts_cnt,  ["RCIF_NUMBER", "ip_id", "business_date"], "left")
-    .join(digital_flags,   ["RCIF_NUMBER"],                           "left")
-    .join(dig_login_dates, ["RCIF_NUMBER"],                           "left")
+    .join(dbm,            ["RCIF_NUMBER"],                           "left")
     .withColumn("_rank", F.row_number().over(window_dedup))
     .filter(F.col("_rank") == 1).drop("_rank")
     # Active flags come from dig_login_dates (already computed against max_ip_date)
