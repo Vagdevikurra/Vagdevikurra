@@ -144,34 +144,7 @@ dbm = (
         F.max("olb_last_login_date").alias("lst_login_olb"),
         F.max("mob_last_login_date").alias("lst_login_mob")
     )
-    # Active flag: datediff(snapshot_date, last_login) <= 90
-    # Exactly mirrors original SQL: datediff(ods_business_dt, lst_login_X) <= 90
-    .withColumn("olb_active_flag",
-        F.when(
-            F.col("lst_login_olb").isNotNull() &
-            (F.datediff(F.col("dbm_snap_dt"), F.col("lst_login_olb")) <= 90),
-            F.lit("OLB Active")
-        ).otherwise(F.lit("Non OLB Active"))
-    )
-    .withColumn("mob_active_flag",
-        F.when(
-            F.col("lst_login_mob").isNotNull() &
-            (F.datediff(F.col("dbm_snap_dt"), F.col("lst_login_mob")) <= 90),
-            F.lit("Mobile Active")
-        ).otherwise(F.lit("Non Mobile Active"))
-    )
-    .withColumn("digitally_active_flag",
-        F.when(
-            (
-                F.col("lst_login_olb").isNotNull() &
-                (F.datediff(F.col("dbm_snap_dt"), F.col("lst_login_olb")) <= 90)
-            ) | (
-                F.col("lst_login_mob").isNotNull() &
-                (F.datediff(F.col("dbm_snap_dt"), F.col("lst_login_mob")) <= 90)
-            ),
-            F.lit("Digital Active")
-        ).otherwise(F.lit("Non Digital Active"))
-    )
+    # Active flags computed PER MONTH in wealth_rows using business_date.
     # Enrolled = has an IBN (internet banking number assigned)
     .withColumn("olb_enrolled",
         F.when(F.col("lst_login_olb").isNotNull(),
@@ -403,6 +376,39 @@ wealth_customer = (
     .join(dbm, rc["cust_ibn"] == dbm["ibn"], "left")
     .withColumn("_rank", F.row_number().over(window_dedup))
     .filter(F.col("_rank") == 1).drop("_rank")
+    # Active flags per month:
+    # last_login must be <= business_date (no future logins counting in past months)
+    # AND within 90 days of business_date
+    .withColumn("olb_active_flag",
+        F.when(
+            F.col("lst_login_olb").isNotNull() &
+            (F.col("lst_login_olb") <= F.col("business_date")) &
+            (F.datediff(F.col("business_date"), F.col("lst_login_olb")) <= 90),
+            F.lit("OLB Active")
+        ).otherwise(F.lit("Non OLB Active"))
+    )
+    .withColumn("mob_active_flag",
+        F.when(
+            F.col("lst_login_mob").isNotNull() &
+            (F.col("lst_login_mob") <= F.col("business_date")) &
+            (F.datediff(F.col("business_date"), F.col("lst_login_mob")) <= 90),
+            F.lit("Mobile Active")
+        ).otherwise(F.lit("Non Mobile Active"))
+    )
+    .withColumn("digitally_active_flag",
+        F.when(
+            (
+                F.col("lst_login_olb").isNotNull() &
+                (F.col("lst_login_olb") <= F.col("business_date")) &
+                (F.datediff(F.col("business_date"), F.col("lst_login_olb")) <= 90)
+            ) | (
+                F.col("lst_login_mob").isNotNull() &
+                (F.col("lst_login_mob") <= F.col("business_date")) &
+                (F.datediff(F.col("business_date"), F.col("lst_login_mob")) <= 90)
+            ),
+            F.lit("Digital Active")
+        ).otherwise(F.lit("Non Digital Active"))
+    )
     .select(
         F.col("RCIF_NUMBER"),
         F.col("business_date"),
@@ -411,9 +417,7 @@ wealth_customer = (
         F.col("division"),
         F.coalesce(F.col("wealth_accts_cnt"), F.lit(0)).alias("wealth_accts_cnt"),
         F.coalesce(F.col("ip_accts_cnt"),     F.lit(0)).alias("ip_accts_cnt"),
-        # IBN from EIL (primary IBN)
         F.col("cust_ibn").alias("ibn"),
-        # Digital flags from DBM
         F.col("digital_enrolled"),
         F.col("digitally_active_flag"),
         F.col("olb_enrolled"),
