@@ -3,14 +3,14 @@
 # Date Range  : 2025-09-01 to 2026-02-28
 # Digital Source: dm_ib.digital_banking_master — max partition only
 #
-# ACTIVE FLAG LOGIC:
-#   cutoff_date = END_DT - 90 days = 2026-02-28 - 90 = 2025-11-30
-#   OLB Active        : olb_last_login_date >= cutoff_date
-#   Mobile Active     : mob_last_login_date >= cutoff_date
-#   Digitally Active  : either of the above
+# ACTIVE FLAG LOGIC (matches original SQL):
+#   datediff(max_dbm_dt, last_login_date) <= 90
+#   i.e. logged in within 90 days of the DBM snapshot date
 #
-# DBM JOIN      : EIL.cust_internet_banking_nbr == DBM.ibn  (single snapshot)
-# WEALTH SEGS   : per month (business_date in groupBy)
+# KEY FIX: pw1 uses DAILY tables (not monthly) so all 6 month-end
+#          dates are always available. Monthly tables may lag by months.
+#
+# DBM JOIN  : EIL.cust_internet_banking_nbr == DBM.ibn (single snapshot)
 # PC and BW excluded from all source codes
 # =============================================================================
 
@@ -32,11 +32,6 @@ final_db             = "dm_ib_dev"
 final_table_customer = "wealth_Insights_Customer"
 final_table_account  = "wealth_Insights_Account"
 
-# Active cutoff = END_DT minus 90 days
-end_d          = datetime.strptime(END_DT, "%Y-%m-%d").date()
-cutoff_date    = str(end_d - timedelta(days=90))   # 2025-11-30
-print("Active cutoff date : {}".format(cutoff_date))
-
 # =============================================================================
 # CONSTANTS  (PC = plastic cards and BW excluded)
 # =============================================================================
@@ -53,8 +48,8 @@ BANKING_SOURCE_CODES = [
 WEALTH_SEGMENT_CODES = ['IS_CT','IS_IT','REGIS_FC','REGIS','PWM']
 
 # =============================================================================
-# STEP 1 — MONTH-END DATES
-# Last valid business day per calendar month in range
+# STEP 1 — MONTH-END DATES from DAILY table
+# Daily table is always up to date — use it as the date authority
 # =============================================================================
 
 def get_month_end_dates(spark, table, start, end):
@@ -93,20 +88,18 @@ def get_month_end_dates(spark, table, start, end):
 
     return sorted(set(result))
 
+# All month-end dates come from the DAILY table — always complete
 month_end_dates = get_month_end_dates(
     spark, "eil.d_involved_party_h", START_DT, END_DT
 )
 max_ip_date = month_end_dates[-1]
 
-print("Month-end dates    : {}".format(month_end_dates))
-print("Max IP date        : {}".format(max_ip_date))
+print("Month-end dates : {}".format(month_end_dates))
+print("Max IP date     : {}".format(max_ip_date))
 
 # =============================================================================
 # STEP 2 — DIGITAL BANKING MASTER  (single max partition)
-#
-# One snapshot — the latest available partition.
-# Active flag = last_login_date >= cutoff_date  (END_DT - 90 days)
-# This is a fixed cutoff applied the same way across all months.
+# Active = datediff(max_dbm_dt, last_login) <= 90  (matches original SQL)
 # =============================================================================
 
 max_dbm_dt = (
@@ -114,7 +107,7 @@ max_dbm_dt = (
     .agg(F.max("ods_business_dt"))
     .collect()[0][0]
 )
-print("DBM max partition  : {}".format(max_dbm_dt))
+print("DBM max partition: {}".format(max_dbm_dt))
 
 dbm = (
     spark.table("dm_ib.digital_banking_master")
@@ -128,7 +121,7 @@ dbm = (
         F.max("olb_last_login_date").alias("lst_login_olb"),
         F.max("mob_last_login_date").alias("lst_login_mob")
     )
-    # Enrolled = has a login date recorded
+    # Enrolled = has any login date on record
     .withColumn("olb_enrolled",
         F.when(F.col("lst_login_olb").isNotNull(),
                F.lit("OLB Enrolled"))
@@ -146,27 +139,23 @@ dbm = (
             F.lit("Digital Enrolled")
         ).otherwise(F.lit("Non Digital Enrolled"))
     )
-    # Active = last login >= cutoff_date (END_DT - 90 days = 2025-11-30)
+    # Active = datediff(max_dbm_dt, last_login) <= 90  — matches original SQL
     .withColumn("olb_active_flag",
         F.when(
-            F.col("lst_login_olb").isNotNull() &
-            (F.col("lst_login_olb") >= F.lit(cutoff_date)),
+            F.datediff(F.lit(max_dbm_dt), F.col("lst_login_olb")) <= 90,
             F.lit("OLB Active")
         ).otherwise(F.lit("Non OLB Active"))
     )
     .withColumn("mob_active_flag",
         F.when(
-            F.col("lst_login_mob").isNotNull() &
-            (F.col("lst_login_mob") >= F.lit(cutoff_date)),
+            F.datediff(F.lit(max_dbm_dt), F.col("lst_login_mob")) <= 90,
             F.lit("Mobile Active")
         ).otherwise(F.lit("Non Mobile Active"))
     )
     .withColumn("digitally_active_flag",
         F.when(
-            (F.col("lst_login_olb").isNotNull() &
-             (F.col("lst_login_olb") >= F.lit(cutoff_date))) |
-            (F.col("lst_login_mob").isNotNull() &
-             (F.col("lst_login_mob") >= F.lit(cutoff_date))),
+            (F.datediff(F.lit(max_dbm_dt), F.col("lst_login_olb")) <= 90) |
+            (F.datediff(F.lit(max_dbm_dt), F.col("lst_login_mob")) <= 90),
             F.lit("Digital Active")
         ).otherwise(F.lit("Non Digital Active"))
     )
@@ -174,24 +163,24 @@ dbm = (
 
 # =============================================================================
 # STEP 3 — WEALTH SEGMENTATION per RCIF per MONTH
-# Monthly EIL tables. business_date in groupBy = per-month classification.
+#
+# *** KEY FIX ***
+# Use DAILY tables (d_involved_party_h, d_arrangement_h) NOT monthly.
+# Monthly table (m_involved_party_h) lags — may only have 3 of 6 months.
+# Daily table has all 6 month-end dates so no months are dropped.
 # =============================================================================
 
-valid_dates_m = get_month_end_dates(
-    spark, "eil.m_involved_party_h", START_DT, END_DT
-)
-
-ip_m = (
-    spark.table("eil.m_involved_party_h")
+ip_pw = (
+    spark.table("eil.d_involved_party_h")
     .filter(
-        F.col("business_date").isin(valid_dates_m) &
+        F.col("business_date").isin(month_end_dates) &
         (F.col("source_system_code") == "CF") &
         (F.coalesce(F.col("deceased_ind"), F.lit("N")) == "N")
     )
 )
-a2i_m = spark.table("eil.m_arrangement_to_involved_party_relationship_h")
-ar_m  = (
-    spark.table("eil.m_arrangement_h")
+a2i_pw = spark.table("eil.d_arrangement_to_involved_party_relationship_h")
+ar_pw  = (
+    spark.table("eil.d_arrangement_h")
     .filter(
         F.col("source_system_code").isin(WEALTH_SOURCE_CODES) &
         (F.col("closed_ind") == "N")
@@ -199,88 +188,88 @@ ar_m  = (
 )
 
 pw1 = (
-    ip_m
+    ip_pw
     .join(
-        a2i_m,
-        (ip_m["involved_party_id"]  == a2i_m["involved_party_id"]) &
-        (ip_m["business_date"]      == a2i_m["business_date"]) &
-        (ip_m["source_system_code"] == a2i_m["source_system_code"]),
+        a2i_pw,
+        (ip_pw["involved_party_id"]  == a2i_pw["involved_party_id"]) &
+        (ip_pw["business_date"]      == a2i_pw["business_date"]) &
+        (ip_pw["source_system_code"] == a2i_pw["source_system_code"]),
         "inner"
     )
     .join(
-        ar_m,
-        (a2i_m["arrangement_id"]                 == ar_m["arrangement_id"]) &
-        (a2i_m["arrangement_source_system_code"] == ar_m["source_system_code"]) &
-        (a2i_m["business_date"]                  == ar_m["business_date"]),
+        ar_pw,
+        (a2i_pw["arrangement_id"]                 == ar_pw["arrangement_id"]) &
+        (a2i_pw["arrangement_source_system_code"] == ar_pw["source_system_code"]) &
+        (a2i_pw["business_date"]                  == ar_pw["business_date"]),
         "inner"
     )
     .filter(
-        F.when(ip_m["private_client_code"].isin("039","539","339"),
+        F.when(ip_pw["private_client_code"].isin("039","539","339"),
                F.lit(1))
-         .when(ip_m["private_client_trust_code"].isin("239","739"),
+         .when(ip_pw["private_client_trust_code"].isin("239","739"),
                F.lit(1))
          .otherwise(
-             F.when(ar_m["business_service_segment_type_code"]
+             F.when(ar_pw["business_service_segment_type_code"]
                     .isin(WEALTH_SEGMENT_CODES), F.lit(1))
               .otherwise(F.lit(0))
          ) == 1
     )
     .withColumn("business_group",
-        F.when(ip_m["private_client_code"].isin("039","539","339"),
+        F.when(ip_pw["private_client_code"].isin("039","539","339"),
                F.lit("Private Wealth"))
-         .when(ip_m["private_client_trust_code"].isin("239","739"),
+         .when(ip_pw["private_client_trust_code"].isin("239","739"),
                F.lit("Private Wealth"))
          .otherwise(
-             F.when(ar_m["business_service_segment_type_code"]
+             F.when(ar_pw["business_service_segment_type_code"]
                     .isin("IS_CT","IS_IT"),
                     F.lit("Institutional Services"))
-              .when(ar_m["business_service_segment_type_code"]
+              .when(ar_pw["business_service_segment_type_code"]
                     .isin("REGIS_FC","REGIS"),
                     F.lit("Investment Services"))
-              .when(ar_m["business_service_segment_type_code"] == "PWM",
+              .when(ar_pw["business_service_segment_type_code"] == "PWM",
                     F.lit("Private Wealth"))
               .otherwise(F.coalesce(
-                    ar_m["business_service_segment_type_code"],
+                    ar_pw["business_service_segment_type_code"],
                     F.lit("Category???")))
          )
     )
-    # business_date in groupBy = one row per RCIF per MONTH
+    # business_date in groupBy = one classification row per RCIF per MONTH
     .groupBy(
-        ip_m["rcif_cust_nbr"].cast("string").alias("RCIF_NUMBER"),
-        ip_m["business_date"].cast(T.DateType()).alias("business_date"),
+        ip_pw["rcif_cust_nbr"].cast("string").alias("RCIF_NUMBER"),
+        ip_pw["business_date"].cast(T.DateType()).alias("business_date"),
         F.col("business_group")
     )
     .agg(
         F.countDistinct(
-            F.when(ar_m["business_service_segment_type_code"] == "IS_CT",
-                   ar_m["arrangement_id"])
+            F.when(ar_pw["business_service_segment_type_code"] == "IS_CT",
+                   ar_pw["arrangement_id"])
         ).alias("corporate_trust_cnt"),
         F.countDistinct(
-            F.when(ar_m["business_service_segment_type_code"] == "IS_IT",
-                   ar_m["arrangement_id"])
+            F.when(ar_pw["business_service_segment_type_code"] == "IS_IT",
+                   ar_pw["arrangement_id"])
         ).alias("institutional_trust_cnt"),
         F.countDistinct(
-            F.when(ar_m["business_service_segment_type_code"]
+            F.when(ar_pw["business_service_segment_type_code"]
                    .isin("REGIS_FC","REGIS"),
-                   ar_m["arrangement_id"])
+                   ar_pw["arrangement_id"])
         ).alias("investment_cnt"),
         F.countDistinct(
-            F.when(ar_m["business_service_segment_type_code"] == "REGIS",
-                   ar_m["arrangement_id"])
+            F.when(ar_pw["business_service_segment_type_code"] == "REGIS",
+                   ar_pw["arrangement_id"])
         ).alias("insurance_cnt"),
         F.countDistinct(
-            F.when(ar_m["business_service_segment_type_code"] == "PWM",
-                   ar_m["arrangement_id"])
+            F.when(ar_pw["business_service_segment_type_code"] == "PWM",
+                   ar_pw["arrangement_id"])
         ).alias("pwm_cnt"),
         F.countDistinct(
-            F.when(ar_m["source_system_code"] == "TR",
-                   ar_m["arrangement_id"])
+            F.when(ar_pw["source_system_code"] == "TR",
+                   ar_pw["arrangement_id"])
         ).alias("trust_cnt"),
         F.countDistinct(
-            F.when(ar_m["source_system_code"].isin(BANKING_SOURCE_CODES),
-                   ar_m["arrangement_id"])
+            F.when(ar_pw["source_system_code"].isin(BANKING_SOURCE_CODES),
+                   ar_pw["arrangement_id"])
         ).alias("banking_cnt"),
-        F.countDistinct(ar_m["arrangement_id"]).alias("wealth_accts_cnt")
+        F.countDistinct(ar_pw["arrangement_id"]).alias("wealth_accts_cnt")
     )
     .withColumn("division",
         F.when(F.col("business_group") == "Private Wealth",
@@ -295,12 +284,10 @@ pw1 = (
         )
         .when(F.col("business_group") == "Investment Services",
             F.when(
-                (F.col("investment_cnt") > 0) &
-                (F.col("insurance_cnt") == 0),
+                (F.col("investment_cnt") > 0) & (F.col("insurance_cnt") == 0),
                 F.lit("Investment")
             ).when(
-                (F.col("investment_cnt") == 0) &
-                (F.col("insurance_cnt") > 0),
+                (F.col("investment_cnt") == 0) & (F.col("insurance_cnt") > 0),
                 F.lit("Insurance")
             ).otherwise(F.lit("Insurance & Investment"))
         )
@@ -422,7 +409,10 @@ ip_accts_cnt = (
 #
 # rc   INNER JOIN pw1         on RCIF_NUMBER + business_date (same month)
 #      LEFT  JOIN ip_accts    on RCIF_NUMBER + business_date
-#      LEFT  JOIN dbm         on cust_ibn == ibn  (single snapshot)
+#      LEFT  JOIN dbm         on cust_ibn == ibn (single snapshot)
+#
+# Both rc and pw1 use daily tables with same month_end_dates
+# so INNER join is safe — no months will be dropped
 # =============================================================================
 
 window_dedup = (
@@ -481,8 +471,7 @@ wealth_customer = (
 )
 
 # =============================================================================
-# STEP 7 — BUILD wealth_Insights_Account
-# InvestPath accounts at max_ip_date
+# STEP 7 — BUILD wealth_Insights_Account  (InvestPath at max_ip_date)
 # =============================================================================
 
 ind_a = (
