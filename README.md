@@ -1,7 +1,7 @@
 # =============================================================================
 # Wealth Insights — Customer & Account Tables
 # Date Range  : 2025-08-01 to 2026-01-31
-# Digital Source: dm_ib.digital_banking_master_dbm ONLY (loaded from 2025-08-02)
+# Digital Source: dm_ib.digital_banking_master ONLY (loaded from 2025-08-02)
 # NO transmit data used anywhere
 #
 # OUTPUT TABLES:
@@ -112,7 +112,7 @@ print("Max IP date     : {}".format(max_ip_date))
 # =============================================================================
 
 dbm = (
-    spark.table("dm_ib.digital_banking_master_dbm")
+    spark.table("dm_ib.digital_banking_master")
     .filter(
         (F.col("ods_business_dt") >= F.lit(START_DT)) &
         (F.col("ods_business_dt") <= F.lit(END_DT))
