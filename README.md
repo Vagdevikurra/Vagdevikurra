@@ -182,21 +182,24 @@ dbm = (
 # Business group, division, account counts per RCIF
 # =============================================================================
 
-ip_m  = spark.table("eil.m_involved_party_h")
-a2i_m = spark.table("eil.m_arrangement_to_involved_party_relationship_h")
-ar_m  = spark.table("eil.m_arrangement_h")
-
 valid_dates_m = get_month_end_dates(
     spark, "eil.m_involved_party_h", START_DT, END_DT
 )
 
-pw1 = (
-    ip_m
+# Pre-filter before joins so deceased_ind is unambiguous
+ip_m  = (
+    spark.table("eil.m_involved_party_h")
     .filter(
         F.col("business_date").isin(valid_dates_m) &
         (F.col("source_system_code") == "CF") &
-        (F.coalesce(ip_m["deceased_ind"], F.lit("N")) == "N")
+        (F.coalesce(F.col("deceased_ind"), F.lit("N")) == "N")
     )
+)
+a2i_m = spark.table("eil.m_arrangement_to_involved_party_relationship_h")
+ar_m  = spark.table("eil.m_arrangement_h")
+
+pw1 = (
+    ip_m
     .join(
         a2i_m,
         (ip_m["involved_party_id"]  == a2i_m["involved_party_id"]) &
@@ -310,20 +313,23 @@ pw1 = (
 # One row per RCIF per month with state, IBN, ip_id
 # =============================================================================
 
-ip_d   = spark.table("eil.d_involved_party_h")
+# Pre-filter before joins so deceased_ind is unambiguous
+ip_d   = (
+    spark.table("eil.d_involved_party_h")
+    .filter(
+        F.col("business_date").isin(month_end_dates) &
+        (F.col("source_system_code") == "CF") &
+        (F.coalesce(F.col("deceased_ind"), F.lit("N")) == "N")
+    )
+)
 a2i_d  = spark.table("eil.d_arrangement_to_involved_party_relationship_h")
 ar_d   = spark.table("eil.d_arrangement_h")
 addr_d = spark.table("eil.d_involved_party_address_h")
 
 rc = (
     ip_d
-    .filter(
-        F.col("business_date").isin(month_end_dates) &
-        (F.col("source_system_code") == "CF") &
-        (F.coalesce(ip_d["deceased_ind"], F.lit("N")) == "N")
-    )
     .join(
-        a2i_d.filter(F.col("business_date").isin(month_end_dates)),
+        a2i_d,
         (ip_d["involved_party_id"]  == a2i_d["involved_party_id"]) &
         (ip_d["business_date"]      == a2i_d["business_date"]) &
         (ip_d["source_system_code"] == a2i_d["source_system_code"]),
@@ -360,19 +366,22 @@ rc = (
 # STEP 5 — INVESTPATH ACCOUNT COUNT PER RCIF PER MONTH
 # =============================================================================
 
-ind_i = spark.table("eil.d_involved_party_h")
+# Pre-filter before joins so deceased_ind is unambiguous
+ind_i = (
+    spark.table("eil.d_involved_party_h")
+    .filter(
+        F.col("business_date").isin(month_end_dates) &
+        (F.col("source_system_code") == "CF") &
+        (F.coalesce(F.col("deceased_ind"), F.lit("N")) == "N")
+    )
+)
 a2i_i = spark.table("eil.d_arrangement_to_involved_party_relationship_h")
 ar_i  = spark.table("eil.d_arrangement_h")
 
 ip_accts_cnt = (
     ind_i
-    .filter(
-        F.col("business_date").isin(month_end_dates) &
-        (F.col("source_system_code") == "CF") &
-        (F.coalesce(ind_i["deceased_ind"], F.lit("N")) == "N")
-    )
     .join(
-        a2i_i.filter(F.col("business_date").isin(month_end_dates)),
+        a2i_i,
         (ind_i["involved_party_id"]  == a2i_i["involved_party_id"]) &
         (ind_i["business_date"]      == a2i_i["business_date"]) &
         (ind_i["source_system_code"] == a2i_i["source_system_code"]),
@@ -461,19 +470,22 @@ wealth_customer = (
 # InvestPath accounts at max_ip_date, one row per account
 # =============================================================================
 
-ind_a = spark.table("eil.d_involved_party_h")
+# Pre-filter before joins so deceased_ind is unambiguous
+ind_a = (
+    spark.table("eil.d_involved_party_h")
+    .filter(
+        (F.col("business_date") == max_ip_date) &
+        (F.col("source_system_code") == "CF") &
+        (F.coalesce(F.col("deceased_ind"), F.lit("N")) == "N")
+    )
+)
 a2i_a = spark.table("eil.d_arrangement_to_involved_party_relationship_h")
 ar_a  = spark.table("eil.d_arrangement_h")
 
 wealth_account = (
     ind_a
-    .filter(
-        (F.col("business_date") == max_ip_date) &
-        (F.col("source_system_code") == "CF") &
-        (F.coalesce(ind_a["deceased_ind"], F.lit("N")) == "N")
-    )
     .join(
-        a2i_a.filter(F.col("business_date") == max_ip_date),
+        a2i_a,
         (ind_a["involved_party_id"]  == a2i_a["involved_party_id"]) &
         (ind_a["business_date"]      == a2i_a["business_date"]) &
         (ind_a["source_system_code"] == a2i_a["source_system_code"]),
