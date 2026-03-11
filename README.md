@@ -118,17 +118,18 @@ dbm = (
         (F.col("ods_business_dt") <= F.lit(END_DT))
     )
     .filter(
-        F.col("relt_ibn").isNotNull() &
-        (F.col("relt_ibn").cast("string") != "")
+        F.col("ibn").isNotNull() &
+        (F.col("ibn").cast("string") != "")
     )
     .groupBy(
         F.trunc(F.col("ods_business_dt"), "MM").alias("dbm_month"),
-        F.col("relt_ibn").cast("string").alias("relt_ibn")
+        F.col("ibn").cast("string").alias("ibn")
     )
     .agg(
         F.max("olb_last_login_date").alias("lst_login_olb"),
         F.max("mob_last_login_date").alias("lst_login_mob"),
-        F.max("ods_business_dt").cast("date").alias("dbm_snap_dt")
+        F.max("ods_business_dt").cast("date").alias("dbm_snap_dt"),
+        F.first("rcif_customer_nbr").cast("string").alias("rcif_from_dbm")
     )
     # --- Enrolled flags ---
     .withColumn("olb_enrolled",
@@ -194,7 +195,7 @@ pw1 = (
     .filter(
         F.col("business_date").isin(valid_dates_m) &
         (F.col("source_system_code") == "CF") &
-        (F.coalesce(F.col("deceased_ind"), F.lit("N")) == "N")
+        (F.coalesce(ip_m["deceased_ind"], F.lit("N")) == "N")
     )
     .join(
         a2i_m,
@@ -319,7 +320,7 @@ rc = (
     .filter(
         F.col("business_date").isin(month_end_dates) &
         (F.col("source_system_code") == "CF") &
-        (F.coalesce(F.col("deceased_ind"), F.lit("N")) == "N")
+        (F.coalesce(ip_d["deceased_ind"], F.lit("N")) == "N")
     )
     .join(
         a2i_d.filter(F.col("business_date").isin(month_end_dates)),
@@ -368,7 +369,7 @@ ip_accts_cnt = (
     .filter(
         F.col("business_date").isin(month_end_dates) &
         (F.col("source_system_code") == "CF") &
-        (F.coalesce(F.col("deceased_ind"), F.lit("N")) == "N")
+        (F.coalesce(ind_i["deceased_ind"], F.lit("N")) == "N")
     )
     .join(
         a2i_i.filter(F.col("business_date").isin(month_end_dates)),
@@ -423,7 +424,7 @@ wealth_customer = (
     .join(
         dbm,
         (F.trunc(rc["business_date"].cast("date"), "MM") == dbm["dbm_month"]) &
-        (rc["cust_ibn"] == dbm["relt_ibn"]),
+        (rc["cust_ibn"] == dbm["ibn"]),
         "left"
     )
     .withColumn("_rn", F.row_number().over(window_dedup))
@@ -469,7 +470,7 @@ wealth_account = (
     .filter(
         (F.col("business_date") == max_ip_date) &
         (F.col("source_system_code") == "CF") &
-        (F.coalesce(F.col("deceased_ind"), F.lit("N")) == "N")
+        (F.coalesce(ind_a["deceased_ind"], F.lit("N")) == "N")
     )
     .join(
         a2i_a.filter(F.col("business_date") == max_ip_date),
