@@ -2,12 +2,11 @@
 # Wealth Insights — Customer & Account Tables
 # Date Range  : 2025-09-01 to 2026-02-28
 #
-# VALIDATED AGAINST SQL — numbers confirmed:
-#   DBM max partition : 2026-03-08  (daily table, take MAX)
-#   Month-end dates   : 09-30, 10-31, 11-28, 12-31, 01-30, 02-27
-#   Active flag       : datediff(DBM_SNAP_DT, last_login) <= 90
+# KEY FIX: DBM grouped by MONTH (TRUNC(ods_business_dt,'MM'))
+#   Active = datediff(MAX(ods_business_dt) per month, last_login) <= 90
+#   Each month uses its OWN max snapshot date — matches original SQL exactly
 #
-# PC and BW excluded from all source codes
+# PC and BW excluded from source codes
 # =============================================================================
 
 from pyspark.sql import SparkSession, functions as F, types as T
@@ -24,11 +23,7 @@ final_db             = "dm_ib_dev"
 final_table_customer = "wealth_Insights_Customer"
 final_table_account  = "wealth_Insights_Account"
 
-# =============================================================================
-# CONSTANTS — hardcoded from SQL validation output
-# =============================================================================
-
-# Confirmed by Step 2 of validation SQL
+# Hardcoded from SQL validation — confirmed month-end dates
 MONTH_END_DATES = [
     '2025-09-30',
     '2025-10-31',
@@ -38,15 +33,6 @@ MONTH_END_DATES = [
     '2026-02-27'
 ]
 MAX_IP_DATE = '2026-02-27'
-
-# DBM is a daily table — take max partition as snap date for active calc
-DBM_SNAP_DT = (
-    spark.table("dm_ib.digital_banking_master")
-    .agg(F.max("ods_business_dt").alias("snap"))
-    .collect()[0]["snap"]
-)
-print("DBM snap dt     : {}".format(DBM_SNAP_DT))
-print("Month-end dates : {}".format(MONTH_END_DATES))
 
 WEALTH_SOURCE_CODES = [
     'DA','SV','CC','MG','LS','TM','LO','CM','CS','EL',
@@ -60,18 +46,56 @@ BANKING_SOURCE_CODES = [
 WEALTH_SEGMENT_CODES = ['IS_CT','IS_IT','REGIS_FC','REGIS','PWM']
 
 # =============================================================================
-# STEP 1 — DIGITAL BANKING MASTER
-# All partitions, max login per ibn.
-# Active = datediff(DBM_SNAP_DT, last_login) <= 90
+# STEP 1 — DIGITAL BANKING MASTER grouped by MONTH
+#
+# Mirrors original SQL exactly:
+#   GROUP BY TRUNC(ods_business_dt,'MM'), ibn
+#   MAX(ods_business_dt) per month = snap_dt for that month's active flag
+#   datediff(snap_dt, last_login) <= 90
+#
+# Join to wealth_customer on: trunc(business_date,'MM') == dbm_month AND ibn
 # =============================================================================
 
 dbm = (
     spark.table("dm_ib.digital_banking_master")
-    .filter(F.col("ibn").isNotNull() & (F.col("ibn").cast("string") != ""))
-    .groupBy(F.col("ibn").cast("string").alias("ibn"))
+    .filter(
+        (F.col("ods_business_dt") >= F.lit("2025-09-01")) &
+        (F.col("ods_business_dt") <= F.lit("2026-02-28")) &
+        F.col("ibn").isNotNull() &
+        (F.col("ibn").cast("string") != "")
+    )
+    .groupBy(
+        F.trunc(F.col("ods_business_dt"), "MM").alias("dbm_month"),
+        F.col("ibn").cast("string").alias("ibn")
+    )
     .agg(
         F.max("olb_last_login_date").alias("lst_login_olb"),
-        F.max("mob_last_login_date").alias("lst_login_mob")
+        F.max("mob_last_login_date").alias("lst_login_mob"),
+        F.max("ods_business_dt").alias("snap_dt")   # per-month snap date
+    )
+    # Active = datediff(this month's snap_dt, last_login) <= 90
+    .withColumn("olb_active_flag",
+        F.when(
+            F.col("lst_login_olb").isNotNull() &
+            (F.datediff(F.col("snap_dt"), F.col("lst_login_olb")) <= 90),
+            F.lit("OLB Active")
+        ).otherwise(F.lit("Non OLB Active"))
+    )
+    .withColumn("mob_active_flag",
+        F.when(
+            F.col("lst_login_mob").isNotNull() &
+            (F.datediff(F.col("snap_dt"), F.col("lst_login_mob")) <= 90),
+            F.lit("Mobile Active")
+        ).otherwise(F.lit("Non Mobile Active"))
+    )
+    .withColumn("digitally_active_flag",
+        F.when(
+            (F.col("lst_login_olb").isNotNull() &
+             (F.datediff(F.col("snap_dt"), F.col("lst_login_olb")) <= 90)) |
+            (F.col("lst_login_mob").isNotNull() &
+             (F.datediff(F.col("snap_dt"), F.col("lst_login_mob")) <= 90)),
+            F.lit("Digital Active")
+        ).otherwise(F.lit("Non Digital Active"))
     )
     .withColumn("olb_enrolled",
         F.when(F.col("lst_login_olb").isNotNull(), F.lit("OLB Enrolled"))
@@ -87,34 +111,13 @@ dbm = (
             F.lit("Digital Enrolled")
         ).otherwise(F.lit("Non Digital Enrolled"))
     )
-    .withColumn("olb_active_flag",
-        F.when(
-            F.col("lst_login_olb").isNotNull() &
-            (F.datediff(F.lit(DBM_SNAP_DT), F.col("lst_login_olb")) <= 90),
-            F.lit("OLB Active")
-        ).otherwise(F.lit("Non OLB Active"))
-    )
-    .withColumn("mob_active_flag",
-        F.when(
-            F.col("lst_login_mob").isNotNull() &
-            (F.datediff(F.lit(DBM_SNAP_DT), F.col("lst_login_mob")) <= 90),
-            F.lit("Mobile Active")
-        ).otherwise(F.lit("Non Mobile Active"))
-    )
-    .withColumn("digitally_active_flag",
-        F.when(
-            (F.col("lst_login_olb").isNotNull() &
-             (F.datediff(F.lit(DBM_SNAP_DT), F.col("lst_login_olb")) <= 90)) |
-            (F.col("lst_login_mob").isNotNull() &
-             (F.datediff(F.lit(DBM_SNAP_DT), F.col("lst_login_mob")) <= 90)),
-            F.lit("Digital Active")
-        ).otherwise(F.lit("Non Digital Active"))
-    )
 )
 
+print("DBM monthly snapshot dates:")
+dbm.select("dbm_month", F.max("snap_dt").alias("snap")).groupBy("dbm_month","snap").show()
+
 # =============================================================================
-# STEP 2 — WEALTH SEGMENTATION per RCIF per MONTH
-# Uses daily tables (d_) — same source as rc, all 6 months always present
+# STEP 2 — WEALTH SEGMENTATION per RCIF per MONTH  (daily tables)
 # =============================================================================
 
 ip_pw = (
@@ -156,8 +159,10 @@ pw1 = (
          ) == 1
     )
     .withColumn("business_group",
-        F.when(ip_pw["private_client_code"].isin("039","539","339"), F.lit("Private Wealth"))
-         .when(ip_pw["private_client_trust_code"].isin("239","739"), F.lit("Private Wealth"))
+        F.when(ip_pw["private_client_code"].isin("039","539","339"),
+               F.lit("Private Wealth"))
+         .when(ip_pw["private_client_trust_code"].isin("239","739"),
+               F.lit("Private Wealth"))
          .otherwise(
              F.when(ar_pw["business_service_segment_type_code"].isin("IS_CT","IS_IT"),
                     F.lit("Institutional Services"))
@@ -176,19 +181,19 @@ pw1 = (
     )
     .agg(
         F.countDistinct(F.when(ar_pw["business_service_segment_type_code"] == "IS_CT",
-                               ar_pw["arrangement_id"])).alias("corporate_trust_cnt"),
+            ar_pw["arrangement_id"])).alias("corporate_trust_cnt"),
         F.countDistinct(F.when(ar_pw["business_service_segment_type_code"] == "IS_IT",
-                               ar_pw["arrangement_id"])).alias("institutional_trust_cnt"),
+            ar_pw["arrangement_id"])).alias("institutional_trust_cnt"),
         F.countDistinct(F.when(ar_pw["business_service_segment_type_code"].isin("REGIS_FC","REGIS"),
-                               ar_pw["arrangement_id"])).alias("investment_cnt"),
+            ar_pw["arrangement_id"])).alias("investment_cnt"),
         F.countDistinct(F.when(ar_pw["business_service_segment_type_code"] == "REGIS",
-                               ar_pw["arrangement_id"])).alias("insurance_cnt"),
+            ar_pw["arrangement_id"])).alias("insurance_cnt"),
         F.countDistinct(F.when(ar_pw["business_service_segment_type_code"] == "PWM",
-                               ar_pw["arrangement_id"])).alias("pwm_cnt"),
+            ar_pw["arrangement_id"])).alias("pwm_cnt"),
         F.countDistinct(F.when(ar_pw["source_system_code"] == "TR",
-                               ar_pw["arrangement_id"])).alias("trust_cnt"),
+            ar_pw["arrangement_id"])).alias("trust_cnt"),
         F.countDistinct(F.when(ar_pw["source_system_code"].isin(BANKING_SOURCE_CODES),
-                               ar_pw["arrangement_id"])).alias("banking_cnt"),
+            ar_pw["arrangement_id"])).alias("banking_cnt"),
         F.countDistinct(ar_pw["arrangement_id"]).alias("wealth_accts_cnt")
     )
     .withColumn("division",
@@ -302,6 +307,9 @@ ip_accts_cnt = (
 
 # =============================================================================
 # STEP 5 — BUILD wealth_Insights_Customer
+#
+# DBM join: trunc(business_date,'MM') == dbm_month  AND  cust_ibn == ibn
+# This gives each month its own per-month active flag — matches original SQL
 # =============================================================================
 
 w = Window.partitionBy("RCIF_NUMBER", "business_date").orderBy("RCIF_NUMBER")
@@ -318,7 +326,11 @@ wealth_customer = (
         (rc["business_date"] == ip_accts_cnt["business_date"]),
         "left")
     .drop(ip_accts_cnt["RCIF_NUMBER"]).drop(ip_accts_cnt["business_date"])
-    .join(dbm, rc["cust_ibn"] == dbm["ibn"], "left")
+    # Join DBM on month + ibn — each row gets its own month's active flag
+    .join(dbm,
+        (F.trunc(rc["business_date"].cast("date"), "MM") == dbm["dbm_month"]) &
+        (rc["cust_ibn"] == dbm["ibn"]),
+        "left")
     .withColumn("_rn", F.row_number().over(w))
     .filter(F.col("_rn") == 1).drop("_rn")
     .select(
@@ -330,6 +342,7 @@ wealth_customer = (
         F.coalesce(F.col("wealth_accts_cnt"), F.lit(0)).alias("wealth_accts_cnt"),
         F.coalesce(F.col("ip_accts_cnt"),     F.lit(0)).alias("ip_accts_cnt"),
         rc["cust_ibn"].alias("ibn"),
+        F.col("snap_dt").alias("dbm_snap_dt"),
         F.coalesce(F.col("digital_enrolled"),      F.lit("Non Digital Enrolled")).alias("digital_enrolled"),
         F.coalesce(F.col("olb_enrolled"),          F.lit("Non OLB Enrolled")).alias("olb_enrolled"),
         F.coalesce(F.col("mob_enrolled"),          F.lit("Non Mobile Enrolled")).alias("mob_enrolled"),
@@ -400,7 +413,8 @@ wealth_account.write \
     .saveAsTable("{}.{}".format(final_db, final_table_account))
 
 # =============================================================================
-# STEP 8 — VERIFY (must match SQL validation: ~67K-70K OLB Active per month)
+# STEP 8 — VERIFY
+# Expected OLB Active: ~64,420 (Sep) → ~65,800 (Feb)
 # =============================================================================
 
 final = spark.table("{}.{}".format(final_db, final_table_customer))
@@ -409,7 +423,12 @@ accts = spark.table("{}.{}".format(final_db, final_table_account))
 print("\nWealth rows : {}".format(final.count()))
 print("Account rows: {}".format(accts.count()))
 
-print("\nOLB Active by month:")
+print("\nDBM snap dates used per month (confirm per-month reference):")
+final.filter(F.col("dbm_snap_dt").isNotNull()) \
+     .groupBy("business_date", "dbm_snap_dt").count() \
+     .orderBy("business_date").show(10)
+
+print("\nOLB Active by month (target: ~64K-66K):")
 final.groupBy("business_date","olb_active_flag") \
      .count().orderBy("business_date","olb_active_flag").show(20)
 
