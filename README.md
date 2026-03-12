@@ -1,4 +1,3 @@
-
 from pyspark.sql import SparkSession, functions as F, types as T
 from pyspark import StorageLevel
 
@@ -35,17 +34,33 @@ spark.sparkContext.setLogLevel("WARN")
 spark.conf.set("spark.sql.adaptive.enabled",               "false")
 spark.conf.set("spark.sql.autoBroadcastJoinThreshold",     209715200)
 spark.conf.set("spark.sql.broadcastTimeout",               "1200")
-spark.conf.set("spark.sql.shuffle.partitions",             "600")
-spark.conf.set("spark.executor.heartbeatInterval",         "10s")
+spark.conf.set("spark.sql.shuffle.partitions",             "800")   # increased for large joins
+
+# Memory tuning — prevent executor OOM
+spark.conf.set("spark.executor.memory",                    "8g")
+spark.conf.set("spark.executor.memoryOverhead",            "2g")    # extra off-heap headroom
+spark.conf.set("spark.driver.memory",                      "4g")
+spark.conf.set("spark.driver.memoryOverhead",              "1g")
+spark.conf.set("spark.memory.fraction",                    "0.8")
+spark.conf.set("spark.memory.storageFraction",             "0.3")
+
+# Heartbeats & timeouts
+spark.conf.set("spark.executor.heartbeatInterval",         "20s")   # increased — gives more time before eviction
 spark.conf.set("spark.network.timeout",                    "1200s")
-spark.conf.set("spark.rpc.askTimeout",                     "300s")
+spark.conf.set("spark.rpc.askTimeout",                     "600s")
 spark.conf.set("spark.storage.blockManagerSlaveTimeoutMs", "900000")
+
+# Retry tolerance
 spark.conf.set("spark.task.maxFailures",                   "16")
 spark.conf.set("spark.stage.maxConsecutiveAttempts",       "10")
 spark.conf.set("spark.yarn.max.executor.failures",         "64")
+
+# File committer tuning
 spark.conf.set("mapreduce.fileoutputcommitter.algorithm.version",        "2")
 spark.conf.set("spark.hadoop.mapreduce.fileoutputcommitter.algorithm.version", "2")
 spark.conf.set("spark.speculation",                        "false")
+
+# Blacklist flaky nodes
 spark.conf.set("spark.blacklist.enabled",                  "true")
 spark.conf.set("spark.blacklist.task.maxTaskAttemptsPerExecutor",  "2")
 spark.conf.set("spark.blacklist.task.maxTaskAttemptsPerNode",      "2")
@@ -521,31 +536,88 @@ if DEBUG:
     """).show(truncate=False)
 
 # =================================================================
-# 10) WRITE — correct table names: wealth_insights_customer / _account
+# 10) WRITE — memory-safe: checkpoint then write month-by-month
+#     Fixes: Py4JJavaError / executor OOM at cust_out_df.count()
+#
+#  Root causes of OOM:
+#   a) .coalesce() narrows all data to N tasks — skews executor memory
+#   b) .count() forces full materialisation of deep lineage in one shot
+#   c) No checkpoint means Spark replays the full plan on retry
 # =================================================================
-TARGET_WRITE_PARTITIONS = 32
-MAX_RECORDS_PER_FILE    = 1_000_000
+import os
 
-# wealth_insights_customer
-cust_out_df = spark.table("wealth_insights_customer_v").persist(StorageLevel.DISK_ONLY)
-_ = cust_out_df.count()
-cust_out_df = cust_out_df.coalesce(TARGET_WRITE_PARTITIONS)
-(cust_out_df.write
-    .mode("overwrite")
-    .option("maxRecordsPerFile", MAX_RECORDS_PER_FILE)
-    .saveAsTable(f"{DEFAULT_DB}.wealth_insights_customer")
-)
+TARGET_WRITE_PARTITIONS = 64        # repartition (not coalesce) = even spread
+MAX_RECORDS_PER_FILE    = 500_000   # smaller files = less per-task memory
 
-# wealth_insights_account
-acct_out_df = spark.table("wealth_insights_account_v").persist(StorageLevel.DISK_ONLY)
-_ = acct_out_df.count()
-acct_out_df = acct_out_df.coalesce(TARGET_WRITE_PARTITIONS)
-(acct_out_df.write
-    .mode("overwrite")
-    .option("maxRecordsPerFile", MAX_RECORDS_PER_FILE)
-    .saveAsTable(f"{DEFAULT_DB}.wealth_insights_account")
-)
+# Set a checkpoint directory so Spark can truncate lineage
+CHECKPOINT_DIR = "/tmp/spark_checkpoints/wealth_insights"
+spark.sparkContext.setCheckpointDir(CHECKPOINT_DIR)
 
-print(f"Saved {DEFAULT_DB}.wealth_insights_customer")
+# ------------------------------------------------------------------
+# Helper: materialise a view safely via checkpoint, then write
+# ------------------------------------------------------------------
+def checkpoint_and_write(view_name, table_name, mode="overwrite"):
+    """
+    1. Read the temp view into a DataFrame
+    2. Repartition evenly (avoids coalesce skew)
+    3. Checkpoint to HDFS  → cuts long lineage, prevents replay OOM
+    4. Write directly — no .count() needed; checkpoint already forced action
+    """
+    print(f"\n[WRITE] Checkpointing {view_name} ...")
+    df = (
+        spark.table(view_name)
+             .repartition(TARGET_WRITE_PARTITIONS)   # even partition spread
+    )
+    df = df.checkpoint(eager=True)                   # ← forces action + saves to HDFS
+                                                     #   replaces persist()+count()
+
+    first_write = True
+    print(f"[WRITE] Writing {view_name} → {DEFAULT_DB}.{table_name} ...")
+    (df.write
+        .mode(mode)
+        .option("maxRecordsPerFile", MAX_RECORDS_PER_FILE)
+        .saveAsTable(f"{DEFAULT_DB}.{table_name}")
+    )
+    print(f"[WRITE] Done → {DEFAULT_DB}.{table_name}")
+    df.unpersist()
+
+
+# ------------------------------------------------------------------
+# wealth_insights_customer — write month-by-month to cap per-job memory
+# ------------------------------------------------------------------
+# Collect the list of months from the already-cached month_ends view
+month_list = [
+    r["business_date"]
+    for r in spark.sql("SELECT business_date FROM month_ends ORDER BY business_date").collect()
+]
+
+first_month = True
+for biz_dt in month_list:
+    print(f"\n[WRITE] Processing wealth_insights_customer for {biz_dt} ...")
+
+    month_df = (
+        spark.table("wealth_insights_customer_v")
+             .filter(F.col("business_date") == F.lit(biz_dt))
+             .repartition(TARGET_WRITE_PARTITIONS)
+    )
+    month_df = month_df.checkpoint(eager=True)   # truncate lineage per month
+
+    write_mode = "overwrite" if first_month else "append"
+    (month_df.write
+        .mode(write_mode)
+        .option("maxRecordsPerFile", MAX_RECORDS_PER_FILE)
+        .saveAsTable(f"{DEFAULT_DB}.wealth_insights_customer")
+    )
+    month_df.unpersist()
+    first_month = False
+    print(f"[WRITE] {biz_dt} committed.")
+
+print(f"\nSaved {DEFAULT_DB}.wealth_insights_customer")
+
+# ------------------------------------------------------------------
+# wealth_insights_account — single checkpoint write (small table)
+# ------------------------------------------------------------------
+checkpoint_and_write("wealth_insights_account_v", "wealth_insights_account")
+
 print(f"Saved {DEFAULT_DB}.wealth_insights_account")
 print("DONE.")
