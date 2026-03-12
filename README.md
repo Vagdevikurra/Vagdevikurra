@@ -220,6 +220,22 @@ pw1 = (
              .otherwise(F.lit("Corporate & Institutional Trust"))
         )
     )
+    # Priority: Private Wealth > Institutional Services > Investment Services > others
+    .withColumn("bg_priority",
+        F.when(F.col("business_group") == "Private Wealth",       F.lit(1))
+         .when(F.col("business_group") == "Institutional Services", F.lit(2))
+         .when(F.col("business_group") == "Investment Services",   F.lit(3))
+         .otherwise(F.lit(4))
+    )
+)
+
+# Dedup pw1 to ONE row per RCIF per month — pick highest priority business_group
+w_pw1 = Window.partitionBy("RCIF_NUMBER", "business_date").orderBy("bg_priority")
+pw1 = (
+    pw1
+    .withColumn("_rn", F.row_number().over(w_pw1))
+    .filter(F.col("_rn") == 1)
+    .drop("_rn", "bg_priority")
 )
 
 # =============================================================================
@@ -339,18 +355,18 @@ wealth_customer = (
     .drop(ip_accts_cnt["RCIF_NUMBER"]).drop(ip_accts_cnt["business_date"])
     # rc is already ONE row per RCIF per month — DBM join on month+ibn will be 1:1
     .join(dbm,
-        (F.trunc(rc["business_date"].cast("date"), "MM") == dbm["dbm_month"]) &
-        (rc["cust_ibn"] == dbm["ibn"]),
+        (F.trunc(F.col("business_date").cast("date"), "MM") == dbm["dbm_month"]) &
+        (F.col("cust_ibn") == dbm["ibn"]),
         "left")
     .select(
-        rc["RCIF_NUMBER"],
-        rc["business_date"],
+        F.col("RCIF_NUMBER"),
+        F.col("business_date"),
         F.col("state_name"),
         F.col("business_group"),
         F.col("division"),
         F.coalesce(F.col("wealth_accts_cnt"), F.lit(0)).alias("wealth_accts_cnt"),
         F.coalesce(F.col("ip_accts_cnt"),     F.lit(0)).alias("ip_accts_cnt"),
-        rc["cust_ibn"].alias("ibn"),
+        F.col("cust_ibn").alias("ibn"),
         F.col("snap_dt").alias("dbm_snap_dt"),
         F.coalesce(F.col("digital_enrolled"),      F.lit("Non Digital Enrolled")).alias("digital_enrolled"),
         F.coalesce(F.col("olb_enrolled"),          F.lit("Non OLB Enrolled")).alias("olb_enrolled"),
