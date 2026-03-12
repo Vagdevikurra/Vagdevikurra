@@ -1,466 +1,663 @@
-# =============================================================================
-# Wealth Insights — Customer & Account Tables
-# Date Range  : 2025-09-01 to 2026-02-28
-#
-# KEY FIX: DBM grouped by MONTH (TRUNC(ods_business_dt,'MM'))
-#   Active = datediff(MAX(ods_business_dt) per month, last_login) <= 90
-#   Each month uses its OWN max snapshot date — matches original SQL exactly
-#
-# PC and BW excluded from source codes
-# =============================================================================
-
 from pyspark.sql import SparkSession, functions as F, types as T
-from pyspark.sql.window import Window
+from pyspark import StorageLevel
 
+# ------------------------------
+# CONFIG / CONSTANTS
+# ------------------------------
+DEFAULT_DB = "dm_ib_dev"
+EIL_DB     = "eil"
+DMIB_DB    = "dm_ib"
+
+START_DT = "2025-08-01"
+END_DT   = "2026-01-31"
+
+# Wealth source systems — PC and BW excluded as requested
+WEALTH_SRC_LIST = [
+    "BI", "TR", "DA", "SV", "CC", "MG", "LS", "TM", "LO",
+    "CS", "IC", "MA", "PF", "PR", "SD", "CM", "EL", "RN"
+]
+
+APPLY_PRIMARY_OWNER_FILTER    = False
+IP_FUNDED_BALANCE_THRESHOLD   = 0.0
+DEBUG = False
+
+# ------------------------------
+# SPARK SESSION
+# ------------------------------
 spark = (
     SparkSession.builder
-    .appName("WealthInsights")
-    .enableHiveSupport()
-    .getOrCreate()
+        .appName("Wealth_Insights")
+        .enableHiveSupport()
+        .getOrCreate()
+)
+spark.sparkContext.setLogLevel("WARN")
+
+# ------------------------------
+# OPERATIONAL / STABILITY SETTINGS (no logic change)
+# ------------------------------
+spark.conf.set("spark.sql.adaptive.enabled", "false")
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", 209715200)   # 200MB
+spark.conf.set("spark.sql.broadcastTimeout", "1200")
+spark.conf.set("spark.sql.shuffle.partitions", "600")
+
+# Heartbeats & timeouts (reduce false executor loss)
+spark.conf.set("spark.executor.heartbeatInterval", "10s")
+spark.conf.set("spark.network.timeout", "1200s")
+spark.conf.set("spark.rpc.askTimeout", "300s")
+spark.conf.set("spark.storage.blockManagerSlaveTimeoutMs", "900000")
+
+# Retry tolerance
+spark.conf.set("spark.task.maxFailures", "16")
+spark.conf.set("spark.stage.maxConsecutiveAttempts", "10")
+spark.conf.set("spark.yarn.max.executor.failures", "64")
+
+# File committer tuning
+spark.conf.set("mapreduce.fileoutputcommitter.algorithm.version", "2")
+spark.conf.set(
+    "spark.hadoop.mapreduce.fileoutputcommitter.algorithm.version", "2")
+
+# Avoid duplicate speculative work
+spark.conf.set("spark.speculation", "false")
+
+# Blacklist flaky nodes
+spark.conf.set("spark.blacklist.enabled", "true")
+spark.conf.set("spark.blacklist.task.maxTaskAttemptsPerExecutor", "2")
+spark.conf.set("spark.blacklist.task.maxTaskAttemptsPerNode", "2")
+spark.conf.set("spark.blacklist.stage.maxFailedTasksPerExecutor", "2")
+spark.conf.set("spark.blacklist.stage.maxFailedExecutorsPerNode", "2")
+
+print(f"Window: {START_DT} .. {END_DT}")
+
+# ------------------------------
+# 0) Latest snapshot dates for customer, address
+# ------------------------------
+cust_dt = spark.sql(f"""
+    SELECT MAX(CAST(business_date AS date)) AS dt
+    FROM {EIL_DB}.d_involved_party_h
+    WHERE source_system_code = 'CF'
+""").collect()[0]["dt"]
+
+addr_dt = spark.sql(f"""
+    SELECT MAX(CAST(business_date AS date)) AS dt
+    FROM {EIL_DB}.d_involved_party_address_h
+""").collect()[0]["dt"]
+
+print(f"[INFO] d_involved_party_h (CF) snapshot date : {cust_dt}")
+print(f"[INFO] d_involved_party_address_h snapshot date : {addr_dt}")
+
+# ------------------------------
+# 1) month_ends: MAX available d_ business_date per calendar month
+# ------------------------------
+wealth_src_csv = ",".join(f"'{s}'" for s in WEALTH_SRC_LIST)
+
+spark.sql(f"""
+    CREATE OR REPLACE TEMP VIEW month_ends AS
+    WITH cal AS (
+        SELECT add_months(date('{START_DT}'), n) AS month_start,
+               add_months(date('{START_DT}'), n + 1) AS next_month_start
+        FROM (
+            SELECT sequence(
+                0,
+                CAST(months_between(date('{END_DT}'), date('{START_DT}')) AS INT)
+            ) AS s
+        ) g
+        LATERAL VIEW posexplode(s) pe AS n, _
+    ),
+    all_dates AS (
+        SELECT DISTINCT CAST(business_date AS date) AS bd FROM {EIL_DB}.d_involved_party_h
+        UNION
+        SELECT DISTINCT CAST(business_date AS date) FROM {EIL_DB}.d_arrangement_to_involved_party_relationship_h
+        UNION
+        SELECT DISTINCT CAST(business_date AS date) FROM {EIL_DB}.d_arrangement_h
+    )
+    SELECT MAX(a.bd) AS business_date
+    FROM cal m
+    LEFT JOIN all_dates a
+        ON a.bd >= m.month_start AND a.bd < m.next_month_start
+    GROUP BY m.month_start
+    ORDER BY m.month_start
+""")
+
+# Cache month_ends to avoid recomputation
+spark.sql("CACHE TABLE month_ends")
+spark.sql("SELECT COUNT(*) FROM month_ends").collect()
+
+if DEBUG:
+    print("\n[1] month_ends (max available per month across d_ tables):")
+    spark.sql(
+        "SELECT * FROM month_ends ORDER BY business_date").show(200, truncate=False)
+
+# ------------------------------
+# 2) WEALTH base at arrangement grain
+# ------------------------------
+primary_owner_pred = "1=1"
+if APPLY_PRIMARY_OWNER_FILTER:
+    primary_owner_pred = "COALESCE(a2i.relationship_role,'') = 'PRIMARY'"
+
+spark.sql(f"""
+    CREATE OR REPLACE TEMP VIEW wealth_arr AS
+    SELECT
+        CAST(ind.business_date AS date) AS business_date,
+        CAST(ind.rcif_cust_nbr AS string) AS rcif_number,
+        ind.involved_party_id AS ip_id,
+        ind.cust_internet_banking_nbr AS ibn,
+        ind.private_client_code,
+        ind.private_client_trust_code,
+        ar.arrangement_id,
+        ar.source_system_code,
+        ar.business_service_segment_type_code,
+        ar.closed_ind
+    FROM {EIL_DB}.d_involved_party_h ind
+    JOIN month_ends d
+        ON CAST(ind.business_date AS date) = d.business_date
+    JOIN {EIL_DB}.d_arrangement_to_involved_party_relationship_h a2i
+        ON  ind.involved_party_id   = a2i.involved_party_id
+        AND ind.business_date       = a2i.business_date
+        AND ind.source_system_code  = a2i.source_system_code
+    JOIN {EIL_DB}.d_arrangement_h ar
+        ON  a2i.arrangement_id                  = ar.arrangement_id
+        AND a2i.arrangement_source_system_code  = ar.source_system_code
+        AND a2i.business_date                   = ar.business_date
+    WHERE ind.source_system_code = 'CF'
+      AND nvl(ind.deceased_ind, 'N') = 'N'
+      AND ar.closed_ind = 'N'
+      AND ({primary_owner_pred})
+      AND ar.source_system_code IN ({wealth_src_csv})
+      AND (
+            CASE
+                WHEN ind.private_client_code IN ('039','539','339') THEN 1
+                WHEN ind.private_client_trust_code IN ('239','739') THEN 1
+                ELSE CASE
+                    WHEN ar.business_service_segment_type_code
+                         IN ('IS_CT','IS_IT','REGIS_FC','REGIS','PWM') THEN 1
+                    ELSE 0
+                END
+            END
+          ) = 1
+""")
+
+if DEBUG:
+    print("\n[2] wealth_arr sample:")
+    spark.sql("SELECT * FROM wealth_arr LIMIT 10").show(truncate=False)
+
+# ------------------------------
+# 3) WEALTH aggregate (RCIF Grain)
+# ------------------------------
+spark.sql(f"""
+    CREATE OR REPLACE TEMP VIEW wealth_agg AS
+    WITH base AS (
+        SELECT
+            business_date,
+            rcif_number,
+            private_client_code,
+            private_client_trust_code,
+            source_system_code,
+            business_service_segment_type_code,
+            concat_ws('|', source_system_code, cast(arrangement_id as string)) AS acct_key
+        FROM wealth_arr
+    ),
+    by_rcif AS (
+        SELECT
+            business_date,
+            rcif_number,
+            COUNT(DISTINCT acct_key) AS accts_cnt,
+
+            -- segment/system counts for classification
+            COUNT(DISTINCT CASE WHEN business_service_segment_type_code = 'IS_CT'  THEN acct_key END) AS corporate_trust_count,
+            COUNT(DISTINCT CASE WHEN business_service_segment_type_code = 'IS_IT'  THEN acct_key END) AS institutional_trust_count,
+            COUNT(DISTINCT CASE WHEN business_service_segment_type_code = 'REGIS_FC' THEN acct_key END) AS investment_count,
+            COUNT(DISTINCT CASE WHEN business_service_segment_type_code = 'REGIS'  THEN acct_key END) AS insurance_count,
+            COUNT(DISTINCT CASE WHEN business_service_segment_type_code = 'PWM'    THEN acct_key END) AS pwm_count,
+
+            COUNT(DISTINCT CASE WHEN source_system_code = 'TR' THEN acct_key END) AS trust_count,
+            COUNT(DISTINCT CASE WHEN source_system_code IN
+                ('DA','SV','CC','MG','LS','TM','LO','CM','CS','EL','IC','MA',
+                 'PF','PR','SD','BI','RN','IS_CT','IS_IT','PWM')
+                THEN acct_key END) AS banking_count,
+
+            MAX(CASE WHEN private_client_code IN ('039','539','339')
+                       OR private_client_trust_code IN ('239','739')
+                     THEN 1 ELSE 0 END) AS private_flag
+        FROM base
+        GROUP BY business_date, rcif_number
+    )
+    SELECT
+        business_date,
+        rcif_number,
+
+        -- Business group at RCIF grain
+        CASE
+            WHEN private_flag = 1 THEN 'Private Wealth'
+            ELSE CASE
+                WHEN (corporate_trust_count + institutional_trust_count) > 0 THEN 'Institutional Services'
+                WHEN (investment_count + insurance_count) > 0 THEN 'Investment Services'
+                WHEN pwm_count > 0 THEN 'Private Wealth'
+                ELSE 'Other'
+            END
+        END AS business_group,
+
+        -- Division at RCIF grain (kept same as original logic)
+        CASE
+            WHEN CASE
+                    WHEN private_flag = 1 THEN 'Private Wealth'
+                    ELSE CASE
+                        WHEN (corporate_trust_count + institutional_trust_count) > 0 THEN 'Institutional Services'
+                        WHEN (investment_count + insurance_count) > 0 THEN 'Investment Services'
+                        WHEN pwm_count > 0 THEN 'Private Wealth'
+                        ELSE 'Other'
+                    END
+                 END = 'Private Wealth'
+            THEN CASE
+                WHEN trust_count > 0 AND banking_count > 0 THEN 'Banking & IMAT'
+                WHEN (investment_count + trust_count) > 0 AND banking_count = 0 THEN 'Investments Only'
+                ELSE 'Banking only'
+            END
+            WHEN CASE
+                    WHEN private_flag = 1 THEN 'Private Wealth'
+                    ELSE CASE
+                        WHEN (corporate_trust_count + institutional_trust_count) > 0 THEN 'Institutional Services'
+                        WHEN (investment_count + insurance_count) > 0 THEN 'Investment Services'
+                        WHEN pwm_count > 0 THEN 'Private Wealth'
+                        ELSE 'Other'
+                    END
+                 END = 'Investment Services'
+            THEN CASE
+                WHEN investment_count > 0 AND insurance_count = 0 THEN 'Investment'
+                WHEN investment_count > 0 AND insurance_count > 0 THEN 'Insurance'
+                ELSE 'Insurance & Investment'
+            END
+            WHEN (corporate_trust_count > 0 AND institutional_trust_count = 0) THEN 'Corporate Trust'
+            WHEN (corporate_trust_count = 0 AND institutional_trust_count > 0) THEN 'Institutional Trust'
+            WHEN pwm_count > 0 THEN 'Banking only'
+            ELSE 'Corporate & Institutional Trust'
+        END AS division,
+
+        accts_cnt
+    FROM by_rcif
+""")
+
+# ------------------------------
+# 4) INVESTPATH (RN + IP) — arrangement grain, monthly as-of
+# ------------------------------
+spark.sql(f"""
+    CREATE OR REPLACE TEMP VIEW investpath_arr AS
+    WITH anchors AS (
+        SELECT m.business_date AS anchor_dt,
+               TRUNC(m.business_date, 'MM') AS month_start
+        FROM month_ends m
+    ),
+    ind_snap AS (
+        SELECT a.anchor_dt, MAX(CAST(ind.business_date AS DATE)) AS ind_bd
+        FROM anchors a
+        JOIN {EIL_DB}.d_involved_party_h ind
+            ON CAST(ind.business_date AS DATE) >= a.month_start
+           AND CAST(ind.business_date AS DATE) <= a.anchor_dt
+        WHERE ind.source_system_code = 'CF'
+        GROUP BY a.anchor_dt
+    ),
+    a2i_snap AS (
+        SELECT a.anchor_dt, MAX(CAST(a2i.business_date AS DATE)) AS a2i_bd
+        FROM anchors a
+        JOIN {EIL_DB}.d_arrangement_to_involved_party_relationship_h a2i
+            ON CAST(a2i.business_date AS DATE) >= a.month_start
+           AND CAST(a2i.business_date AS DATE) <= a.anchor_dt
+        GROUP BY a.anchor_dt
+    ),
+    ar_snap AS (
+        SELECT a.anchor_dt, MAX(CAST(ar.business_date AS DATE)) AS ar_bd
+        FROM anchors a
+        JOIN {EIL_DB}.d_arrangement_h ar
+            ON CAST(ar.business_date AS DATE) >= a.month_start
+           AND CAST(ar.business_date AS DATE) <= a.anchor_dt
+        WHERE ar.source_system_code = 'RN'
+          AND ar.account_type_code  = 'IP'
+          AND ar.closed_ind         = 'N'
+        GROUP BY a.anchor_dt
+    ),
+    ind_at AS (
+        SELECT s.anchor_dt AS business_date,
+               ind.involved_party_id AS ip_id,
+               CAST(ind.rcif_cust_nbr AS STRING) AS rcif_number
+        FROM ind_snap s
+        JOIN {EIL_DB}.d_involved_party_h ind
+            ON CAST(ind.business_date AS DATE) = s.ind_bd
+        WHERE ind.source_system_code = 'CF'
+          AND NVL(ind.deceased_ind,'N') = 'N'
+    ),
+    a2i_at AS (
+        SELECT s.anchor_dt AS business_date,
+               a2i.involved_party_id AS ip_id,
+               a2i.arrangement_id,
+               a2i.arrangement_source_system_code AS arr_src
+        FROM a2i_snap s
+        JOIN {EIL_DB}.d_arrangement_to_involved_party_relationship_h a2i
+            ON CAST(a2i.business_date AS DATE) = s.a2i_bd
+    ),
+    ar_at AS (
+        SELECT s.anchor_dt AS business_date,
+               ar.arrangement_id,
+               ar.source_system_code,
+               CAST(COALESCE(ar.current_balance_amt, 0.0) AS DOUBLE) AS ip_balance,
+               CAST(ar.open_date AS DATE) AS ip_open_date
+        FROM ar_snap s
+        JOIN {EIL_DB}.d_arrangement_h ar
+            ON CAST(ar.business_date AS DATE) = s.ar_bd
+        WHERE ar.source_system_code = 'RN'
+          AND ar.account_type_code  = 'IP'
+          AND ar.closed_ind         = 'N'
+    ),
+    ip_joined AS (
+        SELECT i.business_date,
+               i.rcif_number,
+               CONCAT_WS('|', ar.source_system_code, CAST(ar.arrangement_id AS STRING)) AS ip_account_id,
+               ar.ip_balance,
+               ar.ip_open_date,
+               i.ip_id
+        FROM ind_at i
+        JOIN a2i_at a2i
+            ON a2i.ip_id = i.ip_id
+        JOIN ar_at ar
+            ON ar.arrangement_id      = a2i.arrangement_id
+           AND ar.source_system_code  = a2i.arr_src
+        WHERE ({primary_owner_pred})
+    )
+    SELECT business_date, rcif_number, ip_id, ip_account_id,
+           MAX(ip_balance)   AS ip_balance,
+           MIN(ip_open_date) AS ip_open_date
+    FROM ip_joined
+    GROUP BY business_date, rcif_number, ip_id, ip_account_id
+""")
+
+spark.sql("""
+    CREATE OR REPLACE TEMP VIEW investpath_arr_dedup AS
+    SELECT * FROM investpath_arr
+""")
+
+spark.sql(f"""
+    CREATE OR REPLACE TEMP VIEW investpath_agg AS
+    SELECT
+        business_date,
+        rcif_number,
+        COUNT(DISTINCT ip_account_id) AS ip_accounts_cnt,
+        SUM(COALESCE(ip_balance, 0.0)) AS ip_sum,
+        COUNT(DISTINCT CASE WHEN ip_balance > ({IP_FUNDED_BALANCE_THRESHOLD}) THEN ip_account_id END) AS ip_funded_accounts_cnt,
+        CASE WHEN COUNT(DISTINCT ip_account_id) > 0 THEN 1 ELSE 0 END AS ip_customers_flag
+    FROM investpath_arr_dedup
+    GROUP BY business_date, rcif_number
+""")
+
+if DEBUG:
+    print("\n[3-4] Wealth+InvestPath aggregation samples:")
+    spark.sql("SELECT * FROM wealth_agg LIMIT 5").show(truncate=False)
+    spark.sql("SELECT * FROM investpath_agg LIMIT 5").show(truncate=False)
+
+# ------------------------------
+# 5) Wealth_Insights_Customer1 view (unchanged logic)
+# ------------------------------
+wealth_fact_df = (
+    spark.table("wealth_agg")
+        .select("business_date", "rcif_number", "business_group", "division", "accts_cnt")
+        .join(spark.table("investpath_agg"), ["business_date", "rcif_number"], "left")
+        .withColumn("ip_accounts_cnt",      F.coalesce(F.col("ip_accounts_cnt"),      F.lit(0)).cast("long"))
+        .withColumn("ip_sum",               F.coalesce(F.col("ip_sum"),               F.lit(0)).cast("double"))
+        .withColumn("ip_funded_accounts_cnt", F.coalesce(F.col("ip_funded_accounts_cnt"), F.lit(0)).cast("long"))
+        .withColumn("ip_customers_flag",    F.coalesce(F.col("ip_customers_flag"),    F.lit(0)).cast("int"))
+        .withColumn("fact_type",            F.lit("WEALTH"))
+        .withColumn("ip_id",                F.lit(None).cast("string"))
+        .withColumn("ip_account_id",        F.lit(None).cast("string"))
+        .withColumn("ip_balance",           F.lit(None).cast("double"))
+        .withColumn("ip_open_date",         F.lit(None).cast("date"))
 )
 
-final_db             = "dm_ib_dev"
-final_table_customer = "wealth_Insights_Customer"
-final_table_account  = "wealth_Insights_Account"
+wealth_fact_df.createOrReplaceTempView("Wealth_Insights_Customer1")
 
-# Hardcoded from SQL validation — confirmed month-end dates
-MONTH_END_DATES = [
-    '2025-09-30',
-    '2025-10-31',
-    '2025-11-28',
-    '2025-12-31',
-    '2026-01-30',
-    '2026-02-27'
-]
-MAX_IP_DATE = '2026-02-27'
+if DEBUG:
+    print("\n[5] wealth fact sample (RCIF + InvestPath):")
+    spark.sql(f"""
+        SELECT business_date, rcif_number, business_group, division,
+               accts_cnt, ip_accounts_cnt, ip_funded_accounts_cnt, ip_sum, ip_customers_flag, fact_type
+        FROM Wealth_Insights_Customer1
+        ORDER BY business_date, rcif_number
+        LIMIT 20
+    """).show(truncate=False)
 
-WEALTH_SOURCE_CODES = [
-    'DA','SV','CC','MG','LS','TM','LO','CM','CS','EL',
-    'IC','MA','PF','PR','SD','TR','BI','RN',
-    'IS_CT','IS_IT','IS_IF','PNB'
-]
-BANKING_SOURCE_CODES = [
-    'DA','SV','CC','MG','LS','TM','LO',
-    'CM','CS','EL','IC','MA','PF','PR','SD'
-]
-WEALTH_SEGMENT_CODES = ['IS_CT','IS_IT','REGIS_FC','REGIS','PWM']
+# ------------------------------
+# 6) DIGITAL monthly (unchanged logic)
+# ------------------------------
+spark.sql(f"""
+    CREATE OR REPLACE TEMP VIEW digital_monthly AS
+    WITH dig_customer AS (
+        SELECT
+            TRUNC(ods_business_dt, 'MM') AS month_dt,
+            CAST(rcif_customer_nbr AS string) AS rcif_number,
+            ibn,
+            MAX(olb_last_login_date) AS last_olb,
+            MAX(mob_last_login_date) AS last_mob,
+            MAX(ods_business_dt) AS ods_dt
+        FROM {DMIB_DB}.digital_banking_master
+        WHERE ods_business_dt >= date('{START_DT}')
+          AND ods_business_dt <= date('{END_DT}')
+        GROUP BY TRUNC(ods_business_dt, 'MM'), CAST(rcif_customer_nbr AS string), ibn
+    )
+    SELECT
+        month_dt,
+        rcif_number,
+        ibn,
+        ods_dt,
+        CASE WHEN last_olb IS NULL THEN 'Non OLB User' ELSE 'OLB User' END AS olb_flag,
+        CASE WHEN last_mob IS NULL THEN 'Non Mobile User' ELSE 'Mobile User' END AS mob_flag,
+        CASE WHEN last_olb IS NOT NULL AND datediff(ods_dt, last_olb) <= 90
+             THEN 'OLB Active' ELSE 'Non OLB Active' END AS olb_active_flag,
+        CASE WHEN last_mob IS NOT NULL AND datediff(ods_dt, last_mob) <= 90
+             THEN 'Mobile Active' ELSE 'Non Mobile Active' END AS mob_active_flag,
+        CASE WHEN (last_olb IS NOT NULL AND datediff(ods_dt, last_olb) <= 90)
+               OR (last_mob IS NOT NULL AND datediff(ods_dt, last_mob) <= 90)
+             THEN 'Digital Active' ELSE 'Non Digital Active' END AS digitally_active_flag,
+        CASE WHEN ibn IS NULL THEN 'Non Digital User' ELSE 'Digital User' END AS digital_flag
+    FROM dig_customer
+""")
 
-# =============================================================================
-# STEP 1 — DIGITAL BANKING MASTER grouped by MONTH
-#
-# Mirrors original SQL exactly:
-#   GROUP BY TRUNC(ods_business_dt,'MM'), ibn
-#   MAX(ods_business_dt) per month = snap_dt for that month's active flag
-#   datediff(snap_dt, last_login) <= 90
-#
-# Join to wealth_customer on: trunc(business_date,'MM') == dbm_month AND ibn
-# =============================================================================
+if DEBUG:
+    print("\n[6] digital_monthly sample:")
+    spark.sql("SELECT * FROM digital_monthly LIMIT 10").show(truncate=False)
 
-dbm = (
-    spark.table("dm_ib.digital_banking_master")
-    .filter(
-        (F.col("ods_business_dt") >= F.lit("2025-09-01")) &
-        (F.col("ods_business_dt") <= F.lit("2026-02-28")) &
-        F.col("ibn").isNotNull() &
-        (F.col("ibn").cast("string") != "")
+# ------------------------------
+# 7) CUSTOMER snapshot + Account view
+#    FIX: deduplicate wealth at (business_date, rcif_number) before joining digital
+#    so that an RCIF with multiple business_groups is not double-counted
+# ------------------------------
+spark.sql(f"""
+    CREATE OR REPLACE TEMP VIEW rcif_customer AS
+    WITH ip AS (
+        SELECT
+            involved_party_id AS ip_id,
+            CAST(rcif_cust_nbr AS string) AS rcif_number,
+            cust_internet_banking_nbr AS ibn,
+            birth_date
+        FROM {EIL_DB}.d_involved_party_h
+        WHERE CAST(business_date AS date) = date('{cust_dt}')
+          AND source_system_code = 'CF'
+          AND nvl(deceased_ind,'N') = 'N'
+          AND birth_date IS NOT NULL
+    ),
+    addr_ranked AS (
+        SELECT
+            involved_party_id AS ip_id,
+            state_name,
+            row_number() OVER (PARTITION BY involved_party_id ORDER BY nvl(state_name,'') DESC) AS rn
+        FROM {EIL_DB}.d_involved_party_address_h
+        WHERE CAST(business_date AS date) = date('{addr_dt}')
     )
-    .groupBy(
-        F.trunc(F.col("ods_business_dt"), "MM").alias("dbm_month"),
-        F.col("ibn").cast("string").alias("ibn")
+    SELECT
+        ip.rcif_number,
+        a.state_name
+    FROM ip
+    LEFT JOIN addr_ranked a
+        ON ip.ip_id = a.ip_id
+       AND a.rn = 1
+""")
+
+# -----------------------------------------------------------------------
+# FIX: Build Wealth_Insights_Account1 by joining wealth (one row per RCIF
+# per month — pick primary business_group via row_number) to digital_monthly.
+# This prevents fan-out when a single RCIF has 2+ business_group rows.
+# -----------------------------------------------------------------------
+spark.sql(f"""
+    CREATE OR REPLACE TEMP VIEW wealth_rcif_dedup AS
+    WITH ranked AS (
+        SELECT *,
+               row_number() OVER (
+                   PARTITION BY business_date, rcif_number
+                   ORDER BY
+                       CASE business_group
+                           WHEN 'Private Wealth'        THEN 1
+                           WHEN 'Institutional Services' THEN 2
+                           WHEN 'Investment Services'   THEN 3
+                           ELSE 4
+                       END
+               ) AS rn
+        FROM Wealth_Insights_Customer1
     )
-    .agg(
-        F.max("olb_last_login_date").alias("lst_login_olb"),
-        F.max("mob_last_login_date").alias("lst_login_mob"),
-        F.max("ods_business_dt").alias("snap_dt")   # per-month snap date
+    SELECT * FROM ranked WHERE rn = 1
+""")
+
+spark.sql(f"""
+    CREATE OR REPLACE TEMP VIEW Wealth_Insights_Account1 AS
+    WITH joined AS (
+        SELECT
+            c.rcif_number,
+            MAX(c.state_name)                                                      AS state_name,
+            MAX(c.rcif_number)                                                     AS primary_ibn,
+            MAX(CASE WHEN d.digital_flag          = 'Digital User'    THEN 1 ELSE 0 END) AS digital_user_bin,
+            MAX(CASE WHEN d.digitally_active_flag = 'Digital Active'  THEN 1 ELSE 0 END) AS digital_active_bin,
+            MAX(CASE WHEN d.mob_flag              = 'Mobile User'     THEN 1 ELSE 0 END) AS mobile_user_bin,
+            MAX(CASE WHEN d.mob_active_flag       = 'Mobile Active'   THEN 1 ELSE 0 END) AS mobile_active_bin,
+            MAX(CASE WHEN d.olb_flag              = 'OLB User'        THEN 1 ELSE 0 END) AS olb_user_bin,
+            MAX(CASE WHEN d.olb_active_flag       = 'OLB Active'      THEN 1 ELSE 0 END) AS olb_active_bin
+        FROM rcif_customer c
+        LEFT JOIN digital_monthly d
+            ON c.ibn = d.ibn
+        GROUP BY c.rcif_number
     )
-    # Active = datediff(this month's snap_dt, last_login) <= 90
-    .withColumn("olb_active_flag",
-        F.when(
-            F.col("lst_login_olb").isNotNull() &
-            (F.datediff(F.col("snap_dt"), F.col("lst_login_olb")) <= 90),
-            F.lit("OLB Active")
-        ).otherwise(F.lit("Non OLB Active"))
+    SELECT
+        rcif_number,
+        state_name,
+        primary_ibn,
+        CASE WHEN digital_user_bin   = 1 THEN 'Digital User'        ELSE 'Non Digital User'   END AS digital_flag,
+        CASE WHEN digital_active_bin = 1 THEN 'Digital Active'      ELSE 'Non Digital Active' END AS digitally_active_flag,
+        CASE WHEN mobile_flag_bin    = 1 THEN 'Mobile User'         ELSE 'Non Mobile User'    END AS mobile_flag,
+        CASE WHEN mobile_active_bin  = 1 THEN 'Mobile Active'       ELSE 'Non Mobile Active'  END AS mobile_active_flag,
+        CASE WHEN olb_user_bin       = 1 THEN 'OLB User'            ELSE 'Non OLB User'       END AS olb_flag,
+        CASE WHEN olb_active_bin     = 1 THEN 'OLB Active'          ELSE 'Non OLB Active'     END AS olb_active_flag
+    FROM joined
+""")
+
+# ---- CORRECTED final join: join wealth_agg directly to the pre-built
+#      per-RCIF digital flags so there is exactly ONE digital row per RCIF
+spark.sql(f"""
+    CREATE OR REPLACE TEMP VIEW Wealth_Insights_Account1 AS
+    WITH joined AS (
+        SELECT
+            c.rcif_number,
+            MAX(c.state_name) AS state_name,
+            MAX(c.ibn)        AS primary_ibn,
+            -- Roll up digital flags across all IBNs on this RCIF for this month
+            MAX(CASE WHEN d.digital_flag          = 'Digital User'   THEN 1 ELSE 0 END) AS digital_user_bin,
+            MAX(CASE WHEN d.digitally_active_flag = 'Digital Active' THEN 1 ELSE 0 END) AS digital_active_bin,
+            MAX(CASE WHEN d.mob_flag              = 'Mobile User'    THEN 1 ELSE 0 END) AS mobile_user_bin,
+            MAX(CASE WHEN d.mob_active_flag       = 'Mobile Active'  THEN 1 ELSE 0 END) AS mobile_active_bin,
+            MAX(CASE WHEN d.olb_flag              = 'OLB User'       THEN 1 ELSE 0 END) AS olb_user_bin,
+            MAX(CASE WHEN d.olb_active_flag       = 'OLB Active'     THEN 1 ELSE 0 END) AS olb_active_bin
+        FROM rcif_customer c
+        LEFT JOIN digital_monthly d ON c.ibn = d.ibn
+        GROUP BY c.rcif_number
     )
-    .withColumn("mob_active_flag",
-        F.when(
-            F.col("lst_login_mob").isNotNull() &
-            (F.datediff(F.col("snap_dt"), F.col("lst_login_mob")) <= 90),
-            F.lit("Mobile Active")
-        ).otherwise(F.lit("Non Mobile Active"))
-    )
-    .withColumn("digitally_active_flag",
-        F.when(
-            (F.col("lst_login_olb").isNotNull() &
-             (F.datediff(F.col("snap_dt"), F.col("lst_login_olb")) <= 90)) |
-            (F.col("lst_login_mob").isNotNull() &
-             (F.datediff(F.col("snap_dt"), F.col("lst_login_mob")) <= 90)),
-            F.lit("Digital Active")
-        ).otherwise(F.lit("Non Digital Active"))
-    )
-    .withColumn("olb_enrolled",
-        F.when(F.col("lst_login_olb").isNotNull(), F.lit("OLB Enrolled"))
-         .otherwise(F.lit("Non OLB Enrolled"))
-    )
-    .withColumn("mob_enrolled",
-        F.when(F.col("lst_login_mob").isNotNull(), F.lit("Mobile Enrolled"))
-         .otherwise(F.lit("Non Mobile Enrolled"))
-    )
-    .withColumn("digital_enrolled",
-        F.when(
-            F.col("lst_login_olb").isNotNull() | F.col("lst_login_mob").isNotNull(),
-            F.lit("Digital Enrolled")
-        ).otherwise(F.lit("Non Digital Enrolled"))
-    )
+    SELECT
+        rcif_number,
+        state_name,
+        primary_ibn                                                                        AS ibn,
+        CASE WHEN digital_user_bin   = 1 THEN 'Digital User'       ELSE 'Non Digital User'   END AS digital_flag,
+        CASE WHEN digital_active_bin = 1 THEN 'Digital Active'     ELSE 'Non Digital Active' END AS digitally_active_flag,
+        CASE WHEN mobile_user_bin    = 1 THEN 'Mobile User'        ELSE 'Non Mobile User'    END AS mobile_flag,
+        CASE WHEN mobile_active_bin  = 1 THEN 'Mobile Active'      ELSE 'Non Mobile Active'  END AS mobile_active_flag,
+        CASE WHEN olb_user_bin       = 1 THEN 'OLB User'           ELSE 'Non OLB User'       END AS olb_flag,
+        CASE WHEN olb_active_bin     = 1 THEN 'OLB Active'         ELSE 'Non OLB Active'     END AS olb_active_flag
+    FROM joined
+""")
+
+if DEBUG:
+    print("\n[7] Wealth_Insights_Account1 distribution (digital activity):")
+    spark.sql("""
+        SELECT digitally_active_flag, COUNT(*) AS cnt
+        FROM Wealth_Insights_Account1
+        GROUP BY digitally_active_flag
+        ORDER BY cnt DESC
+    """).show(truncate=False)
+
+# ------------------------------
+# *** KEY FIX — rebuild Wealth_Insights_Customer1 joining digital
+#     at RCIF level AFTER deduplication, not before ***
+# The original code joined wealth_agg (multi-row per RCIF) to digital;
+# now we enrich each deduplicated wealth row with per-RCIF digital flags.
+# ------------------------------
+spark.sql(f"""
+    CREATE OR REPLACE TEMP VIEW Wealth_Insights_Customer1_final AS
+    SELECT
+        w.business_date,
+        w.rcif_number,
+        w.business_group,
+        w.division,
+        w.accts_cnt,
+        w.ip_accounts_cnt,
+        w.ip_funded_accounts_cnt,
+        w.ip_sum,
+        w.ip_customers_flag,
+        w.fact_type,
+
+        -- digital flags joined at RCIF level (no fan-out)
+        COALESCE(a.digital_flag,          'Non Digital User')   AS digital_flag,
+        COALESCE(a.digitally_active_flag, 'Non Digital Active') AS digitally_active_flag,
+        COALESCE(a.mobile_flag,           'Non Mobile User')    AS mobile_flag,
+        COALESCE(a.mobile_active_flag,    'Non Mobile Active')  AS mobile_active_flag,
+        COALESCE(a.olb_flag,              'Non OLB User')       AS olb_flag,
+        COALESCE(a.olb_active_flag,       'Non OLB Active')     AS olb_active_flag,
+        COALESCE(a.state_name,            'Unknown')            AS state_name
+    FROM Wealth_Insights_Customer1 w
+    LEFT JOIN Wealth_Insights_Account1 a
+        ON w.rcif_number = a.rcif_number
+""")
+
+# ------------------------------
+# 8) WRITE TABLES (robust write; _1 suffix)
+# ------------------------------
+# Keep tail small so YARN can place tasks; lower further to 24/16 if queue is tight
+TARGET_WRITE_PARTITIONS = 32
+MAX_RECORDS_PER_FILE    = 1_000_000
+
+# Wealth_Insights_Customer1
+wealth_out_df = spark.table("Wealth_Insights_Customer1_final") \
+    .persist(StorageLevel.DISK_ONLY)
+_ = wealth_out_df.count()   # materialize to cut lineage for retries
+wealth_out_df = wealth_out_df.coalesce(TARGET_WRITE_PARTITIONS)
+
+(wealth_out_df.write
+    .mode("overwrite")
+    .option("maxRecordsPerFile", MAX_RECORDS_PER_FILE)
+    .saveAsTable(f"{DEFAULT_DB}.Wealth_Insights_Customer1")
 )
 
-print("DBM monthly snapshot dates:")
-dbm.groupBy("dbm_month").agg(F.max("snap_dt").alias("snap")).orderBy("dbm_month").show()
+# Wealth_Insights_Account1
+account_out_df = spark.table("Wealth_Insights_Account1") \
+    .persist(StorageLevel.DISK_ONLY)
+_ = account_out_df.count()
+account_out_df = account_out_df.coalesce(TARGET_WRITE_PARTITIONS)
 
-# =============================================================================
-# STEP 2 — WEALTH SEGMENTATION per RCIF per MONTH  (daily tables)
-# =============================================================================
-
-ip_pw = (
-    spark.table("eil.d_involved_party_h")
-    .filter(
-        F.col("business_date").isin(MONTH_END_DATES) &
-        (F.col("source_system_code") == "CF") &
-        (F.coalesce(F.col("deceased_ind"), F.lit("N")) == "N")
-    )
-)
-a2i_pw = spark.table("eil.d_arrangement_to_involved_party_relationship_h")
-ar_pw = (
-    spark.table("eil.d_arrangement_h")
-    .filter(
-        F.col("source_system_code").isin(WEALTH_SOURCE_CODES) &
-        (F.col("closed_ind") == "N")
-    )
+(account_out_df.write
+    .mode("overwrite")
+    .option("maxRecordsPerFile", MAX_RECORDS_PER_FILE)
+    .saveAsTable(f"{DEFAULT_DB}.Wealth_Insights_Account1")
 )
 
-pw1 = (
-    ip_pw
-    .join(a2i_pw,
-        (ip_pw["involved_party_id"]  == a2i_pw["involved_party_id"]) &
-        (ip_pw["business_date"]      == a2i_pw["business_date"]) &
-        (ip_pw["source_system_code"] == a2i_pw["source_system_code"]),
-        "inner")
-    .join(ar_pw,
-        (a2i_pw["arrangement_id"]                 == ar_pw["arrangement_id"]) &
-        (a2i_pw["arrangement_source_system_code"] == ar_pw["source_system_code"]) &
-        (a2i_pw["business_date"]                  == ar_pw["business_date"]),
-        "inner")
-    .filter(
-        F.when(ip_pw["private_client_code"].isin("039","539","339"), F.lit(1))
-         .when(ip_pw["private_client_trust_code"].isin("239","739"), F.lit(1))
-         .otherwise(
-             F.when(ar_pw["business_service_segment_type_code"]
-                    .isin(WEALTH_SEGMENT_CODES), F.lit(1))
-              .otherwise(F.lit(0))
-         ) == 1
-    )
-    .withColumn("business_group",
-        F.when(ip_pw["private_client_code"].isin("039","539","339"),
-               F.lit("Private Wealth"))
-         .when(ip_pw["private_client_trust_code"].isin("239","739"),
-               F.lit("Private Wealth"))
-         .otherwise(
-             F.when(ar_pw["business_service_segment_type_code"].isin("IS_CT","IS_IT"),
-                    F.lit("Institutional Services"))
-              .when(ar_pw["business_service_segment_type_code"].isin("REGIS_FC","REGIS"),
-                    F.lit("Investment Services"))
-              .when(ar_pw["business_service_segment_type_code"] == "PWM",
-                    F.lit("Private Wealth"))
-              .otherwise(F.coalesce(ar_pw["business_service_segment_type_code"],
-                                    F.lit("Category???")))
-         )
-    )
-    .groupBy(
-        ip_pw["rcif_cust_nbr"].cast("string").alias("RCIF_NUMBER"),
-        ip_pw["business_date"].cast(T.DateType()).alias("business_date"),
-        F.col("business_group")
-    )
-    .agg(
-        F.countDistinct(F.when(ar_pw["business_service_segment_type_code"] == "IS_CT",
-            ar_pw["arrangement_id"])).alias("corporate_trust_cnt"),
-        F.countDistinct(F.when(ar_pw["business_service_segment_type_code"] == "IS_IT",
-            ar_pw["arrangement_id"])).alias("institutional_trust_cnt"),
-        F.countDistinct(F.when(ar_pw["business_service_segment_type_code"].isin("REGIS_FC","REGIS"),
-            ar_pw["arrangement_id"])).alias("investment_cnt"),
-        F.countDistinct(F.when(ar_pw["business_service_segment_type_code"] == "REGIS",
-            ar_pw["arrangement_id"])).alias("insurance_cnt"),
-        F.countDistinct(F.when(ar_pw["business_service_segment_type_code"] == "PWM",
-            ar_pw["arrangement_id"])).alias("pwm_cnt"),
-        F.countDistinct(F.when(ar_pw["source_system_code"] == "TR",
-            ar_pw["arrangement_id"])).alias("trust_cnt"),
-        F.countDistinct(F.when(ar_pw["source_system_code"].isin(BANKING_SOURCE_CODES),
-            ar_pw["arrangement_id"])).alias("banking_cnt"),
-        F.countDistinct(ar_pw["arrangement_id"]).alias("wealth_accts_cnt")
-    )
-    .withColumn("division",
-        F.when(F.col("business_group") == "Private Wealth",
-            F.when((F.col("trust_cnt") > 0) & (F.col("banking_cnt") > 0),
-                   F.lit("Banking & IM&T"))
-             .when((F.col("investment_cnt") + F.col("trust_cnt") > 0) &
-                   (F.col("banking_cnt") == 0), F.lit("Investments Only"))
-             .otherwise(F.lit("Banking only"))
-        )
-        .when(F.col("business_group") == "Investment Services",
-            F.when((F.col("investment_cnt") > 0) & (F.col("insurance_cnt") == 0),
-                   F.lit("Investment"))
-             .when((F.col("investment_cnt") == 0) & (F.col("insurance_cnt") > 0),
-                   F.lit("Insurance"))
-             .otherwise(F.lit("Insurance & Investment"))
-        )
-        .otherwise(
-            F.when((F.col("corporate_trust_cnt") > 0) &
-                   (F.col("institutional_trust_cnt") == 0), F.lit("Corporate Trust"))
-             .when((F.col("corporate_trust_cnt") == 0) &
-                   (F.col("institutional_trust_cnt") > 0), F.lit("Institutional Trust"))
-             .when(F.col("pwm_cnt") > 0, F.lit("Banking only"))
-             .otherwise(F.lit("Corporate & Institutional Trust"))
-        )
-    )
-    # Priority: Private Wealth > Institutional Services > Investment Services > others
-    .withColumn("bg_priority",
-        F.when(F.col("business_group") == "Private Wealth",       F.lit(1))
-         .when(F.col("business_group") == "Institutional Services", F.lit(2))
-         .when(F.col("business_group") == "Investment Services",   F.lit(3))
-         .otherwise(F.lit(4))
-    )
-)
-
-# Dedup pw1 to ONE row per RCIF per month — pick highest priority business_group
-w_pw1 = Window.partitionBy("RCIF_NUMBER", "business_date").orderBy("bg_priority")
-pw1 = (
-    pw1
-    .withColumn("_rn", F.row_number().over(w_pw1))
-    .filter(F.col("_rn") == 1)
-    .drop("_rn", "bg_priority")
-)
-
-# =============================================================================
-# STEP 3 — RCIF SNAPSHOTS per MONTH-END
-# =============================================================================
-
-ip_d = (
-    spark.table("eil.d_involved_party_h")
-    .filter(
-        F.col("business_date").isin(MONTH_END_DATES) &
-        (F.col("source_system_code") == "CF") &
-        (F.coalesce(F.col("deceased_ind"), F.lit("N")) == "N")
-    )
-)
-a2i_d  = spark.table("eil.d_arrangement_to_involved_party_relationship_h")
-ar_d   = spark.table("eil.d_arrangement_h").filter(
-    F.col("source_system_code").isin(WEALTH_SOURCE_CODES)
-)
-addr_d = spark.table("eil.d_involved_party_address_h")
-
-# Build one row per involved_party per RCIF per month, then pick ONE per RCIF
-# ordered by cust_ibn ASC (matches original PWRANK logic) BEFORE joining DBM
-rc_raw = (
-    ip_d
-    .join(a2i_d,
-        (ip_d["involved_party_id"]  == a2i_d["involved_party_id"]) &
-        (ip_d["business_date"]      == a2i_d["business_date"]) &
-        (ip_d["source_system_code"] == a2i_d["source_system_code"]),
-        "inner")
-    .join(ar_d,
-        (a2i_d["arrangement_id"]                 == ar_d["arrangement_id"]) &
-        (a2i_d["arrangement_source_system_code"] == ar_d["source_system_code"]) &
-        (a2i_d["business_date"]                  == ar_d["business_date"]),
-        "inner")
-    .join(addr_d,
-        (ip_d["involved_party_id"] == addr_d["involved_party_id"]) &
-        (ip_d["business_date"]     == addr_d["business_date"]),
-        "left")
-    .select(
-        ip_d["rcif_cust_nbr"].cast("string").alias("RCIF_NUMBER"),
-        ip_d["business_date"].cast(T.DateType()).alias("business_date"),
-        ip_d["involved_party_id"].alias("ip_id"),
-        ip_d["cust_internet_banking_nbr"].alias("cust_ibn"),
-        addr_d["state_name"]
-    )
-    .distinct()
-)
-
-# Dedup: ONE row per RCIF per month, ordered by cust_ibn ASC nulls last
-# This must happen BEFORE DBM join so active flag uses the ONE correct ibn
-w_rc = Window.partitionBy("RCIF_NUMBER", "business_date").orderBy(
-    F.col("cust_ibn").asc_nulls_last()
-)
-rc = (
-    rc_raw
-    .withColumn("_rn", F.row_number().over(w_rc))
-    .filter(F.col("_rn") == 1)
-    .drop("_rn")
-)
-
-# =============================================================================
-# STEP 4 — INVESTPATH COUNT per RCIF per MONTH
-# =============================================================================
-
-ind_i = (
-    spark.table("eil.d_involved_party_h")
-    .filter(
-        F.col("business_date").isin(MONTH_END_DATES) &
-        (F.col("source_system_code") == "CF") &
-        (F.coalesce(F.col("deceased_ind"), F.lit("N")) == "N")
-    )
-)
-a2i_i = spark.table("eil.d_arrangement_to_involved_party_relationship_h")
-ar_i  = spark.table("eil.d_arrangement_h").filter(
-    (F.col("closed_ind") == "N") &
-    (F.col("account_type_code") == "IP") &
-    (F.col("source_system_code") == "RN")
-)
-
-ip_accts_cnt = (
-    ind_i
-    .join(a2i_i,
-        (ind_i["involved_party_id"]  == a2i_i["involved_party_id"]) &
-        (ind_i["business_date"]      == a2i_i["business_date"]) &
-        (ind_i["source_system_code"] == a2i_i["source_system_code"]),
-        "inner")
-    .join(ar_i,
-        (a2i_i["arrangement_id"]                 == ar_i["arrangement_id"]) &
-        (a2i_i["arrangement_source_system_code"] == ar_i["source_system_code"]) &
-        (a2i_i["business_date"]                  == ar_i["business_date"]),
-        "inner")
-    .groupBy(
-        ind_i["rcif_cust_nbr"].cast("string").alias("RCIF_NUMBER"),
-        ind_i["business_date"].cast(T.DateType()).alias("business_date")
-    )
-    .agg(F.countDistinct(ar_i["arrangement_id"]).alias("ip_accts_cnt"))
-)
-
-# =============================================================================
-# STEP 5 — BUILD wealth_Insights_Customer
-#
-# DBM join: trunc(business_date,'MM') == dbm_month  AND  cust_ibn == ibn
-# This gives each month its own per-month active flag — matches original SQL
-# =============================================================================
-
-wealth_customer = (
-    rc
-    .join(pw1,
-        (rc["RCIF_NUMBER"]   == pw1["RCIF_NUMBER"]) &
-        (rc["business_date"] == pw1["business_date"]),
-        "inner")
-    .drop(pw1["RCIF_NUMBER"]).drop(pw1["business_date"])
-    .join(ip_accts_cnt,
-        (rc["RCIF_NUMBER"]   == ip_accts_cnt["RCIF_NUMBER"]) &
-        (rc["business_date"] == ip_accts_cnt["business_date"]),
-        "left")
-    .drop(ip_accts_cnt["RCIF_NUMBER"]).drop(ip_accts_cnt["business_date"])
-    # rc is already ONE row per RCIF per month — DBM join on month+ibn will be 1:1
-    .join(dbm,
-        (F.trunc(F.col("business_date").cast("date"), "MM") == dbm["dbm_month"]) &
-        (F.col("cust_ibn") == dbm["ibn"]),
-        "left")
-    .select(
-        F.col("RCIF_NUMBER"),
-        F.col("business_date"),
-        F.col("state_name"),
-        F.col("business_group"),
-        F.col("division"),
-        F.coalesce(F.col("wealth_accts_cnt"), F.lit(0)).alias("wealth_accts_cnt"),
-        F.coalesce(F.col("ip_accts_cnt"),     F.lit(0)).alias("ip_accts_cnt"),
-        F.col("cust_ibn").alias("ibn"),
-        F.col("snap_dt").alias("dbm_snap_dt"),
-        F.coalesce(F.col("digital_enrolled"),      F.lit("Non Digital Enrolled")).alias("digital_enrolled"),
-        F.coalesce(F.col("olb_enrolled"),          F.lit("Non OLB Enrolled")).alias("olb_enrolled"),
-        F.coalesce(F.col("mob_enrolled"),          F.lit("Non Mobile Enrolled")).alias("mob_enrolled"),
-        F.coalesce(F.col("digitally_active_flag"), F.lit("Non Digital Active")).alias("digitally_active_flag"),
-        F.coalesce(F.col("olb_active_flag"),       F.lit("Non OLB Active")).alias("olb_active_flag"),
-        F.coalesce(F.col("mob_active_flag"),       F.lit("Non Mobile Active")).alias("mob_active_flag"),
-        F.col("lst_login_olb"),
-        F.col("lst_login_mob"),
-        F.lit("Wealth").alias("fact_type")
-    )
-)
-
-# =============================================================================
-# STEP 6 — BUILD wealth_Insights_Account
-# =============================================================================
-
-ind_a = (
-    spark.table("eil.d_involved_party_h")
-    .filter(
-        (F.col("business_date")      == MAX_IP_DATE) &
-        (F.col("source_system_code") == "CF") &
-        (F.coalesce(F.col("deceased_ind"), F.lit("N")) == "N")
-    )
-)
-a2i_a = spark.table("eil.d_arrangement_to_involved_party_relationship_h")
-ar_a  = spark.table("eil.d_arrangement_h").filter(
-    (F.col("business_date")      == MAX_IP_DATE) &
-    (F.col("closed_ind")         == "N") &
-    (F.col("account_type_code")  == "IP") &
-    (F.col("source_system_code") == "RN")
-)
-
-wealth_account = (
-    ind_a
-    .join(a2i_a,
-        (ind_a["involved_party_id"]  == a2i_a["involved_party_id"]) &
-        (ind_a["business_date"]      == a2i_a["business_date"]) &
-        (ind_a["source_system_code"] == a2i_a["source_system_code"]),
-        "inner")
-    .join(ar_a,
-        (a2i_a["arrangement_id"]                 == ar_a["arrangement_id"]) &
-        (a2i_a["arrangement_source_system_code"] == ar_a["source_system_code"]) &
-        (a2i_a["business_date"]                  == ar_a["business_date"]),
-        "inner")
-    .select(
-        ind_a["rcif_cust_nbr"].cast("string").alias("RCIF_NUMBER"),
-        ind_a["involved_party_id"].alias("ip_id"),
-        ar_a["arrangement_id"].alias("ip_account_number"),
-        ar_a["open_date"].alias("ip_open_date"),
-        ar_a["current_balance_amt"].alias("ip_balance"),
-        F.when(ar_a["current_balance_amt"] > 0,
-               F.lit("Funded")).otherwise(F.lit("Not Funded")).alias("is_funded"),
-        F.lit(MAX_IP_DATE).cast(T.DateType()).alias("business_date"),
-        F.lit("Account").alias("fact_type")
-    )
-)
-
-# =============================================================================
-# STEP 7 — WRITE
-# =============================================================================
-
-wealth_customer.repartition(200).write \
-    .mode("overwrite").option("overwriteSchema","true") \
-    .saveAsTable("{}.{}".format(final_db, final_table_customer))
-
-wealth_account.write \
-    .mode("overwrite").option("overwriteSchema","true") \
-    .saveAsTable("{}.{}".format(final_db, final_table_account))
-
-# =============================================================================
-# STEP 8 — VERIFY
-# Expected OLB Active: ~64,420 (Sep) → ~65,800 (Feb)
-# =============================================================================
-
-final = spark.table("{}.{}".format(final_db, final_table_customer))
-accts = spark.table("{}.{}".format(final_db, final_table_account))
-
-print("\nWealth rows : {}".format(final.count()))
-print("Account rows: {}".format(accts.count()))
-
-print("\nDBM snap dates used per month (confirm per-month reference):")
-final.filter(F.col("dbm_snap_dt").isNotNull()) \
-     .groupBy("business_date", "dbm_snap_dt").count() \
-     .orderBy("business_date").show(10)
-
-print("\nOLB Active by month (target: ~64K-66K):")
-final.groupBy("business_date","olb_active_flag") \
-     .count().orderBy("business_date","olb_active_flag").show(20)
-
-print("\nMobile Active by month:")
-final.groupBy("business_date","mob_active_flag") \
-     .count().orderBy("business_date","mob_active_flag").show(20)
-
-print("\nDigital Active by month:")
-final.groupBy("business_date","digitally_active_flag") \
-     .count().orderBy("business_date","digitally_active_flag").show(20)
+print(f"Saved {DEFAULT_DB}.Wealth_Insights_Customer1")
+print(f"Saved {DEFAULT_DB}.Wealth_Insights_Account1")
+print("DONE.")
