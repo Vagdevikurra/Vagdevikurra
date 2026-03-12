@@ -114,7 +114,7 @@ dbm = (
 )
 
 print("DBM monthly snapshot dates:")
-dbm.select("dbm_month", F.max("snap_dt").alias("snap")).groupBy("dbm_month","snap").show()
+dbm.groupBy("dbm_month").agg(F.max("snap_dt").alias("snap")).orderBy("dbm_month").show()
 
 # =============================================================================
 # STEP 2 — WEALTH SEGMENTATION per RCIF per MONTH  (daily tables)
