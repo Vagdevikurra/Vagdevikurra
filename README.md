@@ -240,7 +240,9 @@ ar_d   = spark.table("eil.d_arrangement_h").filter(
 )
 addr_d = spark.table("eil.d_involved_party_address_h")
 
-rc = (
+# Build one row per involved_party per RCIF per month, then pick ONE per RCIF
+# ordered by cust_ibn ASC (matches original PWRANK logic) BEFORE joining DBM
+rc_raw = (
     ip_d
     .join(a2i_d,
         (ip_d["involved_party_id"]  == a2i_d["involved_party_id"]) &
@@ -256,15 +258,26 @@ rc = (
         (ip_d["involved_party_id"] == addr_d["involved_party_id"]) &
         (ip_d["business_date"]     == addr_d["business_date"]),
         "left")
-    .groupBy(
+    .select(
         ip_d["rcif_cust_nbr"].cast("string").alias("RCIF_NUMBER"),
-        ip_d["business_date"].cast(T.DateType()).alias("business_date")
+        ip_d["business_date"].cast(T.DateType()).alias("business_date"),
+        ip_d["involved_party_id"].alias("ip_id"),
+        ip_d["cust_internet_banking_nbr"].alias("cust_ibn"),
+        addr_d["state_name"]
     )
-    .agg(
-        F.first(ip_d["involved_party_id"]).alias("ip_id"),
-        F.first(ip_d["cust_internet_banking_nbr"]).alias("cust_ibn"),
-        F.first(addr_d["state_name"]).alias("state_name")
-    )
+    .distinct()
+)
+
+# Dedup: ONE row per RCIF per month, ordered by cust_ibn ASC nulls last
+# This must happen BEFORE DBM join so active flag uses the ONE correct ibn
+w_rc = Window.partitionBy("RCIF_NUMBER", "business_date").orderBy(
+    F.col("cust_ibn").asc_nulls_last()
+)
+rc = (
+    rc_raw
+    .withColumn("_rn", F.row_number().over(w_rc))
+    .filter(F.col("_rn") == 1)
+    .drop("_rn")
 )
 
 # =============================================================================
@@ -312,8 +325,6 @@ ip_accts_cnt = (
 # This gives each month its own per-month active flag — matches original SQL
 # =============================================================================
 
-w = Window.partitionBy("RCIF_NUMBER", "business_date").orderBy("RCIF_NUMBER")
-
 wealth_customer = (
     rc
     .join(pw1,
@@ -326,13 +337,11 @@ wealth_customer = (
         (rc["business_date"] == ip_accts_cnt["business_date"]),
         "left")
     .drop(ip_accts_cnt["RCIF_NUMBER"]).drop(ip_accts_cnt["business_date"])
-    # Join DBM on month + ibn — each row gets its own month's active flag
+    # rc is already ONE row per RCIF per month — DBM join on month+ibn will be 1:1
     .join(dbm,
         (F.trunc(rc["business_date"].cast("date"), "MM") == dbm["dbm_month"]) &
         (rc["cust_ibn"] == dbm["ibn"]),
         "left")
-    .withColumn("_rn", F.row_number().over(w))
-    .filter(F.col("_rn") == 1).drop("_rn")
     .select(
         rc["RCIF_NUMBER"],
         rc["business_date"],
