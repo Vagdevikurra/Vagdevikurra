@@ -245,8 +245,11 @@ rcif_dig = (
     )
     # Mobile Active: uses c.ods_business_dt & c.lst_login_mob (null if not in dig_customer)
     .withColumn("Mobile_Active_Flag",
-        F.when(F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90, "Mobile Active")
-         .otherwise("Non Mobile Active")
+        F.when(
+            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90) &
+            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) >= 0),
+            "Mobile Active"
+        ).otherwise("Non Mobile Active")
     )
     # Mobile User: c.lst_login_mob null → Non Mobile User
     .withColumn("Mobile_Flag",
@@ -255,8 +258,11 @@ rcif_dig = (
     )
     # OLB Active: uses c.ods_business_dt & c.lst_login_olb
     .withColumn("OLB_Active_Flag",
-        F.when(F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90, "OLB Active")
-         .otherwise("Non OLB Active")
+        F.when(
+            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90) &
+            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) >= 0),
+            "OLB Active"
+        ).otherwise("Non OLB Active")
     )
     # OLB User: c.lst_login_olb null → Non OLB User
     .withColumn("OLB_Flag",
@@ -266,8 +272,10 @@ rcif_dig = (
     # Digitally Active: either login within 90 days
     .withColumn("Digitally_Active_Flag",
         F.when(
-            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90) |
-            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90),
+            ((F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90) &
+             (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) >= 0)) |
+            ((F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90) &
+             (F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) >= 0)),
             "Digital Active"
         ).otherwise("Non Digital Active")
     )
@@ -469,15 +477,44 @@ pw1_per_rcif = (
     )
 )
 
-# ── wealth_insights_customer ──────────────────────────────────────────────────
-wealth_insights_customer = (
+# ── rcif_dig filtered & deduplicated by RCIF ─────────────────────────────────
+# One row per RCIF with all digital flags
+rcif_dig_base = (
     rcif_dig
-    .join(add_rcifs,   rcif_dig["RCIF_NUMBER"] == add_rcifs["rcif_number"],  "inner")
-    .join(pw1_per_rcif, rcif_dig["RCIF_NUMBER"] == pw1_per_rcif["pw_rcif"],  "left")
+    .join(add_rcifs, rcif_dig["RCIF_NUMBER"] == add_rcifs["rcif_number"], "inner")
     .select(
-        rcif_dig["RCIF_NUMBER"],
+        rcif_dig["RCIF_NUMBER"].alias("rd_rcif"),
         F.col("involved_party_id"),
-        rcif_dig["ibn"],
+        rcif_dig["ibn"].alias("rd_ibn"),
+        F.col("involved_party_name"),
+        F.col("involved_party_tax_id_nbr"),
+        F.col("birth_date"),
+        F.col("CUSTOMER_GENERATION"),
+        F.col("Mobile_Active_Flag"),
+        F.col("Mobile_Flag"),
+        F.col("OLB_Active_Flag"),
+        F.col("OLB_Flag"),
+        F.col("Digitally_Active_Flag"),
+        F.col("Digital_flag")
+    )
+    .distinct()
+)
+
+# ── wealth_insights_customer ──────────────────────────────────────────────────
+# pw1 is the BASE (one row per customer per segment = ~600k rows)
+# LEFT JOIN rcif_dig for digital flags
+# This gives COUNT(accts_cnt) ~ 600k matching original DAX
+wealth_insights_customer = (
+    pw1
+    .join(
+        rcif_dig_base,
+        pw1["RCIF_NUMBER"] == rcif_dig_base["rd_rcif"],
+        "left"
+    )
+    .select(
+        pw1["RCIF_NUMBER"],
+        F.col("ip_id"),
+        F.col("rd_ibn").alias("ibn"),
         F.col("involved_party_name"),
         F.col("involved_party_tax_id_nbr"),
         F.col("birth_date"),
@@ -499,7 +536,6 @@ wealth_insights_customer = (
         F.col("Trust_Count"),
         F.col("Banking_Count")
     )
-    .distinct()
 )
 
 # ── wealth_insights_account ───────────────────────────────────────────────────
