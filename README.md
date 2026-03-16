@@ -245,11 +245,8 @@ rcif_dig = (
     )
     # Mobile Active: uses c.ods_business_dt & c.lst_login_mob (null if not in dig_customer)
     .withColumn("Mobile_Active_Flag",
-        F.when(
-            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90) &
-            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) >= 0),
-            "Mobile Active"
-        ).otherwise("Non Mobile Active")
+        F.when(F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90, "Mobile Active")
+         .otherwise("Non Mobile Active")
     )
     # Mobile User: c.lst_login_mob null → Non Mobile User
     .withColumn("Mobile_Flag",
@@ -258,11 +255,8 @@ rcif_dig = (
     )
     # OLB Active: uses c.ods_business_dt & c.lst_login_olb
     .withColumn("OLB_Active_Flag",
-        F.when(
-            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90) &
-            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) >= 0),
-            "OLB Active"
-        ).otherwise("Non OLB Active")
+        F.when(F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90, "OLB Active")
+         .otherwise("Non OLB Active")
     )
     # OLB User: c.lst_login_olb null → Non OLB User
     .withColumn("OLB_Flag",
@@ -272,10 +266,8 @@ rcif_dig = (
     # Digitally Active: either login within 90 days
     .withColumn("Digitally_Active_Flag",
         F.when(
-            ((F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90) &
-             (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) >= 0)) |
-            ((F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90) &
-             (F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) >= 0)),
+            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90) |
+            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90),
             "Digital Active"
         ).otherwise("Non Digital Active")
     )
