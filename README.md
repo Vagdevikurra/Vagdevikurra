@@ -522,13 +522,14 @@ pw1_per_ip = (
 )
 
 # state_name lookup from rc (one row per ip_id)
+# One row per ip_id — prevents duplicates in account join
 rc_state = (
-    rc.select(
+    rc
+    .select(
         F.col("involved_party_id").alias("s_ip_id"),
-        F.col("state_name"),
-        F.col("city_name"),
-        F.col("country_name")
-    ).distinct()
+        F.col("state_name")
+    )
+    .dropDuplicates(["s_ip_id"])
 )
 
 wealth_insights_account = (
@@ -543,7 +544,7 @@ wealth_insights_account = (
         F.col("Accounts").alias("arrangement_id"),
         F.col("Business_Group"),
         F.col("division"),
-        F.lit(last_biz_date).alias("wealth_business_date"),
+        F.lit(last_biz_date).alias("business_date"),
         F.col("accts_cnt"),
         F.col("state_name")
     )
@@ -555,6 +556,8 @@ wealth_insights_account.write.mode("overwrite").saveAsTable(f"{DEFAULT_DB}.wealt
 
 print(f"✅ wealth_insights_customer: {wealth_insights_customer.count():,} rows")
 print(f"✅ wealth_insights_account:  {wealth_insights_account.count():,} rows")
+
+
 
 from pyspark.sql import SparkSession, functions as F
 from pyspark import SparkConf
@@ -573,88 +576,88 @@ cust = spark.table(f"{DEFAULT_DB}.wealth_insights_customer")
 acct = spark.table(f"{DEFAULT_DB}.wealth_insights_account")
 
 print("=" * 65)
-print("  WEALTH INSIGHTS — VALIDATION vs DAX")
+print("  WEALTH INSIGHTS — DAX VALIDATION")
 print("=" * 65)
 
-# [1] Wealth Customers ~267,664
+# ── DAX 1: wealth_customer ────────────────────────────────────────────────────
+# CALCULATE(DISTINCTCOUNT(Wealth[pw1.rcif_number]))
 n1 = cust.filter(F.col("Business_Group").isNotNull()) \
          .select(F.countDistinct("RCIF_NUMBER")).collect()[0][0]
 print(f"\n[1]  Wealth Customers        (expect ~267,664):  {n1:>10,}")
 
-# [2] Digital Enrollment ~123,379
+# ── DAX 2: Digital_Enrollment_Wealth ─────────────────────────────────────────
+# calculate(Wealth[wealth_customer], RCIF[rcif_dig.digital_flag]="Digital User")
 n2 = cust.filter(F.col("Business_Group").isNotNull()) \
          .filter(F.col("Digital_flag") == "Digital User") \
          .select(F.countDistinct("RCIF_NUMBER")).collect()[0][0]
 print(f"[2]  Digital Enrollment      (expect ~123,379):  {n2:>10,}")
 
-# [3] Wealth Digital Active 88k-91k
+# ── DAX 3: Wealth_Digital_Active ─────────────────────────────────────────────
+# INTERSECT Wealth RCIF with Digital where digitally_active_flag="Digital Active"
 n3 = cust.filter(F.col("Business_Group").isNotNull()) \
          .filter(F.col("Digitally_Active_Flag") == "Digital Active") \
          .select(F.countDistinct("RCIF_NUMBER")).collect()[0][0]
 print(f"[3]  Wealth Digital Active   (expect 88k-91k):   {n3:>10,}")
 
-# [4] Wealth OLB Active 63k-65k
+# ── DAX 4: Wealth_OLB_Active ─────────────────────────────────────────────────
+# INTERSECT Wealth RCIF with Digital where olb_active_flag="OLB Active"
 n4 = cust.filter(F.col("Business_Group").isNotNull()) \
          .filter(F.col("OLB_Active_Flag") == "OLB Active") \
          .select(F.countDistinct("RCIF_NUMBER")).collect()[0][0]
 print(f"[4]  Wealth OLB Active       (expect 63k-65k):   {n4:>10,}")
 
-# [5] Wealth Mobile Active 59k-61k
+# ── DAX 5: Wealth_MOB_Active ─────────────────────────────────────────────────
+# INTERSECT Wealth RCIF with Digital where mobile_active_flag="Mobile Active"
 n5 = cust.filter(F.col("Business_Group").isNotNull()) \
          .filter(F.col("Mobile_Active_Flag") == "Mobile Active") \
          .select(F.countDistinct("RCIF_NUMBER")).collect()[0][0]
 print(f"[5]  Wealth Mobile Active    (expect 59k-61k):   {n5:>10,}")
 
-# [6] Digital Penetration ~35%
+# ── DAX 6: Wealth_Digitally_Active_Penetration ───────────────────────────────
+# DIVIDE(Wealth_Digital_Active, wealth_customer) ~35%
 pct = round(n3 / n1 * 100, 2) if n1 else 0
 print(f"[6]  Digital Penetration %   (expect ~35%):      {pct:>9.2f}%")
 
-# [7] Total Accounts ~600k — SUM(accts_cnt) across wealth customers
+# ── DAX 7: Accounts ──────────────────────────────────────────────────────────
+# COUNT(Wealth[pw1.accts_cnt]) = SUM of all accts across wealth customers ~600k
 n7 = int(cust.filter(F.col("Business_Group").isNotNull())
              .agg(F.sum("accts_cnt")).collect()[0][0] or 0)
 print(f"[7]  Total Accounts          (expect ~600k):     {n7:>10,}")
 
-# [8] Accounts per user ~6.5
+# ── DAX 8: Account_per_user ───────────────────────────────────────────────────
+# [Accounts] / [wealth_customer] ~6.5
 apu = round(n7 / n1, 2) if n1 else 0
 print(f"[8]  Accounts per User       (expect ~6.5):      {apu:>10.2f}")
 
-# [9-13] InvestPath
-n9  = acct.select(F.countDistinct("ip_id")).collect()[0][0]
-n10 = acct.select(F.countDistinct("arrangement_id")).collect()[0][0]
-n11 = acct.filter(F.col("balance") > 0).select(F.countDistinct("arrangement_id")).collect()[0][0]
-aum = float(acct.agg(F.sum("balance")).collect()[0][0] or 0)
-avg = round(aum / n10, 2) if n10 else 0
-
+# ── DAX 9: InvestPath_Customers ──────────────────────────────────────────────
+# DISTINCTCOUNT(InvestPath[ip_id]) ~123
+n9 = acct.select(F.countDistinct("ip_id")).collect()[0][0]
 print(f"\n[9]  InvestPath Customers    (expect ~123):      {n9:>10,}")
-print(f"[10] InvestPath Accounts     (expect ~118):      {n10:>10,}")
-print(f"[11] IP Funded Accounts      (expect ~108):      {n11:>10,}")
-print(f"[12] AUM                     (expect ~$1.83M):   ${aum/1e6:>9.2f}M")
-print(f"[13] Avg Balance/IP Acct     (expect $15k-18k):  ${avg:>9,.2f}")
 
-# Business Group
+# ── DAX 10: InvestPath_Accounts ──────────────────────────────────────────────
+# DISTINCTCOUNT(InvestPath[accounts]) ~118
+n10 = acct.select(F.countDistinct("arrangement_id")).collect()[0][0]
+print(f"[10] InvestPath Accounts     (expect ~118):      {n10:>10,}")
+
+# ── DAX 11: InvestPath_Accounts_Funded ───────────────────────────────────────
+# FILTER InvestPath balance > 0 ~108
+n11 = acct.filter(F.col("balance") > 0) \
+          .select(F.countDistinct("arrangement_id")).collect()[0][0]
+print(f"[11] IP Funded Accounts      (expect ~108):      {n11:>10,}")
+
+# ── DAX 12: AUM ──────────────────────────────────────────────────────────────
+# SUM(InvestPath[balance]) ~$1.83M
+aum = float(acct.agg(F.sum("balance")).collect()[0][0] or 0)
+print(f"[12] AUM                     (expect ~$1.83M):   ${aum/1e6:>9.2f}M")
+
+# ── Bonus: Avg Balance (from your notes) ─────────────────────────────────────
+avg = round(aum / n10, 2) if n10 else 0
+print(f"     Avg Balance/IP Acct     (expect $15k-18k):  ${avg:>9,.2f}")
+
 print("\n" + "=" * 65)
-print("  BUSINESS GROUP  (expect: PW~177k, IS~64k, InvSvc~26k)")
+print("  BUSINESS GROUP BREAKDOWN")
 print("=" * 65)
 cust.filter(F.col("Business_Group").isNotNull()) \
     .groupBy("Business_Group") \
     .agg(F.countDistinct("RCIF_NUMBER").alias("Customers")) \
     .orderBy(F.desc("Customers")).show(truncate=False)
-
-# Division
-print("=" * 65)
-print("  DIVISION BREAKDOWN")
-print("=" * 65)
-cust.filter(F.col("division").isNotNull()) \
-    .groupBy("Business_Group", "division") \
-    .agg(F.countDistinct("RCIF_NUMBER").alias("Customers")) \
-    .orderBy("Business_Group", F.desc("Customers")).show(truncate=False)
-
-# Debug — what date is in dig_customer
-print("=" * 65)
-print("  DEBUG — dig_customer date check")
-print("=" * 65)
-spark.table("dm_ib.digital_banking_master") \
-     .agg(F.max("ods_business_dt").alias("max_date"),
-          F.min("ods_business_dt").alias("min_date")) \
-     .show()
-
