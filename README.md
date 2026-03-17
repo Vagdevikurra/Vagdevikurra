@@ -30,6 +30,7 @@ customer = spark.table(f"{EIL_DB}.d_involved_party_h")
 bridge   = spark.table(f"{EIL_DB}.d_arrangement_to_involved_party_relationship_h")
 account  = spark.table(f"{EIL_DB}.d_arrangement_h")
 digital  = spark.table(f"{DMIB_DB}.digital_banking_master")
+address  = spark.table(f"{EIL_DB}.d_involved_party_address_h")
 
 # ── Source Code Lists (BW and PC removed per requirement) ────────────────────
 VALID_SOURCE_CODES = [
@@ -210,12 +211,27 @@ rc = (
         (F.col("a2i_biz_dt")       == F.col("ar_biz_dt")),
         "inner"
     )
+    .join(
+        address
+        .filter(F.col("business_date") == last_biz_date)
+        .select(
+            F.col("involved_party_id").alias("addr_ip_id"),
+            F.col("state_name"),
+            F.col("city_name"),
+            F.col("country_name")
+        ),
+        F.col("c_ip_id") == F.col("addr_ip_id"),
+        "left"
+    )
     .groupBy(
         F.col("c_ip_id").alias("involved_party_id"),
         F.col("ibn"),
         F.col("involved_party_name"),
         F.col("involved_party_tax_id_nbr"),
-        F.col("birth_date")
+        F.col("birth_date"),
+        F.col("state_name"),
+        F.col("city_name"),
+        F.col("country_name")
     )
     .agg(F.max(F.col("rcif_cust_nbr").cast("string")).alias("RCIF_NUMBER"))
 )
@@ -477,21 +493,28 @@ wealth_insights_customer = (
     .join(add_rcifs,    rcif_dig["RCIF_NUMBER"] == add_rcifs["rcif_number"],  "inner")
     .join(pw1_per_rcif, rcif_dig["RCIF_NUMBER"] == pw1_per_rcif["pw_rcif"],   "left")
     .select(
+        # Identity
         rcif_dig["RCIF_NUMBER"],
-        F.col("involved_party_id"),
+        F.col("pw_ip_id").alias("ip_id"),
         rcif_dig["ibn"],
         F.col("involved_party_name"),
         F.col("involved_party_tax_id_nbr"),
         F.col("birth_date"),
         F.col("CUSTOMER_GENERATION"),
+        # Digital flags (from Dig_Customer LEFT JOIN)
+        F.col("state_name"),
+        F.col("city_name"),
+        F.col("country_name"),
         F.col("Mobile_Active_Flag"),
         F.col("Mobile_Flag"),
         F.col("OLB_Active_Flag"),
         F.col("OLB_Flag"),
         F.col("Digitally_Active_Flag"),
         F.col("Digital_flag"),
+        # Wealth fields
         F.col("Business_Group"),
         F.col("division"),
+        # Account counts (SUM across all segments)
         F.col("accts_cnt"),
         F.col("Corporate_Trust_Count"),
         F.col("Institutional_Trust_Count"),
@@ -521,17 +544,32 @@ pw1_per_ip = (
     )
 )
 
+# state_name lookup from rc (one row per ip_id)
+rc_state = (
+    rc.select(
+        F.col("involved_party_id").alias("s_ip_id"),
+        F.col("state_name"),
+        F.col("city_name"),
+        F.col("country_name")
+    ).distinct()
+)
+
 wealth_insights_account = (
     inv_df
     .join(pw1_per_ip, inv_df["ip_id"] == pw1_per_ip["pw_ip_id"], "left")
+    .join(rc_state,   inv_df["ip_id"] == rc_state["s_ip_id"],     "left")
     .select(
+        # Identity
         F.col("rcif_nbr").alias("RCIF_NUMBER"),
         inv_df["ip_id"],
+        # InvestPath columns
         F.col("balance"),
         F.col("open_date"),
         F.col("Accounts").alias("arrangement_id"),
+        # Wealth fields
         F.col("Business_Group"),
         F.col("division"),
+        # Account counts
         F.col("accts_cnt"),
         F.col("Corporate_Trust_Count"),
         F.col("Institutional_Trust_Count"),
@@ -539,7 +577,11 @@ wealth_insights_account = (
         F.col("Insurance_Count"),
         F.col("PWM_Count"),
         F.col("Trust_Count"),
-        F.col("Banking_Count")
+        F.col("Banking_Count"),
+        # Location
+        F.col("state_name"),
+        F.col("city_name"),
+        F.col("country_name")
     )
 )
 
