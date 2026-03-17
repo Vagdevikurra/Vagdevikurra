@@ -72,9 +72,20 @@ BANKING_SOURCE_CODES = [
 # login dates only up to that date — no capping needed.
 # Original SQL: WHERE ods_business_dt = (SELECT max(ods_business_dt) ...)
 # We pin to END_DT = "2026-02-28" so we always get the Feb snapshot.
+# Use the latest snapshot ON OR BEFORE END_DT
+# This guarantees we get the Feb 28 snapshot if it exists,
+# or the closest earlier date — same as original max() logic
+# but pinned to END_DT so March data never enters
+max_dig_dt = (
+    digital
+    .filter(F.col("ods_business_dt") <= END_DT)
+    .agg(F.max("ods_business_dt"))
+    .collect()[0][0]
+)
+
 dig_customer = (
     digital
-    .filter(F.col("ods_business_dt") == END_DT)
+    .filter(F.col("ods_business_dt") == max_dig_dt)
     .groupBy(
         F.col("ibn").alias("reltibn"),
         F.col("ods_business_dt")
@@ -544,3 +555,106 @@ wealth_insights_account.write.mode("overwrite").saveAsTable(f"{DEFAULT_DB}.wealt
 
 print(f"✅ wealth_insights_customer: {wealth_insights_customer.count():,} rows")
 print(f"✅ wealth_insights_account:  {wealth_insights_account.count():,} rows")
+
+from pyspark.sql import SparkSession, functions as F
+from pyspark import SparkConf
+
+DEFAULT_DB = "dm_ib_dev"
+conf = SparkConf().setAppName("wealth_validation")
+spark = (
+    SparkSession.builder
+    .config(conf=conf)
+    .enableHiveSupport()
+    .getOrCreate()
+)
+spark.sparkContext.setLogLevel("WARN")
+
+cust = spark.table(f"{DEFAULT_DB}.wealth_insights_customer")
+acct = spark.table(f"{DEFAULT_DB}.wealth_insights_account")
+
+print("=" * 65)
+print("  WEALTH INSIGHTS — VALIDATION vs DAX")
+print("=" * 65)
+
+# [1] Wealth Customers ~267,664
+n1 = cust.filter(F.col("Business_Group").isNotNull()) \
+         .select(F.countDistinct("RCIF_NUMBER")).collect()[0][0]
+print(f"\n[1]  Wealth Customers        (expect ~267,664):  {n1:>10,}")
+
+# [2] Digital Enrollment ~123,379
+n2 = cust.filter(F.col("Business_Group").isNotNull()) \
+         .filter(F.col("Digital_flag") == "Digital User") \
+         .select(F.countDistinct("RCIF_NUMBER")).collect()[0][0]
+print(f"[2]  Digital Enrollment      (expect ~123,379):  {n2:>10,}")
+
+# [3] Wealth Digital Active 88k-91k
+n3 = cust.filter(F.col("Business_Group").isNotNull()) \
+         .filter(F.col("Digitally_Active_Flag") == "Digital Active") \
+         .select(F.countDistinct("RCIF_NUMBER")).collect()[0][0]
+print(f"[3]  Wealth Digital Active   (expect 88k-91k):   {n3:>10,}")
+
+# [4] Wealth OLB Active 63k-65k
+n4 = cust.filter(F.col("Business_Group").isNotNull()) \
+         .filter(F.col("OLB_Active_Flag") == "OLB Active") \
+         .select(F.countDistinct("RCIF_NUMBER")).collect()[0][0]
+print(f"[4]  Wealth OLB Active       (expect 63k-65k):   {n4:>10,}")
+
+# [5] Wealth Mobile Active 59k-61k
+n5 = cust.filter(F.col("Business_Group").isNotNull()) \
+         .filter(F.col("Mobile_Active_Flag") == "Mobile Active") \
+         .select(F.countDistinct("RCIF_NUMBER")).collect()[0][0]
+print(f"[5]  Wealth Mobile Active    (expect 59k-61k):   {n5:>10,}")
+
+# [6] Digital Penetration ~35%
+pct = round(n3 / n1 * 100, 2) if n1 else 0
+print(f"[6]  Digital Penetration %   (expect ~35%):      {pct:>9.2f}%")
+
+# [7] Total Accounts ~600k — SUM(accts_cnt) across wealth customers
+n7 = int(cust.filter(F.col("Business_Group").isNotNull())
+             .agg(F.sum("accts_cnt")).collect()[0][0] or 0)
+print(f"[7]  Total Accounts          (expect ~600k):     {n7:>10,}")
+
+# [8] Accounts per user ~6.5
+apu = round(n7 / n1, 2) if n1 else 0
+print(f"[8]  Accounts per User       (expect ~6.5):      {apu:>10.2f}")
+
+# [9-13] InvestPath
+n9  = acct.select(F.countDistinct("ip_id")).collect()[0][0]
+n10 = acct.select(F.countDistinct("arrangement_id")).collect()[0][0]
+n11 = acct.filter(F.col("balance") > 0).select(F.countDistinct("arrangement_id")).collect()[0][0]
+aum = float(acct.agg(F.sum("balance")).collect()[0][0] or 0)
+avg = round(aum / n10, 2) if n10 else 0
+
+print(f"\n[9]  InvestPath Customers    (expect ~123):      {n9:>10,}")
+print(f"[10] InvestPath Accounts     (expect ~118):      {n10:>10,}")
+print(f"[11] IP Funded Accounts      (expect ~108):      {n11:>10,}")
+print(f"[12] AUM                     (expect ~$1.83M):   ${aum/1e6:>9.2f}M")
+print(f"[13] Avg Balance/IP Acct     (expect $15k-18k):  ${avg:>9,.2f}")
+
+# Business Group
+print("\n" + "=" * 65)
+print("  BUSINESS GROUP  (expect: PW~177k, IS~64k, InvSvc~26k)")
+print("=" * 65)
+cust.filter(F.col("Business_Group").isNotNull()) \
+    .groupBy("Business_Group") \
+    .agg(F.countDistinct("RCIF_NUMBER").alias("Customers")) \
+    .orderBy(F.desc("Customers")).show(truncate=False)
+
+# Division
+print("=" * 65)
+print("  DIVISION BREAKDOWN")
+print("=" * 65)
+cust.filter(F.col("division").isNotNull()) \
+    .groupBy("Business_Group", "division") \
+    .agg(F.countDistinct("RCIF_NUMBER").alias("Customers")) \
+    .orderBy("Business_Group", F.desc("Customers")).show(truncate=False)
+
+# Debug — what date is in dig_customer
+print("=" * 65)
+print("  DEBUG — dig_customer date check")
+print("=" * 65)
+spark.table("dm_ib.digital_banking_master") \
+     .agg(F.max("ods_business_dt").alias("max_date"),
+          F.min("ods_business_dt").alias("min_date")) \
+     .show()
+
