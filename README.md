@@ -67,27 +67,21 @@ BANKING_SOURCE_CODES = [
 #
 # Snapshot fix: filter to END_DT so we get Feb 28 snapshot
 # AND cap login dates to END_DT so March logins don't inflate 90-day window
-max_ods_dt = digital.filter(
-    F.col("ods_business_dt") <= END_DT
-).agg(F.max("ods_business_dt")).collect()[0][0]
-
+# digital_banking_master is a SNAPSHOT table.
+# The row where ods_business_dt = END_DT already contains
+# login dates only up to that date — no capping needed.
+# Original SQL: WHERE ods_business_dt = (SELECT max(ods_business_dt) ...)
+# We pin to END_DT = "2026-02-28" so we always get the Feb snapshot.
 dig_customer = (
     digital
-    .filter(F.col("ods_business_dt") == max_ods_dt)
+    .filter(F.col("ods_business_dt") == END_DT)
     .groupBy(
         F.col("ibn").alias("reltibn"),
         F.col("ods_business_dt")
     )
     .agg(
-        # Cap login dates to END_DT - excludes any logins after snapshot date
-        F.max(
-            F.when(F.col("olb_last_login_date") <= END_DT,
-                   F.col("olb_last_login_date"))
-        ).alias("lst_login_olb"),
-        F.max(
-            F.when(F.col("mob_last_login_date") <= END_DT,
-                   F.col("mob_last_login_date"))
-        ).alias("lst_login_mob")
+        F.max("olb_last_login_date").alias("lst_login_olb"),
+        F.max("mob_last_login_date").alias("lst_login_mob")
     )
 )
 
@@ -259,16 +253,6 @@ rcif_dig = (
         ),
         rc["ibn"] == dig_customer["reltibn"],
         "left"
-    )
-    # Generation (exact original CASE)
-    .withColumn("CUSTOMER_GENERATION",
-        F.when((F.col("birth_date") >= "1900-01-01") & (F.col("birth_date") <= "1924-12-31"), "GI Generation (1900-1924)")
-         .when((F.col("birth_date") >= "1925-01-01") & (F.col("birth_date") <= "1945-12-31"), "Traditionalist (1925-1945)")
-         .when((F.col("birth_date") >= "1946-01-01") & (F.col("birth_date") <= "1964-12-31"), "Baby Boomer (1946-1964)")
-         .when((F.col("birth_date") >= "1965-01-01") & (F.col("birth_date") <= "1980-12-31"), "Gen X (1965-1980)")
-         .when((F.col("birth_date") >= "1981-01-01") & (F.col("birth_date") <= "1996-12-31"), "Millennial (1981-1996)")
-         .when( F.col("birth_date") >= "1997-01-01",                                          "Centennial (1997-???)")
-         .otherwise("Unknown")
     )
     # Exact original: datediff(c.ods_business_Dt, c.lst_login_mob) <= 90
     .withColumn("Mobile_Active_Flag",
@@ -493,36 +477,18 @@ wealth_insights_customer = (
     .join(add_rcifs,    rcif_dig["RCIF_NUMBER"] == add_rcifs["rcif_number"],  "inner")
     .join(pw1_per_rcif, rcif_dig["RCIF_NUMBER"] == pw1_per_rcif["pw_rcif"],   "left")
     .select(
-        # Identity
         rcif_dig["RCIF_NUMBER"],
         F.col("pw_ip_id").alias("ip_id"),
         rcif_dig["ibn"],
-        F.col("involved_party_name"),
-        F.col("involved_party_tax_id_nbr"),
-        F.col("birth_date"),
-        F.col("CUSTOMER_GENERATION"),
-        # Digital flags (from Dig_Customer LEFT JOIN)
-        F.col("state_name"),
-        F.col("city_name"),
-        F.col("country_name"),
         F.col("Mobile_Active_Flag"),
         F.col("Mobile_Flag"),
         F.col("OLB_Active_Flag"),
         F.col("OLB_Flag"),
         F.col("Digitally_Active_Flag"),
         F.col("Digital_flag"),
-        # Wealth fields
         F.col("Business_Group"),
         F.col("division"),
-        # Account counts (SUM across all segments)
-        F.col("accts_cnt"),
-        F.col("Corporate_Trust_Count"),
-        F.col("Institutional_Trust_Count"),
-        F.col("Investment_Count"),
-        F.col("Insurance_Count"),
-        F.col("PWM_Count"),
-        F.col("Trust_Count"),
-        F.col("Banking_Count")
+        F.col("accts_cnt")
     )
     .distinct()
 )
@@ -559,29 +525,16 @@ wealth_insights_account = (
     .join(pw1_per_ip, inv_df["ip_id"] == pw1_per_ip["pw_ip_id"], "left")
     .join(rc_state,   inv_df["ip_id"] == rc_state["s_ip_id"],     "left")
     .select(
-        # Identity
         F.col("rcif_nbr").alias("RCIF_NUMBER"),
         inv_df["ip_id"],
-        # InvestPath columns
         F.col("balance"),
         F.col("open_date"),
         F.col("Accounts").alias("arrangement_id"),
-        # Wealth fields
         F.col("Business_Group"),
         F.col("division"),
-        # Account counts
+        F.lit(last_biz_date).alias("wealth_business_date"),
         F.col("accts_cnt"),
-        F.col("Corporate_Trust_Count"),
-        F.col("Institutional_Trust_Count"),
-        F.col("Investment_Count"),
-        F.col("Insurance_Count"),
-        F.col("PWM_Count"),
-        F.col("Trust_Count"),
-        F.col("Banking_Count"),
-        # Location
-        F.col("state_name"),
-        F.col("city_name"),
-        F.col("country_name")
+        F.col("state_name")
     )
 )
 
