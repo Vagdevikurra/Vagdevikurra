@@ -469,44 +469,17 @@ pw1_per_rcif = (
     )
 )
 
-# ── rcif_dig filtered & deduplicated by RCIF ─────────────────────────────────
-# One row per RCIF with all digital flags
-rcif_dig_base = (
-    rcif_dig
-    .join(add_rcifs, rcif_dig["RCIF_NUMBER"] == add_rcifs["rcif_number"], "inner")
-    .select(
-        rcif_dig["RCIF_NUMBER"].alias("rd_rcif"),
-        F.col("involved_party_id"),
-        rcif_dig["ibn"].alias("rd_ibn"),
-        F.col("involved_party_name"),
-        F.col("involved_party_tax_id_nbr"),
-        F.col("birth_date"),
-        F.col("CUSTOMER_GENERATION"),
-        F.col("Mobile_Active_Flag"),
-        F.col("Mobile_Flag"),
-        F.col("OLB_Active_Flag"),
-        F.col("OLB_Flag"),
-        F.col("Digitally_Active_Flag"),
-        F.col("Digital_flag")
-    )
-    .distinct()
-)
-
 # ── wealth_insights_customer ──────────────────────────────────────────────────
-# pw1 is the BASE (one row per customer per segment = ~600k rows)
-# LEFT JOIN rcif_dig for digital flags
-# This gives COUNT(accts_cnt) ~ 600k matching original DAX
+# rcif_dig as base (7M rows = full RCIF universe last 6 months)
+# LEFT JOIN pw1_per_rcif for wealth fields
 wealth_insights_customer = (
-    pw1
-    .join(
-        rcif_dig_base,
-        pw1["RCIF_NUMBER"] == rcif_dig_base["rd_rcif"],
-        "left"
-    )
+    rcif_dig
+    .join(add_rcifs,    rcif_dig["RCIF_NUMBER"] == add_rcifs["rcif_number"],   "inner")
+    .join(pw1_per_rcif, rcif_dig["RCIF_NUMBER"] == pw1_per_rcif["pw_rcif"],    "left")
     .select(
-        pw1["RCIF_NUMBER"],
-        F.col("ip_id"),
-        F.col("rd_ibn").alias("ibn"),
+        rcif_dig["RCIF_NUMBER"],
+        F.col("involved_party_id"),
+        rcif_dig["ibn"],
         F.col("involved_party_name"),
         F.col("involved_party_tax_id_nbr"),
         F.col("birth_date"),
@@ -528,6 +501,7 @@ wealth_insights_customer = (
         F.col("Trust_Count"),
         F.col("Banking_Count")
     )
+    .distinct()
 )
 
 # ── wealth_insights_account ───────────────────────────────────────────────────
