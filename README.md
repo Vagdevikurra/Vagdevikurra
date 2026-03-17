@@ -64,8 +64,11 @@ dig_customer = (
         F.col("ods_business_dt")
     )
     .agg(
-        F.max("olb_last_login_date").alias("lst_login_olb"),
-        F.max("mob_last_login_date").alias("lst_login_mob")
+        # Cap login dates to END_DT — excludes future logins added after snapshot
+        F.max(F.when(F.col("olb_last_login_date") <= END_DT,
+                     F.col("olb_last_login_date"))).alias("lst_login_olb"),
+        F.max(F.when(F.col("mob_last_login_date") <= END_DT,
+                     F.col("mob_last_login_date"))).alias("lst_login_mob")
     )
 )
 
@@ -446,13 +449,17 @@ pw1 = (
 
 # =============================================================================
 # FINAL — Build 2 output tables
-# rcif_dig is the customer base → LEFT JOIN pw1 for wealth fields
-# pw1 is collapsed to ONE row per RCIF (top Business_Group by priority)
 # =============================================================================
 
-bg_priority = F.when(F.col("Business_Group") == "Private Wealth",        1)                .when(F.col("Business_Group") == "Institutional Services", 2)                .when(F.col("Business_Group") == "Investment Services",    3)                .otherwise(4)
+bg_priority = (
+    F.when(F.col("Business_Group") == "Private Wealth",        1)
+     .when(F.col("Business_Group") == "Institutional Services",2)
+     .when(F.col("Business_Group") == "Investment Services",   3)
+     .otherwise(4)
+)
 
-pw1_per_rcif = (
+# ── Top Business_Group + division per RCIF ────────────────────────────────────
+pw1_top_bg = (
     pw1
     .withColumn("bg_rank", bg_priority)
     .withColumn("rn", F.row_number().over(
@@ -462,6 +469,33 @@ pw1_per_rcif = (
     .select(
         F.col("RCIF_NUMBER").alias("pw_rcif"),
         F.col("ip_id").alias("pw_ip_id"),
+        "Business_Group", "division"
+    )
+)
+
+# ── SUM accts_cnt across ALL segments per RCIF → gives ~600k total ───────────
+pw1_accts = (
+    pw1
+    .groupBy("RCIF_NUMBER")
+    .agg(
+        F.sum("accts_cnt").alias("accts_cnt"),
+        F.sum("Corporate_Trust_Count").alias("Corporate_Trust_Count"),
+        F.sum("Institutional_Trust_Count").alias("Institutional_Trust_Count"),
+        F.sum("Investment_Count").alias("Investment_Count"),
+        F.sum("Insurance_Count").alias("Insurance_Count"),
+        F.sum("PWM_Count").alias("PWM_Count"),
+        F.sum("Trust_Count").alias("Trust_Count"),
+        F.sum("Banking_Count").alias("Banking_Count")
+    )
+)
+
+# ── Combine: one row per RCIF with top BG + total accts ──────────────────────
+pw1_per_rcif = (
+    pw1_top_bg
+    .join(pw1_accts,
+          pw1_top_bg["pw_rcif"] == pw1_accts["RCIF_NUMBER"], "left")
+    .select(
+        "pw_rcif", "pw_ip_id",
         "Business_Group", "division", "accts_cnt",
         "Corporate_Trust_Count", "Institutional_Trust_Count",
         "Investment_Count", "Insurance_Count",
@@ -470,12 +504,12 @@ pw1_per_rcif = (
 )
 
 # ── wealth_insights_customer ──────────────────────────────────────────────────
-# rcif_dig as base (7M rows = full RCIF universe last 6 months)
-# LEFT JOIN pw1_per_rcif for wealth fields
+# rcif_dig = BASE (7M rows — full RCIF universe last 6 months)
+# LEFT JOIN pw1_per_rcif for wealth fields + total accts_cnt (SUM across segments)
 wealth_insights_customer = (
     rcif_dig
-    .join(add_rcifs,    rcif_dig["RCIF_NUMBER"] == add_rcifs["rcif_number"],   "inner")
-    .join(pw1_per_rcif, rcif_dig["RCIF_NUMBER"] == pw1_per_rcif["pw_rcif"],    "left")
+    .join(add_rcifs,    rcif_dig["RCIF_NUMBER"] == add_rcifs["rcif_number"],  "inner")
+    .join(pw1_per_rcif, rcif_dig["RCIF_NUMBER"] == pw1_per_rcif["pw_rcif"],   "left")
     .select(
         rcif_dig["RCIF_NUMBER"],
         F.col("involved_party_id"),
