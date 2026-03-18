@@ -50,19 +50,17 @@ BANKING_SOURCE_CODES = [
 # Original: WHERE ods_business_dt = max(ods_business_dt)
 # Pinned to <= END_DT so we get Feb snapshot not March
 # =============================================================================
-max_dig_dt = (
-    digital
-    .filter(F.col("ods_business_dt") <= END_DT)
-    .agg(F.max("ods_business_dt"))
-    .collect()[0][0]
-)
-
+# All 6 monthly snapshot dates between START_DT and END_DT
+# One row per customer per month — ods_business_dt is the monthly anchor
 dig_customer = (
     digital
-    .filter(F.col("ods_business_dt") == max_dig_dt)
+    .filter(
+        (F.col("ods_business_dt") >= START_DT) &
+        (F.col("ods_business_dt") <= END_DT)
+    )
     .groupBy(
         F.col("ibn"),
-        F.col("ods_business_dt")
+        F.col("ods_business_dt")   # monthly anchor date
     )
     .agg(
         F.max("olb_last_login_date").alias("lst_login_olb"),
@@ -195,6 +193,7 @@ rc = (
 # =============================================================================
 dig_customer_sel = dig_customer.select(
     F.col("ibn").alias("dig_ibn"),
+    F.col("ods_business_dt"),
     F.col("lst_login_olb"),
     F.col("lst_login_mob")
 )
@@ -207,14 +206,14 @@ rcif_dig = (
         "left"
     )
     .withColumn("Mobile_Active_Flag",
-        F.when(F.datediff(F.lit(END_DT).cast("date"), F.col("lst_login_mob")) <= 90, "Mobile Active")
+        F.when(F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90, "Mobile Active")
          .otherwise("Non Mobile Active")
     )
     .withColumn("Mobile_Flag",
         F.when(F.col("lst_login_mob").isNull(), "Non Mobile User").otherwise("Mobile User")
     )
     .withColumn("OLB_Active_Flag",
-        F.when(F.datediff(F.lit(END_DT).cast("date"), F.col("lst_login_olb")) <= 90, "OLB Active")
+        F.when(F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90, "OLB Active")
          .otherwise("Non OLB Active")
     )
     .withColumn("OLB_Flag",
@@ -222,8 +221,8 @@ rcif_dig = (
     )
     .withColumn("Digitally_Active_Flag",
         F.when(
-            (F.datediff(F.lit(END_DT).cast("date"), F.col("lst_login_mob")) <= 90) |
-            (F.datediff(F.lit(END_DT).cast("date"), F.col("lst_login_olb")) <= 90),
+            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90) |
+            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90),
             "Digital Active"
         ).otherwise("Non Digital Active")
     )
@@ -421,7 +420,8 @@ wealth_insights_customer = (
         F.col("OLB_Active_Flag").alias("olb_active_flag"),
         F.col("Digital_flag").alias("digital_flag"),
         F.col("Digitally_Active_Flag").alias("digital_active_flag"),
-        F.col("fact_type")
+        F.col("fact_type"),
+        F.col("ods_business_dt")   # monthly anchor date from dig_customer
     )
     .distinct()
 )
