@@ -1,3 +1,4 @@
+
 from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.window import Window
 from pyspark import SparkConf
@@ -194,11 +195,18 @@ rc = (
 # =============================================================================
 # CTE 4 — RCIF_Dig (exact original flag logic)
 # =============================================================================
+dig_customer_sel = dig_customer.select(
+    F.col("ibn").alias("dig_ibn"),
+    F.col("ods_business_dt"),
+    F.col("lst_login_olb"),
+    F.col("lst_login_mob")
+)
+
 rcif_dig = (
     rc
     .join(
-        dig_customer.select("reltibn", "ods_business_dt", "lst_login_olb", "lst_login_mob"),
-        rc["ibn"] == dig_customer["reltibn"],
+        dig_customer_sel,
+        rc["ibn"] == dig_customer_sel["dig_ibn"],
         "left"
     )
     .withColumn("Mobile_Active_Flag",
@@ -223,7 +231,7 @@ rcif_dig = (
         ).otherwise("Non Digital Active")
     )
     .withColumn("Digital_flag",
-        F.when(F.col("reltibn").isNull(), "Non Digital User").otherwise("Digital User")
+        F.when(F.col("dig_ibn").isNull(), "Non Digital User").otherwise("Digital User")
     )
     .select(
         "RCIF_NUMBER", "involved_party_id",
