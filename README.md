@@ -362,6 +362,20 @@ pw1 = (
 # =============================================================================
 # FINAL OUTPUT
 # =============================================================================
+
+# ── Date Spine: 6 month-end dates (Sep 2025 → Feb 2026) ──────────────────────
+month_ends = [
+    "2025-09-30",
+    "2025-10-31",
+    "2025-11-30",
+    "2025-12-31",
+    "2026-01-31",
+    "2026-02-28"
+]
+date_spine = spark.createDataFrame(
+    [(d,) for d in month_ends],
+    ["ods_business_dt"]
+)
 bg_priority = (
     F.when(F.col("Business_Group") == "Private Wealth",        1)
      .when(F.col("Business_Group") == "Institutional Services",2)
@@ -402,6 +416,7 @@ wealth_insights_customer = (
     rcif_dig
     .join(add_rcifs,    rcif_dig["RCIF_NUMBER"] == add_rcifs["rcif_number"],  "inner")
     .join(pw1_per_rcif, rcif_dig["RCIF_NUMBER"] == pw1_per_rcif["pw_rcif"],   "left")
+    .crossJoin(date_spine)
     .withColumn("fact_type",
         F.when(
             F.col("Business_Group").isNotNull() & (F.col("Digital_flag") == "Digital User"),
@@ -425,7 +440,7 @@ wealth_insights_customer = (
         F.col("Digital_flag").alias("digital_flag"),
         F.col("Digitally_Active_Flag").alias("digital_active_flag"),
         F.col("fact_type"),
-        F.lit(max_dig_dt).cast("date").alias("ods_business_dt")   # digital snapshot month-end (Feb 28)
+        F.col("ods_business_dt")   # month-end anchor date (Sep-Feb)
     )
     .distinct()
 )
