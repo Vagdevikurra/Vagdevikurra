@@ -50,17 +50,20 @@ BANKING_SOURCE_CODES = [
 # Original: WHERE ods_business_dt = max(ods_business_dt)
 # Pinned to <= END_DT so we get Feb snapshot not March
 # =============================================================================
-# All 6 monthly snapshot dates between START_DT and END_DT
-# One row per customer per month — ods_business_dt is the monthly anchor
+# Single latest snapshot date <= END_DT (Feb 28)
+max_dig_dt = (
+    digital
+    .filter(F.col("ods_business_dt") <= END_DT)
+    .agg(F.max("ods_business_dt"))
+    .collect()[0][0]
+)
+
 dig_customer = (
     digital
-    .filter(
-        (F.col("ods_business_dt") >= START_DT) &
-        (F.col("ods_business_dt") <= END_DT)
-    )
+    .filter(F.col("ods_business_dt") == max_dig_dt)
     .groupBy(
         F.col("ibn"),
-        F.col("ods_business_dt")   # monthly anchor date
+        F.col("ods_business_dt")
     )
     .agg(
         F.max("olb_last_login_date").alias("lst_login_olb"),
@@ -422,7 +425,7 @@ wealth_insights_customer = (
         F.col("Digital_flag").alias("digital_flag"),
         F.col("Digitally_Active_Flag").alias("digital_active_flag"),
         F.col("fact_type"),
-        F.col("ods_business_dt")   # monthly anchor date from dig_customer
+        F.last_day(F.lit(last_biz_date).cast("date")).alias("ods_business_dt")   # month-end of snapshot
     )
     .distinct()
 )
