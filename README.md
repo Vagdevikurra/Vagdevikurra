@@ -71,7 +71,12 @@ dig_customer = (
     )
 )
 
-last_biz_date = customer.agg(F.max("business_date")).collect()[0][0]
+last_biz_date = (
+    customer
+    .filter(F.col("business_date") <= END_DT)
+    .agg(F.max("business_date"))
+    .collect()[0][0]
+)
 
 # =============================================================================
 # CTE 2 — INV (Investpath)
