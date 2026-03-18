@@ -188,12 +188,15 @@ rc = (
         F.col("c_ip_id") == F.col("addr_ip_id"),
         "left"
     )
-    .groupBy(
-        F.col("c_ip_id").alias("involved_party_id"),
+    .select(
+        F.col("c_ip_id"),
         F.col("ibn"),
+        F.col("rcif_cust_nbr"),
         F.col("state_name")
     )
+    .groupBy("c_ip_id", "ibn", "state_name")
     .agg(F.max(F.col("rcif_cust_nbr").cast("string")).alias("RCIF_NUMBER"))
+    .withColumnRenamed("c_ip_id", "involved_party_id")
 )
 
 # =============================================================================
