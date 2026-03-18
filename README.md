@@ -209,14 +209,14 @@ rcif_dig = (
         "left"
     )
     .withColumn("Mobile_Active_Flag",
-        F.when(F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90, "Mobile Active")
+        F.when(F.datediff(F.current_date(), F.col("lst_login_mob")) <= 90, "Mobile Active")
          .otherwise("Non Mobile Active")
     )
     .withColumn("Mobile_Flag",
         F.when(F.col("lst_login_mob").isNull(), "Non Mobile User").otherwise("Mobile User")
     )
     .withColumn("OLB_Active_Flag",
-        F.when(F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90, "OLB Active")
+        F.when(F.datediff(F.current_date(), F.col("lst_login_olb")) <= 90, "OLB Active")
          .otherwise("Non OLB Active")
     )
     .withColumn("OLB_Flag",
@@ -224,8 +224,8 @@ rcif_dig = (
     )
     .withColumn("Digitally_Active_Flag",
         F.when(
-            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90) |
-            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90),
+            (F.datediff(F.current_date(), F.col("lst_login_mob")) <= 90) |
+            (F.datediff(F.current_date(), F.col("lst_login_olb")) <= 90),
             "Digital Active"
         ).otherwise("Non Digital Active")
     )
@@ -425,7 +425,7 @@ wealth_insights_customer = (
         F.col("Digital_flag").alias("digital_flag"),
         F.col("Digitally_Active_Flag").alias("digital_active_flag"),
         F.col("fact_type"),
-        F.last_day(F.lit(last_biz_date).cast("date")).alias("ods_business_dt")   # month-end of snapshot
+        F.lit(max_dig_dt).cast("date").alias("ods_business_dt")   # digital snapshot month-end (Feb 28)
     )
     .distinct()
 )
