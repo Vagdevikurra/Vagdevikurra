@@ -1,4 +1,3 @@
-
 from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.window import Window
 from pyspark import SparkConf
@@ -62,7 +61,7 @@ dig_customer = (
     digital
     .filter(F.col("ods_business_dt") == max_dig_dt)
     .groupBy(
-        F.col("relt_lbn").alias("reltibn"),   # original: dbm.relt_lbn as reltibn
+        F.col("ibn"),
         F.col("ods_business_dt")
     )
     .agg(
@@ -197,7 +196,6 @@ rc = (
 # =============================================================================
 dig_customer_sel = dig_customer.select(
     F.col("ibn").alias("dig_ibn"),
-    F.col("ods_business_dt"),
     F.col("lst_login_olb"),
     F.col("lst_login_mob")
 )
@@ -210,14 +208,14 @@ rcif_dig = (
         "left"
     )
     .withColumn("Mobile_Active_Flag",
-        F.when(F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90, "Mobile Active")
+        F.when(F.datediff(F.current_date(), F.col("lst_login_mob")) <= 90, "Mobile Active")
          .otherwise("Non Mobile Active")
     )
     .withColumn("Mobile_Flag",
         F.when(F.col("lst_login_mob").isNull(), "Non Mobile User").otherwise("Mobile User")
     )
     .withColumn("OLB_Active_Flag",
-        F.when(F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90, "OLB Active")
+        F.when(F.datediff(F.current_date(), F.col("lst_login_olb")) <= 90, "OLB Active")
          .otherwise("Non OLB Active")
     )
     .withColumn("OLB_Flag",
@@ -225,8 +223,8 @@ rcif_dig = (
     )
     .withColumn("Digitally_Active_Flag",
         F.when(
-            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90) |
-            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90),
+            (F.datediff(F.current_date(), F.col("lst_login_mob")) <= 90) |
+            (F.datediff(F.current_date(), F.col("lst_login_olb")) <= 90),
             "Digital Active"
         ).otherwise("Non Digital Active")
     )
