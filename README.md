@@ -7,8 +7,8 @@ DEFAULT_DB = "dm_ib_dev"
 EIL_DB     = "eil"
 DMIB_DB    = "dm_ib"
 
-START_DT = "2025-09-01"
-END_DT   = "2026-02-28"
+# Pin to Feb 28 — original SQL ran in Feb so max(ods_business_dt) was Feb 28
+END_DT = "2026-02-28"
 
 conf = (
     SparkConf()
@@ -16,7 +16,6 @@ conf = (
     .set("spark.sql.legacy.timeParserPolicy", "LEGACY")
     .set("spark.sql.autoBroadcastJoinThreshold", "-1")
 )
-
 spark = (
     SparkSession.builder
     .config(conf=conf)
@@ -32,7 +31,6 @@ account  = spark.table(f"{EIL_DB}.d_arrangement_h")
 digital  = spark.table(f"{DMIB_DB}.digital_banking_master")
 address  = spark.table(f"{EIL_DB}.d_involved_party_address_h")
 
-# ── Source Code Lists (BW and PC removed per requirement) ────────────────────
 VALID_SOURCE_CODES = [
     'DA','SV','CC','MG','LS','TM','LO','CM','CS',
     'EL','IC','MA','PF','PR','SD','TR','BI','RN',
@@ -49,33 +47,9 @@ BANKING_SOURCE_CODES = [
 
 # =============================================================================
 # CTE 1 — Dig_Customer
-# Exact original:
-#   SELECT relt_ibn as reltibn,
-#          max(olb_last_login_date) as lst_login_olb,
-#          max(mob_last_login_date) as lst_login_mob,
-# =============================================================================
-# STEP 1 — Dig_Customer
-# Exact original SQL:
-#   WHERE ods_business_dt = (SELECT max(ods_business_dt) FROM digital_banking_master)
-#   GROUP BY relt_ibn, ods_business_dt
-#   SELECT relt_ibn as reltibn, max(olb_last_login_date), max(mob_last_login_date), ods_business_dt
-# =============================================================================
-# Dig_Customer — exact original SQL logic
 # Original: WHERE ods_business_dt = max(ods_business_dt)
-# GROUP BY relt_ibn, ods_business_dt
-# SELECT relt_ibn, max(olb_last_login_date), max(mob_last_login_date), ods_business_dt
-#
-# Snapshot fix: filter to END_DT so we get Feb 28 snapshot
-# AND cap login dates to END_DT so March logins don't inflate 90-day window
-# digital_banking_master is a SNAPSHOT table.
-# The row where ods_business_dt = END_DT already contains
-# login dates only up to that date — no capping needed.
-# Original SQL: WHERE ods_business_dt = (SELECT max(ods_business_dt) ...)
-# We pin to END_DT = "2026-02-28" so we always get the Feb snapshot.
-# Use the latest snapshot ON OR BEFORE END_DT
-# This guarantees we get the Feb 28 snapshot if it exists,
-# or the closest earlier date — same as original max() logic
-# but pinned to END_DT so March data never enters
+# Pinned to <= END_DT so we get Feb snapshot not March
+# =============================================================================
 max_dig_dt = (
     digital
     .filter(F.col("ods_business_dt") <= END_DT)
@@ -96,27 +70,11 @@ dig_customer = (
     )
 )
 
-# =============================================================================
-# CTE 2 — INV (Investpath)
-# customer → bridge → account (closed=N, type=IP, src=RN)
-# =============================================================================
 last_biz_date = customer.agg(F.max("business_date")).collect()[0][0]
 
-cust_inv = (
-    customer
-    .filter(
-        (F.col("business_date")      == last_biz_date) &
-        (F.col("source_system_code") == "CF")          &
-        (F.coalesce(F.col("deceased_ind"), F.lit("N")) == "N")
-    )
-    .select(
-        F.col("involved_party_id").alias("c_ip_id"),
-        F.col("business_date").alias("c_biz_dt"),
-        F.col("source_system_code").alias("c_src_code"),
-        F.col("rcif_cust_nbr").alias("rcif_nbr")
-    )
-)
-
+# =============================================================================
+# CTE 2 — INV (Investpath)
+# =============================================================================
 bridge_base = (
     bridge
     .filter(F.col("business_date") == last_biz_date)
@@ -129,31 +87,40 @@ bridge_base = (
     )
 )
 
-acct_inv = (
-    account
+inv_df = (
+    customer
     .filter(
-        (F.col("closed_ind")        == "N") &
-        (F.col("account_type_code") == "IP") &
-        (F.col("source_system_code")== "RN")
+        (F.col("business_date")      == last_biz_date) &
+        (F.col("source_system_code") == "CF")          &
+        (F.coalesce(F.col("deceased_ind"), F.lit("N")) == "N")
     )
     .select(
-        F.col("arrangement_id").alias("ar_arr_id"),
-        F.col("source_system_code").alias("ar_src_code"),
-        F.col("business_date").alias("ar_biz_dt"),
-        F.col("current_balance_amt").alias("balance"),
-        F.col("open_date")
+        F.col("involved_party_id").alias("c_ip_id"),
+        F.col("business_date").alias("c_biz_dt"),
+        F.col("source_system_code").alias("c_src_code"),
+        F.col("rcif_cust_nbr").alias("rcif_nbr"),
+        F.col("cust_internet_banking_nbr")
     )
-)
-
-inv_df = (
-    cust_inv
     .join(bridge_base,
         (F.col("c_ip_id")    == F.col("a2i_ip_id"))  &
         (F.col("c_biz_dt")   == F.col("a2i_biz_dt")) &
         (F.col("c_src_code") == F.col("a2i_src_code")),
         "inner"
     )
-    .join(acct_inv,
+    .join(
+        account
+        .filter(
+            (F.col("closed_ind")        == "N") &
+            (F.col("account_type_code") == "IP") &
+            (F.col("source_system_code")== "RN")
+        )
+        .select(
+            F.col("arrangement_id").alias("ar_arr_id"),
+            F.col("source_system_code").alias("ar_src_code"),
+            F.col("business_date").alias("ar_biz_dt"),
+            F.col("current_balance_amt").alias("ip_balance"),
+            F.col("open_date").alias("ip_open_date")
+        ),
         (F.col("a2i_arr_id")       == F.col("ar_arr_id"))   &
         (F.col("a2i_arr_src_code") == F.col("ar_src_code")) &
         (F.col("a2i_biz_dt")       == F.col("ar_biz_dt")),
@@ -161,19 +128,18 @@ inv_df = (
     )
     .select(
         F.col("rcif_nbr"),
+        F.col("cust_internet_banking_nbr"),
         F.col("c_ip_id").alias("ip_id"),
-        F.col("balance"),
-        F.col("open_date"),
-        F.col("a2i_arr_id").alias("Accounts")
+        F.col("ip_balance"),
+        F.col("ip_open_date"),
+        F.col("a2i_arr_id").alias("ip_accounts_cnt")
     )
 )
 
 # =============================================================================
 # CTE 3 — RC
-# customer → bridge → account (VALID_SOURCE_CODES)
-# group by customer fields, max(rcif_cust_nbr) as RCIF_NUMBER
 # =============================================================================
-cust_rc = (
+rc = (
     customer
     .filter(
         (F.col("business_date")      == last_biz_date) &
@@ -185,32 +151,22 @@ cust_rc = (
         F.col("business_date").alias("c_biz_dt"),
         F.col("source_system_code").alias("c_src_code"),
         F.col("rcif_cust_nbr"),
-        F.col("cust_internet_banking_nbr").alias("ibn"),
-        F.col("involved_party_name"),
-        F.col("involved_party_tax_id_nbr"),
-        F.col("birth_date")
+        F.col("cust_internet_banking_nbr").alias("ibn")
     )
-)
-
-acct_rc = (
-    account
-    .filter(F.col("source_system_code").isin(VALID_SOURCE_CODES))
-    .select(
-        F.col("arrangement_id").alias("ar_arr_id"),
-        F.col("source_system_code").alias("ar_src_code"),
-        F.col("business_date").alias("ar_biz_dt")
-    )
-)
-
-rc = (
-    cust_rc
     .join(bridge_base,
         (F.col("c_ip_id")    == F.col("a2i_ip_id"))  &
         (F.col("c_biz_dt")   == F.col("a2i_biz_dt")) &
         (F.col("c_src_code") == F.col("a2i_src_code")),
         "inner"
     )
-    .join(acct_rc,
+    .join(
+        account
+        .filter(F.col("source_system_code").isin(VALID_SOURCE_CODES))
+        .select(
+            F.col("arrangement_id").alias("ar_arr_id"),
+            F.col("source_system_code").alias("ar_src_code"),
+            F.col("business_date").alias("ar_biz_dt")
+        ),
         (F.col("a2i_arr_id")       == F.col("ar_arr_id"))   &
         (F.col("a2i_arr_src_code") == F.col("ar_src_code")) &
         (F.col("a2i_biz_dt")       == F.col("ar_biz_dt")),
@@ -221,71 +177,44 @@ rc = (
         .filter(F.col("business_date") == last_biz_date)
         .select(
             F.col("involved_party_id").alias("addr_ip_id"),
-            F.col("state_name"),
-            F.col("city_name"),
-            F.col("country_name")
-        ),
+            F.col("state_name")
+        )
+        .dropDuplicates(["addr_ip_id"]),
         F.col("c_ip_id") == F.col("addr_ip_id"),
         "left"
     )
     .groupBy(
         F.col("c_ip_id").alias("involved_party_id"),
         F.col("ibn"),
-        F.col("involved_party_name"),
-        F.col("involved_party_tax_id_nbr"),
-        F.col("birth_date"),
-        F.col("state_name"),
-        F.col("city_name"),
-        F.col("country_name")
+        F.col("state_name")
     )
     .agg(F.max(F.col("rcif_cust_nbr").cast("string")).alias("RCIF_NUMBER"))
 )
 
 # =============================================================================
-# CTE 4 — RCIF_Dig
-# rc LEFT JOIN Dig_Customer c ON rc.ibn = c.reltibn
-# Exact original flag logic — c.* columns (null when no match = not digital)
-# =============================================================================
-# =============================================================================
-# CTE 4 — RCIF_Dig
-# Exact original SQL:
-#   from rc
-#   left join Dig_Customer c on rc.cust_internet_banking_nbr = c.reltibn
-# All flags use c.* columns — null when customer not in digital universe
+# CTE 4 — RCIF_Dig (exact original flag logic)
 # =============================================================================
 rcif_dig = (
     rc
     .join(
-        dig_customer.select(
-            F.col("reltibn"),           # c.reltibn — null check for Digital_flag
-            F.col("ods_business_dt"),   # c.ods_business_Dt — reference date for datediff
-            F.col("lst_login_olb"),     # c.lst_login_olb
-            F.col("lst_login_mob")      # c.lst_login_mob
-        ),
+        dig_customer.select("reltibn", "ods_business_dt", "lst_login_olb", "lst_login_mob"),
         rc["ibn"] == dig_customer["reltibn"],
         "left"
     )
-    # Exact original: datediff(c.ods_business_Dt, c.lst_login_mob) <= 90
     .withColumn("Mobile_Active_Flag",
         F.when(F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90, "Mobile Active")
          .otherwise("Non Mobile Active")
     )
-    # Exact original: c.lst_login_mob is null then Non Mobile User
     .withColumn("Mobile_Flag",
-        F.when(F.col("lst_login_mob").isNull(), "Non Mobile User")
-         .otherwise("Mobile User")
+        F.when(F.col("lst_login_mob").isNull(), "Non Mobile User").otherwise("Mobile User")
     )
-    # Exact original: datediff(c.ods_business_Dt, c.lst_login_olb) <= 90
     .withColumn("OLB_Active_Flag",
         F.when(F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90, "OLB Active")
          .otherwise("Non OLB Active")
     )
-    # Exact original: c.lst_login_olb is null then Non OLB User
     .withColumn("OLB_Flag",
-        F.when(F.col("lst_login_olb").isNull(), "Non OLB User")
-         .otherwise("OLB User")
+        F.when(F.col("lst_login_olb").isNull(), "Non OLB User").otherwise("OLB User")
     )
-    # Exact original: datediff mob <= 90 OR datediff olb <= 90
     .withColumn("Digitally_Active_Flag",
         F.when(
             (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90) |
@@ -293,18 +222,22 @@ rcif_dig = (
             "Digital Active"
         ).otherwise("Non Digital Active")
     )
-    # Exact original: c.reltibn is null then Non Digital User
     .withColumn("Digital_flag",
-        F.when(F.col("reltibn").isNull(), "Non Digital User")
-         .otherwise("Digital User")
+        F.when(F.col("reltibn").isNull(), "Non Digital User").otherwise("Digital User")
+    )
+    .select(
+        "RCIF_NUMBER", "involved_party_id",
+        F.col("ibn").alias("cust_internet_banking_nbr"),
+        "Mobile_Active_Flag", "Mobile_Flag",
+        "OLB_Active_Flag", "OLB_Flag",
+        "Digitally_Active_Flag", "Digital_flag"
     )
 )
 
 # =============================================================================
-# CTE 5 — add_rcifs (RCIF universe last 6 months)
+# CTE 5 — add_rcifs
 # =============================================================================
 six_mo_ago = F.add_months(F.current_date(), -6)
-
 add_rcifs = (
     customer
     .filter(F.col("business_date") >= six_mo_ago)
@@ -321,11 +254,8 @@ add_rcifs = (
 
 # =============================================================================
 # CTE 6 — PW1 (Wealth)
-# customer → bridge → account (WEALTH_SOURCE_CODES, closed=N)
-# Wealth eligibility filter
-# Group by customer + segment → one row per customer per segment
 # =============================================================================
-cust_pw = (
+pw1 = (
     customer
     .filter(
         (F.col("business_date")      == last_biz_date) &
@@ -341,31 +271,24 @@ cust_pw = (
         F.col("private_client_code"),
         F.col("private_client_trust_code")
     )
-)
-
-acct_pw = (
-    account
-    .filter(
-        F.col("source_system_code").isin(WEALTH_SOURCE_CODES) &
-        (F.col("closed_ind") == "N")
-    )
-    .select(
-        F.col("arrangement_id").alias("ar_arr_id"),
-        F.col("source_system_code").alias("ar_src_code"),
-        F.col("business_date").alias("ar_biz_dt"),
-        F.col("business_service_segment_type_code")
-    )
-)
-
-pw1 = (
-    cust_pw
     .join(bridge_base,
         (F.col("c_ip_id")    == F.col("a2i_ip_id"))  &
         (F.col("c_biz_dt")   == F.col("a2i_biz_dt")) &
         (F.col("c_src_code") == F.col("a2i_src_code")),
         "inner"
     )
-    .join(acct_pw,
+    .join(
+        account
+        .filter(
+            F.col("source_system_code").isin(WEALTH_SOURCE_CODES) &
+            (F.col("closed_ind") == "N")
+        )
+        .select(
+            F.col("arrangement_id").alias("ar_arr_id"),
+            F.col("source_system_code").alias("ar_src_code"),
+            F.col("business_date").alias("ar_biz_dt"),
+            F.col("business_service_segment_type_code")
+        ),
         (F.col("a2i_arr_id")       == F.col("ar_arr_id"))   &
         (F.col("a2i_arr_src_code") == F.col("ar_src_code")) &
         (F.col("a2i_biz_dt")       == F.col("ar_biz_dt")),
@@ -429,12 +352,8 @@ pw1 = (
 )
 
 # =============================================================================
-# FINAL — wealth_insights_customer & wealth_insights_account
+# FINAL OUTPUT
 # =============================================================================
-
-# pw1 collapsed to ONE row per RCIF:
-# - Top Business_Group by priority
-# - SUM accts_cnt across all segments → total accounts per customer
 bg_priority = (
     F.when(F.col("Business_Group") == "Private Wealth",        1)
      .when(F.col("Business_Group") == "Institutional Services",2)
@@ -442,6 +361,7 @@ bg_priority = (
      .otherwise(4)
 )
 
+# One row per RCIF — top Business_Group by priority
 pw1_top = (
     pw1
     .withColumn("bg_rank", bg_priority)
@@ -449,114 +369,86 @@ pw1_top = (
         Window.partitionBy("RCIF_NUMBER").orderBy("bg_rank")
     ))
     .filter(F.col("rn") == 1)
-    .select("RCIF_NUMBER", F.col("ip_id").alias("pw_ip_id"),
-            "Business_Group", "division")
+    .select(
+        F.col("RCIF_NUMBER").alias("pw_rcif"),
+        F.col("ip_id").alias("pw_ip_id"),
+        "Business_Group", "division"
+    )
 )
 
-pw1_sums = (
+# SUM accts_cnt across all segments per RCIF
+pw1_accts = (
     pw1
     .groupBy("RCIF_NUMBER")
-    .agg(
-        F.sum("accts_cnt").alias("accts_cnt"),
-        F.sum("Corporate_Trust_Count").alias("Corporate_Trust_Count"),
-        F.sum("Institutional_Trust_Count").alias("Institutional_Trust_Count"),
-        F.sum("Investment_Count").alias("Investment_Count"),
-        F.sum("Insurance_Count").alias("Insurance_Count"),
-        F.sum("PWM_Count").alias("PWM_Count"),
-        F.sum("Trust_Count").alias("Trust_Count"),
-        F.sum("Banking_Count").alias("Banking_Count")
-    )
+    .agg(F.sum("accts_cnt").alias("wealth_accts_cnt"))
 )
 
 pw1_per_rcif = (
     pw1_top
-    .join(pw1_sums, "RCIF_NUMBER", "left")
-    .select(
-        F.col("RCIF_NUMBER").alias("pw_rcif"),
-        "pw_ip_id", "Business_Group", "division", "accts_cnt",
-        "Corporate_Trust_Count", "Institutional_Trust_Count",
-        "Investment_Count", "Insurance_Count",
-        "PWM_Count", "Trust_Count", "Banking_Count"
-    )
+    .join(pw1_accts, pw1_top["pw_rcif"] == pw1_accts["RCIF_NUMBER"], "left")
+    .select("pw_rcif", "pw_ip_id", "Business_Group", "division", "wealth_accts_cnt")
 )
 
 # ── wealth_insights_customer ──────────────────────────────────────────────────
-# Base: rcif_dig filtered to add_rcifs (~7M rows)
-# LEFT JOIN pw1_per_rcif for wealth fields
 wealth_insights_customer = (
     rcif_dig
     .join(add_rcifs,    rcif_dig["RCIF_NUMBER"] == add_rcifs["rcif_number"],  "inner")
     .join(pw1_per_rcif, rcif_dig["RCIF_NUMBER"] == pw1_per_rcif["pw_rcif"],   "left")
+    .withColumn("fact_type",
+        F.when(
+            F.col("Business_Group").isNotNull() & (F.col("Digital_flag") == "Digital User"),
+            "Both"
+        )
+        .when(F.col("Business_Group").isNotNull(), "Wealth")
+        .when(F.col("Digital_flag") == "Digital User", "Digital")
+        .otherwise("Neither")
+    )
     .select(
-        rcif_dig["RCIF_NUMBER"],
+        rcif_dig["RCIF_NUMBER"].alias("rcif_number"),
+        F.col("cust_internet_banking_nbr"),
         F.col("pw_ip_id").alias("ip_id"),
-        rcif_dig["ibn"],
-        F.col("Mobile_Active_Flag"),
-        F.col("Mobile_Flag"),
-        F.col("OLB_Active_Flag"),
-        F.col("OLB_Flag"),
-        F.col("Digitally_Active_Flag"),
-        F.col("Digital_flag"),
-        F.col("Business_Group"),
+        F.col("Business_Group").alias("business_group"),
         F.col("division"),
-        F.col("accts_cnt")
+        F.col("wealth_accts_cnt"),
+        F.col("Mobile_Flag").alias("mobile_flag"),
+        F.col("Mobile_Active_Flag").alias("mobile_active_flag"),
+        F.col("OLB_Flag").alias("olb_flag"),
+        F.col("OLB_Active_Flag").alias("olb_active_flag"),
+        F.col("Digital_flag").alias("digital_flag"),
+        F.col("Digitally_Active_Flag").alias("digital_active_flag"),
+        F.col("fact_type")
     )
     .distinct()
 )
 
 # ── wealth_insights_account ───────────────────────────────────────────────────
-pw1_per_ip = (
-    pw1
-    .withColumn("bg_rank", bg_priority)
-    .withColumn("rn", F.row_number().over(
-        Window.partitionBy("ip_id").orderBy("bg_rank")
-    ))
-    .filter(F.col("rn") == 1)
-    .select(
-        F.col("ip_id").alias("pw_ip_id"),
-        "Business_Group", "division", "accts_cnt",
-        "Corporate_Trust_Count", "Institutional_Trust_Count",
-        "Investment_Count", "Insurance_Count",
-        "PWM_Count", "Trust_Count", "Banking_Count"
-    )
-)
-
-# state_name lookup from rc (one row per ip_id)
-# One row per ip_id — prevents duplicates in account join
-rc_state = (
-    rc
-    .select(
-        F.col("involved_party_id").alias("s_ip_id"),
-        F.col("state_name")
-    )
-    .dropDuplicates(["s_ip_id"])
-)
-
 wealth_insights_account = (
     inv_df
-    .join(pw1_per_ip, inv_df["ip_id"] == pw1_per_ip["pw_ip_id"], "left")
-    .join(rc_state,   inv_df["ip_id"] == rc_state["s_ip_id"],     "left")
+    .join(
+        rc.select(
+            F.col("involved_party_id").alias("s_ip_id"),
+            "state_name"
+        ).dropDuplicates(["s_ip_id"]),
+        inv_df["ip_id"] == F.col("s_ip_id"),
+        "left"
+    )
     .select(
-        F.col("rcif_nbr").alias("RCIF_NUMBER"),
+        F.col("rcif_nbr").alias("rcif_number"),
+        F.col("cust_internet_banking_nbr"),
         inv_df["ip_id"],
-        F.col("balance"),
-        F.col("open_date"),
-        F.col("Accounts").alias("arrangement_id"),
-        F.col("Business_Group"),
-        F.col("division"),
-        F.lit(last_biz_date).alias("business_date"),
-        F.col("accts_cnt"),
+        F.col("ip_balance"),
+        F.col("ip_open_date"),
+        F.col("ip_accounts_cnt"),
         F.col("state_name")
     )
 )
 
-# ── Write tables ──────────────────────────────────────────────────────────────
+# ── Write ─────────────────────────────────────────────────────────────────────
 wealth_insights_customer.write.mode("overwrite").saveAsTable(f"{DEFAULT_DB}.wealth_insights_customer")
 wealth_insights_account.write.mode("overwrite").saveAsTable(f"{DEFAULT_DB}.wealth_insights_account")
 
 print(f"✅ wealth_insights_customer: {wealth_insights_customer.count():,} rows")
 print(f"✅ wealth_insights_account:  {wealth_insights_account.count():,} rows")
-
 
 
 from pyspark.sql import SparkSession, functions as F
@@ -576,88 +468,58 @@ cust = spark.table(f"{DEFAULT_DB}.wealth_insights_customer")
 acct = spark.table(f"{DEFAULT_DB}.wealth_insights_account")
 
 print("=" * 65)
-print("  WEALTH INSIGHTS — DAX VALIDATION")
+print("  WEALTH INSIGHTS — DAX VALIDATION 1-12")
 print("=" * 65)
 
-# ── DAX 1: wealth_customer ────────────────────────────────────────────────────
-# CALCULATE(DISTINCTCOUNT(Wealth[pw1.rcif_number]))
-n1 = cust.filter(F.col("Business_Group").isNotNull()) \
-         .select(F.countDistinct("RCIF_NUMBER")).collect()[0][0]
+n1 = cust.filter(F.col("business_group").isNotNull()) \
+         .select(F.countDistinct("rcif_number")).collect()[0][0]
 print(f"\n[1]  Wealth Customers        (expect ~267,664):  {n1:>10,}")
 
-# ── DAX 2: Digital_Enrollment_Wealth ─────────────────────────────────────────
-# calculate(Wealth[wealth_customer], RCIF[rcif_dig.digital_flag]="Digital User")
-n2 = cust.filter(F.col("Business_Group").isNotNull()) \
-         .filter(F.col("Digital_flag") == "Digital User") \
-         .select(F.countDistinct("RCIF_NUMBER")).collect()[0][0]
+n2 = cust.filter(F.col("business_group").isNotNull()) \
+         .filter(F.col("digital_flag") == "Digital User") \
+         .select(F.countDistinct("rcif_number")).collect()[0][0]
 print(f"[2]  Digital Enrollment      (expect ~123,379):  {n2:>10,}")
 
-# ── DAX 3: Wealth_Digital_Active ─────────────────────────────────────────────
-# INTERSECT Wealth RCIF with Digital where digitally_active_flag="Digital Active"
-n3 = cust.filter(F.col("Business_Group").isNotNull()) \
-         .filter(F.col("Digitally_Active_Flag") == "Digital Active") \
-         .select(F.countDistinct("RCIF_NUMBER")).collect()[0][0]
+n3 = cust.filter(F.col("business_group").isNotNull()) \
+         .filter(F.col("digital_active_flag") == "Digital Active") \
+         .select(F.countDistinct("rcif_number")).collect()[0][0]
 print(f"[3]  Wealth Digital Active   (expect 88k-91k):   {n3:>10,}")
 
-# ── DAX 4: Wealth_OLB_Active ─────────────────────────────────────────────────
-# INTERSECT Wealth RCIF with Digital where olb_active_flag="OLB Active"
-n4 = cust.filter(F.col("Business_Group").isNotNull()) \
-         .filter(F.col("OLB_Active_Flag") == "OLB Active") \
-         .select(F.countDistinct("RCIF_NUMBER")).collect()[0][0]
+n4 = cust.filter(F.col("business_group").isNotNull()) \
+         .filter(F.col("olb_active_flag") == "OLB Active") \
+         .select(F.countDistinct("rcif_number")).collect()[0][0]
 print(f"[4]  Wealth OLB Active       (expect 63k-65k):   {n4:>10,}")
 
-# ── DAX 5: Wealth_MOB_Active ─────────────────────────────────────────────────
-# INTERSECT Wealth RCIF with Digital where mobile_active_flag="Mobile Active"
-n5 = cust.filter(F.col("Business_Group").isNotNull()) \
-         .filter(F.col("Mobile_Active_Flag") == "Mobile Active") \
-         .select(F.countDistinct("RCIF_NUMBER")).collect()[0][0]
+n5 = cust.filter(F.col("business_group").isNotNull()) \
+         .filter(F.col("mobile_active_flag") == "Mobile Active") \
+         .select(F.countDistinct("rcif_number")).collect()[0][0]
 print(f"[5]  Wealth Mobile Active    (expect 59k-61k):   {n5:>10,}")
 
-# ── DAX 6: Wealth_Digitally_Active_Penetration ───────────────────────────────
-# DIVIDE(Wealth_Digital_Active, wealth_customer) ~35%
 pct = round(n3 / n1 * 100, 2) if n1 else 0
 print(f"[6]  Digital Penetration %   (expect ~35%):      {pct:>9.2f}%")
 
-# ── DAX 7: Accounts ──────────────────────────────────────────────────────────
-# COUNT(Wealth[pw1.accts_cnt]) = SUM of all accts across wealth customers ~600k
-n7 = int(cust.filter(F.col("Business_Group").isNotNull())
-             .agg(F.sum("accts_cnt")).collect()[0][0] or 0)
+n7 = int(cust.filter(F.col("business_group").isNotNull())
+             .agg(F.sum("wealth_accts_cnt")).collect()[0][0] or 0)
 print(f"[7]  Total Accounts          (expect ~600k):     {n7:>10,}")
 
-# ── DAX 8: Account_per_user ───────────────────────────────────────────────────
-# [Accounts] / [wealth_customer] ~6.5
 apu = round(n7 / n1, 2) if n1 else 0
 print(f"[8]  Accounts per User       (expect ~6.5):      {apu:>10.2f}")
 
-# ── DAX 9: InvestPath_Customers ──────────────────────────────────────────────
-# DISTINCTCOUNT(InvestPath[ip_id]) ~123
-n9 = acct.select(F.countDistinct("ip_id")).collect()[0][0]
+n9  = acct.select(F.countDistinct("ip_id")).collect()[0][0]
+n10 = acct.select(F.countDistinct("ip_accounts_cnt")).collect()[0][0]
+n11 = acct.filter(F.col("ip_balance") > 0) \
+          .select(F.countDistinct("ip_accounts_cnt")).collect()[0][0]
+aum = float(acct.agg(F.sum("ip_balance")).collect()[0][0] or 0)
+
 print(f"\n[9]  InvestPath Customers    (expect ~123):      {n9:>10,}")
-
-# ── DAX 10: InvestPath_Accounts ──────────────────────────────────────────────
-# DISTINCTCOUNT(InvestPath[accounts]) ~118
-n10 = acct.select(F.countDistinct("arrangement_id")).collect()[0][0]
 print(f"[10] InvestPath Accounts     (expect ~118):      {n10:>10,}")
-
-# ── DAX 11: InvestPath_Accounts_Funded ───────────────────────────────────────
-# FILTER InvestPath balance > 0 ~108
-n11 = acct.filter(F.col("balance") > 0) \
-          .select(F.countDistinct("arrangement_id")).collect()[0][0]
 print(f"[11] IP Funded Accounts      (expect ~108):      {n11:>10,}")
-
-# ── DAX 12: AUM ──────────────────────────────────────────────────────────────
-# SUM(InvestPath[balance]) ~$1.83M
-aum = float(acct.agg(F.sum("balance")).collect()[0][0] or 0)
 print(f"[12] AUM                     (expect ~$1.83M):   ${aum/1e6:>9.2f}M")
 
-# ── Bonus: Avg Balance (from your notes) ─────────────────────────────────────
-avg = round(aum / n10, 2) if n10 else 0
-print(f"     Avg Balance/IP Acct     (expect $15k-18k):  ${avg:>9,.2f}")
-
 print("\n" + "=" * 65)
-print("  BUSINESS GROUP BREAKDOWN")
+print("  BUSINESS GROUP")
 print("=" * 65)
-cust.filter(F.col("Business_Group").isNotNull()) \
-    .groupBy("Business_Group") \
-    .agg(F.countDistinct("RCIF_NUMBER").alias("Customers")) \
+cust.filter(F.col("business_group").isNotNull()) \
+    .groupBy("business_group") \
+    .agg(F.countDistinct("rcif_number").alias("Customers")) \
     .orderBy(F.desc("Customers")).show(truncate=False)
