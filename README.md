@@ -102,9 +102,8 @@ inv_df = (
         F.col("cust_internet_banking_nbr")
     )
     .join(bridge_base,
-        (F.col("c_ip_id")    == F.col("a2i_ip_id"))  &
-        (F.col("c_biz_dt")   == F.col("a2i_biz_dt")) &
-        (F.col("c_src_code") == F.col("a2i_src_code")),
+        (F.col("c_ip_id")  == F.col("a2i_ip_id")) &
+        (F.col("c_biz_dt") == F.col("a2i_biz_dt")),
         "inner"
     )
     .join(
@@ -208,14 +207,14 @@ rcif_dig = (
         "left"
     )
     .withColumn("Mobile_Active_Flag",
-        F.when(F.datediff(F.current_date(), F.col("lst_login_mob")) <= 90, "Mobile Active")
+        F.when(F.datediff(F.lit(END_DT).cast("date"), F.col("lst_login_mob")) <= 90, "Mobile Active")
          .otherwise("Non Mobile Active")
     )
     .withColumn("Mobile_Flag",
         F.when(F.col("lst_login_mob").isNull(), "Non Mobile User").otherwise("Mobile User")
     )
     .withColumn("OLB_Active_Flag",
-        F.when(F.datediff(F.current_date(), F.col("lst_login_olb")) <= 90, "OLB Active")
+        F.when(F.datediff(F.lit(END_DT).cast("date"), F.col("lst_login_olb")) <= 90, "OLB Active")
          .otherwise("Non OLB Active")
     )
     .withColumn("OLB_Flag",
@@ -223,8 +222,8 @@ rcif_dig = (
     )
     .withColumn("Digitally_Active_Flag",
         F.when(
-            (F.datediff(F.current_date(), F.col("lst_login_mob")) <= 90) |
-            (F.datediff(F.current_date(), F.col("lst_login_olb")) <= 90),
+            (F.datediff(F.lit(END_DT).cast("date"), F.col("lst_login_mob")) <= 90) |
+            (F.datediff(F.lit(END_DT).cast("date"), F.col("lst_login_olb")) <= 90),
             "Digital Active"
         ).otherwise("Non Digital Active")
     )
