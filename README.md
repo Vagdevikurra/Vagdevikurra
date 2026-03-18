@@ -196,7 +196,7 @@ rc = (
 # =============================================================================
 dig_customer_sel = dig_customer.select(
     F.col("ibn").alias("dig_ibn"),
-    F.col("ods_business_dt"),
+    F.col("ods_business_dt").alias("dig_snap_dt"),
     F.col("lst_login_olb"),
     F.col("lst_login_mob")
 )
@@ -209,14 +209,14 @@ rcif_dig = (
         "left"
     )
     .withColumn("Mobile_Active_Flag",
-        F.when(F.datediff(F.lit(END_DT).cast("date"), F.col("lst_login_mob")) <= 90, "Mobile Active")
+        F.when(F.datediff(F.col("dig_snap_dt"), F.col("lst_login_mob")) <= 90, "Mobile Active")
          .otherwise("Non Mobile Active")
     )
     .withColumn("Mobile_Flag",
         F.when(F.col("lst_login_mob").isNull(), "Non Mobile User").otherwise("Mobile User")
     )
     .withColumn("OLB_Active_Flag",
-        F.when(F.datediff(F.lit(END_DT).cast("date"), F.col("lst_login_olb")) <= 90, "OLB Active")
+        F.when(F.datediff(F.col("dig_snap_dt"), F.col("lst_login_olb")) <= 90, "OLB Active")
          .otherwise("Non OLB Active")
     )
     .withColumn("OLB_Flag",
@@ -224,8 +224,8 @@ rcif_dig = (
     )
     .withColumn("Digitally_Active_Flag",
         F.when(
-            (F.datediff(F.lit(END_DT).cast("date"), F.col("lst_login_mob")) <= 90) |
-            (F.datediff(F.lit(END_DT).cast("date"), F.col("lst_login_olb")) <= 90),
+            (F.datediff(F.col("dig_snap_dt"), F.col("lst_login_mob")) <= 90) |
+            (F.datediff(F.col("dig_snap_dt"), F.col("lst_login_olb")) <= 90),
             "Digital Active"
         ).otherwise("Non Digital Active")
     )
@@ -235,7 +235,6 @@ rcif_dig = (
     .select(
         "RCIF_NUMBER", "involved_party_id",
         F.col("ibn").alias("cust_internet_banking_nbr"),
-        "ods_business_dt",
         "Mobile_Active_Flag", "Mobile_Flag",
         "OLB_Active_Flag", "OLB_Flag",
         "Digitally_Active_Flag", "Digital_flag"
