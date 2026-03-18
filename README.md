@@ -232,6 +232,7 @@ rcif_dig = (
     .select(
         "RCIF_NUMBER", "involved_party_id",
         F.col("ibn").alias("cust_internet_banking_nbr"),
+        "ods_business_dt",
         "Mobile_Active_Flag", "Mobile_Flag",
         "OLB_Active_Flag", "OLB_Flag",
         "Digitally_Active_Flag", "Digital_flag"
