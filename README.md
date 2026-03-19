@@ -50,20 +50,18 @@ BANKING_SOURCE_CODES = [
 # Original: WHERE ods_business_dt = max(ods_business_dt)
 # Pinned to <= END_DT so we get Feb snapshot not March
 # =============================================================================
-# Single latest snapshot date <= END_DT (Feb 28)
-max_dig_dt = (
-    digital
-    .filter(F.col("ods_business_dt") <= END_DT)
-    .agg(F.max("ods_business_dt"))
-    .collect()[0][0]
-)
-
+# 6 monthly snapshots Sep 2025 → Feb 2026
+# digital_banking_master has one snapshot per month
+# Group by ibn + ods_business_dt gives one row per customer per month
 dig_customer = (
     digital
-    .filter(F.col("ods_business_dt") == max_dig_dt)
+    .filter(
+        (F.col("ods_business_dt") >= START_DT) &
+        (F.col("ods_business_dt") <= END_DT)
+    )
     .groupBy(
         F.col("ibn"),
-        F.col("ods_business_dt")
+        F.last_day(F.col("ods_business_dt").cast("date")).alias("ods_business_dt")
     )
     .agg(
         F.max("olb_last_login_date").alias("lst_login_olb"),
@@ -204,7 +202,7 @@ rc = (
 # =============================================================================
 dig_customer_sel = dig_customer.select(
     F.col("ibn").alias("dig_ibn"),
-    F.col("ods_business_dt").alias("dig_snap_dt"),
+    F.col("ods_business_dt"),
     F.col("lst_login_olb"),
     F.col("lst_login_mob")
 )
@@ -217,14 +215,14 @@ rcif_dig = (
         "left"
     )
     .withColumn("Mobile_Active_Flag",
-        F.when(F.datediff(F.col("dig_snap_dt"), F.col("lst_login_mob")) <= 90, "Mobile Active")
+        F.when(F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90, "Mobile Active")
          .otherwise("Non Mobile Active")
     )
     .withColumn("Mobile_Flag",
         F.when(F.col("lst_login_mob").isNull(), "Non Mobile User").otherwise("Mobile User")
     )
     .withColumn("OLB_Active_Flag",
-        F.when(F.datediff(F.col("dig_snap_dt"), F.col("lst_login_olb")) <= 90, "OLB Active")
+        F.when(F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90, "OLB Active")
          .otherwise("Non OLB Active")
     )
     .withColumn("OLB_Flag",
@@ -232,8 +230,8 @@ rcif_dig = (
     )
     .withColumn("Digitally_Active_Flag",
         F.when(
-            (F.datediff(F.col("dig_snap_dt"), F.col("lst_login_mob")) <= 90) |
-            (F.datediff(F.col("dig_snap_dt"), F.col("lst_login_olb")) <= 90),
+            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_mob")) <= 90) |
+            (F.datediff(F.col("ods_business_dt"), F.col("lst_login_olb")) <= 90),
             "Digital Active"
         ).otherwise("Non Digital Active")
     )
@@ -243,6 +241,7 @@ rcif_dig = (
     .select(
         "RCIF_NUMBER", "involved_party_id",
         F.col("ibn").alias("cust_internet_banking_nbr"),
+        "ods_business_dt",
         "Mobile_Active_Flag", "Mobile_Flag",
         "OLB_Active_Flag", "OLB_Flag",
         "Digitally_Active_Flag", "Digital_flag"
@@ -370,19 +369,7 @@ pw1 = (
 # FINAL OUTPUT
 # =============================================================================
 
-# ── Date Spine: 6 month-end dates (Sep 2025 → Feb 2026) ──────────────────────
-month_ends = [
-    "2025-09-30",
-    "2025-10-31",
-    "2025-11-30",
-    "2025-12-31",
-    "2026-01-31",
-    "2026-02-28"
-]
-date_spine = spark.createDataFrame(
-    [(d,) for d in month_ends],
-    ["ods_business_dt"]
-)
+
 bg_priority = (
     F.when(F.col("Business_Group") == "Private Wealth",        1)
      .when(F.col("Business_Group") == "Institutional Services",2)
@@ -423,7 +410,6 @@ wealth_insights_customer = (
     rcif_dig
     .join(add_rcifs,    rcif_dig["RCIF_NUMBER"] == add_rcifs["rcif_number"],  "inner")
     .join(pw1_per_rcif, rcif_dig["RCIF_NUMBER"] == pw1_per_rcif["pw_rcif"],   "left")
-    .crossJoin(date_spine)
     .withColumn("fact_type",
         F.when(
             F.col("Business_Group").isNotNull() & (F.col("Digital_flag") == "Digital User"),
@@ -447,7 +433,7 @@ wealth_insights_customer = (
         F.col("Digital_flag").alias("digital_flag"),
         F.col("Digitally_Active_Flag").alias("digital_active_flag"),
         F.col("fact_type"),
-        F.col("ods_business_dt")   # month-end anchor date (Sep-Feb)
+        F.col("ods_business_dt")
     )
     .distinct()
 )
