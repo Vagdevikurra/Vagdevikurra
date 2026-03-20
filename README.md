@@ -1,6 +1,6 @@
 from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.window import Window
-from pyspark import SparkConf
+from pyspark import SparkConf, StorageLevel
 
 # ── Configuration ────────────────────────────────────────────────────────────────
 DEFAULT_DB = "dm_ib_dev"
@@ -275,9 +275,10 @@ if DEBUG:
 
 # ── 4) INVESTPATH (RN + IP) — arrangement grain, monthly as-of ──────────────────
 # Simplified: join directly on month_ends dates (same approach as wealth_arr).
-# This avoids the expensive snap sub-queries that were causing OOM.
-spark.sql(f"""
-    CREATE OR REPLACE TEMP VIEW investpath_arr AS
+# Persist to DISK_ONLY — too large for memory cache but we need it for both
+# the RCIF agg and the account-level output table.
+
+investpath_df = spark.sql(f"""
     SELECT
         CAST(ind.business_date AS date)                            AS business_date,
         CAST(ind.rcif_cust_nbr AS STRING)                          AS rcif_number,
@@ -305,10 +306,10 @@ spark.sql(f"""
       AND ar.closed_ind              = 'N'
       AND {primary_owner_pred}
 """)
-
-# Cache investpath_arr to cut lineage before aggregation
-spark.sql("CACHE TABLE investpath_arr")
-_ = spark.sql("SELECT COUNT(*) FROM investpath_arr").collect()
+investpath_df.persist(StorageLevel.DISK_ONLY)
+investpath_cnt = investpath_df.count()
+investpath_df.createOrReplaceTempView("investpath_arr")
+print(f"[INFO] investpath_arr persisted to disk: {investpath_cnt:,} rows")
 
 # RCIF-level aggregate for the customer-table join
 spark.sql(f"""
@@ -326,9 +327,8 @@ spark.sql(f"""
 """)
 
 if DEBUG:
-    print("\n[4] investpath_arr / investpath_agg samples:")
-    spark.sql("SELECT * FROM investpath_arr  LIMIT 5").show(truncate=False)
-    spark.sql("SELECT * FROM investpath_agg  LIMIT 5").show(truncate=False)
+    print("\n[4] investpath_agg sample:")
+    spark.sql("SELECT * FROM investpath_agg LIMIT 5").show(truncate=False)
 
 
 # ── 5) DIGITAL monthly ──────────────────────────────────────────────────────────
@@ -564,10 +564,14 @@ print(f"\nSaved {DEFAULT_DB}.wealth_insights_cust")
 print(f"Saved {DEFAULT_DB}.wealth_insights_acct")
 
 # Cleanup cached tables
-for t in ["month_ends", "wealth_agg", "investpath_arr", "digital_monthly"]:
+for t in ["month_ends", "wealth_agg", "digital_monthly"]:
     try:
         spark.sql(f"UNCACHE TABLE IF EXISTS {t}")
     except Exception:
         pass
+try:
+    investpath_df.unpersist()
+except Exception:
+    pass
 
 print("DONE.")
