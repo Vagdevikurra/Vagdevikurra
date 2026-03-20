@@ -1,6 +1,6 @@
 from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.window import Window
-from pyspark import SparkConf, StorageLevel
+from pyspark import SparkConf
 
 # ── Configuration ────────────────────────────────────────────────────────────────
 DEFAULT_DB = "dm_ib_dev"
@@ -17,7 +17,7 @@ WEALTH_SRC_LIST = [
 
 APPLY_PRIMARY_OWNER_FILTER = False
 IP_FUNDED_BALANCE_THRESHOLD = 0.0
-DEBUG = True
+DEBUG = False   # diagnostics done — turn off to reduce memory pressure
 
 conf = (
     SparkConf()
@@ -274,10 +274,9 @@ if DEBUG:
 
 # ── 4) INVESTPATH (RN + IP) — arrangement grain, monthly as-of ──────────────────
 # Simplified: join directly on month_ends dates (same approach as wealth_arr).
-# Persist to DISK_ONLY — too large for memory cache but we need it for both
-# the RCIF agg and the account-level output table.
-
-investpath_df = spark.sql(f"""
+# Register as view only — account table uses its own fresh SQL query
+spark.sql(f"""
+    CREATE OR REPLACE TEMP VIEW investpath_arr AS
     SELECT
         CAST(ind.business_date AS date)                            AS business_date,
         CAST(ind.rcif_cust_nbr AS STRING)                          AS rcif_number,
@@ -305,10 +304,6 @@ investpath_df = spark.sql(f"""
       AND ar.closed_ind              = 'N'
       AND {primary_owner_pred}
 """)
-investpath_df.persist(StorageLevel.DISK_ONLY)
-investpath_cnt = investpath_df.count()
-investpath_df.createOrReplaceTempView("investpath_arr")
-print(f"[INFO] investpath_arr persisted to disk: {investpath_cnt:,} rows")
 
 # RCIF-level aggregate for the customer-table join
 spark.sql(f"""
@@ -523,18 +518,15 @@ if DEBUG:
 
 
 # ══════════════════════════════════════════════════════════════════════════════════
-# WRITE TABLES — customer first (small), then account (large)
+# WRITE TABLES
 # ══════════════════════════════════════════════════════════════════════════════════
+print("\n[WRITE] Starting table writes ...")
 TARGET_WRITE_PARTITIONS = 32
 MAX_RECORDS_PER_FILE    = 1_000_000
 
-# -- 9a) Customer table (write immediately — small, fast)
+# -- 9a) Customer table
 print("\n[9a] Writing customer table ...")
-cust_df = spark.table("wealth_insights_cust")
-_ = cust_df.cache().count()
-print(f"[INFO] wealth_insights_cust rows: {_:,}")
-cust_df = cust_df.coalesce(TARGET_WRITE_PARTITIONS)
-
+cust_df = spark.table("wealth_insights_cust").coalesce(TARGET_WRITE_PARTITIONS)
 (cust_df.write
     .mode("overwrite")
     .option("maxRecordsPerFile", MAX_RECORDS_PER_FILE)
@@ -542,46 +534,74 @@ cust_df = cust_df.coalesce(TARGET_WRITE_PARTITIONS)
 )
 print(f"[OK] Saved {DEFAULT_DB}.wealth_insights_cust")
 
-
-# -- 9b) Account table (larger — uses investpath_df which is DISK_ONLY persisted)
-print("\n[9b] Writing account table ...")
-try:
-    # Build account DF directly from the persisted investpath_df to avoid
-    # re-reading the lazy view through Spark SQL (which can lose the persist).
-    addr_df = spark.table("rcif_address")
-
-    acct_df = (
-        investpath_df
-        .join(addr_df, on="ip_id", how="left")
-        .withColumn("ip_accounts_cnt",
-                     F.count("ip_account_id").over(
-                         Window.partitionBy("business_date", "rcif_number")))
-    )
-    acct_cnt = acct_df.count()
-    print(f"[INFO] wealth_insights_acct rows: {acct_cnt:,}")
-    acct_df = acct_df.coalesce(TARGET_WRITE_PARTITIONS)
-
-    (acct_df.write
-        .mode("overwrite")
-        .option("maxRecordsPerFile", MAX_RECORDS_PER_FILE)
-        .saveAsTable(f"{DEFAULT_DB}.wealth_insights_acct")
-    )
-    print(f"[OK] Saved {DEFAULT_DB}.wealth_insights_acct")
-except Exception as e:
-    print(f"[ERROR] Account table write failed: {e}")
-    print("[INFO] Customer table was already saved successfully.")
-
-
-# Cleanup
-for t in ["month_ends", "wealth_agg", "digital_monthly"]:
+# Free everything before account write to avoid OOM
+for t in ["wealth_agg", "digital_monthly"]:
     try:
         spark.sql(f"UNCACHE TABLE IF EXISTS {t}")
     except Exception:
         pass
+
+# -- 9b) Account table — fresh SQL query (no dependency on persisted DF)
+print("\n[9b] Writing account table ...")
+spark.sql(f"""
+    CREATE OR REPLACE TEMP VIEW wealth_insights_acct AS
+    SELECT
+        ip.business_date,
+        ip.rcif_number,
+        ip.cust_internet_banking_nbr,
+        ip.ip_id,
+        ip.ip_balance,
+        ip.ip_open_date,
+        ip.ip_accounts_cnt,
+        addr.state_name
+    FROM (
+        SELECT
+            CAST(ind.business_date AS date)                        AS business_date,
+            CAST(ind.rcif_cust_nbr AS STRING)                      AS rcif_number,
+            ind.cust_internet_banking_nbr,
+            ind.involved_party_id                                  AS ip_id,
+            CONCAT_WS('|', ar.source_system_code,
+                       CAST(ar.arrangement_id AS STRING))           AS ip_account_id,
+            CAST(COALESCE(ar.current_balance_amt, 0.0) AS DOUBLE) AS ip_balance,
+            CAST(ar.open_date AS DATE)                             AS ip_open_date,
+            COUNT(*) OVER (
+                PARTITION BY CAST(ind.business_date AS date),
+                             CAST(ind.rcif_cust_nbr AS STRING)
+            ) AS ip_accounts_cnt
+        FROM {EIL_DB}.d_involved_party_h ind
+        JOIN month_ends d
+            ON CAST(ind.business_date AS date) = d.business_date
+        JOIN {EIL_DB}.d_arrangement_to_involved_party_relationship_h a2i
+            ON  ind.involved_party_id   = a2i.involved_party_id
+            AND ind.business_date       = a2i.business_date
+            AND ind.source_system_code  = a2i.source_system_code
+        JOIN {EIL_DB}.d_arrangement_h ar
+            ON  a2i.arrangement_id                 = ar.arrangement_id
+            AND a2i.arrangement_source_system_code = ar.source_system_code
+            AND a2i.business_date                  = ar.business_date
+        WHERE ind.source_system_code     = 'CF'
+          AND NVL(ind.deceased_ind, 'N') = 'N'
+          AND ar.source_system_code      = 'RN'
+          AND ar.account_type_code       = 'IP'
+          AND ar.closed_ind              = 'N'
+          AND {primary_owner_pred}
+    ) ip
+    LEFT JOIN rcif_address addr
+        ON ip.ip_id = addr.ip_id
+""")
+
+acct_df = spark.table("wealth_insights_acct").coalesce(TARGET_WRITE_PARTITIONS)
+(acct_df.write
+    .mode("overwrite")
+    .option("maxRecordsPerFile", MAX_RECORDS_PER_FILE)
+    .saveAsTable(f"{DEFAULT_DB}.wealth_insights_acct")
+)
+print(f"[OK] Saved {DEFAULT_DB}.wealth_insights_acct")
+
+# Cleanup
 try:
-    investpath_df.unpersist()
-    cust_df.unpersist()
+    spark.sql("UNCACHE TABLE IF EXISTS month_ends")
 except Exception:
     pass
 
-print("DONE.")
+print("\nDONE.")
