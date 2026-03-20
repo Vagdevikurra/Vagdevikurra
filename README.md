@@ -444,103 +444,96 @@ spark.sql("""
 """)
 
 if DEBUG:
-    print("\n[7] wealth_insights_cust sample:")
-    spark.sql("""
-        SELECT business_date, rcif_number, business_group, division,
-               wealth_accts_cnt, digital_flag, digital_active_flag, fact_type
-          FROM wealth_insights_cust
-         ORDER BY business_date, rcif_number
-         LIMIT 20
-    """).show(truncate=False)
+    try:
+        print("\n[7] wealth_insights_cust — flag distribution:")
+        spark.sql("""
+            SELECT business_date,
+                   COUNT(DISTINCT rcif_number) AS wealth_customers,
+                   COUNT(DISTINCT CASE WHEN digital_flag        = 'Digital User'    THEN rcif_number END) AS digital_enrolled,
+                   COUNT(DISTINCT CASE WHEN digital_active_flag = 'Digital Active'  THEN rcif_number END) AS digital_active,
+                   COUNT(DISTINCT CASE WHEN olb_active_flag     = 'OLB Active'      THEN rcif_number END) AS olb_active,
+                   COUNT(DISTINCT CASE WHEN mobile_active_flag  = 'Mobile Active'   THEN rcif_number END) AS mobile_active
+              FROM wealth_insights_cust
+             GROUP BY business_date
+             ORDER BY business_date
+        """).show(truncate=False)
 
-    print("\n[7] wealth_insights_cust — flag distribution (latest month):")
-    spark.sql("""
-        SELECT business_date,
-               COUNT(DISTINCT rcif_number) AS wealth_customers,
-               COUNT(DISTINCT CASE WHEN digital_flag        = 'Digital User'    THEN rcif_number END) AS digital_enrolled,
-               COUNT(DISTINCT CASE WHEN digital_active_flag = 'Digital Active'  THEN rcif_number END) AS digital_active,
-               COUNT(DISTINCT CASE WHEN olb_active_flag     = 'OLB Active'      THEN rcif_number END) AS olb_active,
-               COUNT(DISTINCT CASE WHEN mobile_active_flag  = 'Mobile Active'   THEN rcif_number END) AS mobile_active
-          FROM wealth_insights_cust
-         GROUP BY business_date
-         ORDER BY business_date
-    """).show(truncate=False)
+        # Delta check vs Power BI reference
+        print("\n[7b] Delta vs Power BI reference (positive = we're over):")
+        ref_data = [
+            ("2025-10-31", 64385, 59359, 89061),
+            ("2025-11-28", 64489, 59812, 89507),
+            ("2025-12-31", 64598, 60220, 89928),
+            ("2026-01-30", 65088, 60577, 90451),
+            ("2026-02-27", 65767, 60799, 91034),
+        ]
+        our = spark.sql("""
+            SELECT business_date,
+                   COUNT(DISTINCT CASE WHEN olb_active_flag     = 'OLB Active'     THEN rcif_number END) AS olb,
+                   COUNT(DISTINCT CASE WHEN mobile_active_flag  = 'Mobile Active'  THEN rcif_number END) AS mob,
+                   COUNT(DISTINCT CASE WHEN digital_active_flag = 'Digital Active' THEN rcif_number END) AS dig
+              FROM wealth_insights_cust
+             WHERE business_date >= '2025-10-01'
+             GROUP BY business_date ORDER BY business_date
+        """).collect()
+        our_map = {str(r["business_date"]): r for r in our}
+        print(f"{'month':>12}  {'olb_delta':>10}  {'mob_delta':>10}  {'dig_delta':>10}")
+        for dt, ref_olb, ref_mob, ref_dig in ref_data:
+            r = our_map.get(dt)
+            if r:
+                print(f"{dt:>12}  {r['olb']-ref_olb:>+10,}  {r['mob']-ref_mob:>+10,}  {r['dig']-ref_dig:>+10,}")
 
-    # ── Quick delta check vs Power BI reference ──
-    print("\n[7b] Delta vs Power BI reference (positive = we're over):")
-    ref_data = [
-        ("2025-10-31", 64385, 59359, 89061),
-        ("2025-11-28", 64489, 59812, 89507),
-        ("2025-12-31", 64598, 60220, 89928),
-        ("2026-01-30", 65088, 60577, 90451),
-        ("2026-02-27", 65767, 60799, 91034),
-    ]
-    our = spark.sql("""
-        SELECT business_date,
-               COUNT(DISTINCT CASE WHEN olb_active_flag     = 'OLB Active'     THEN rcif_number END) AS olb,
-               COUNT(DISTINCT CASE WHEN mobile_active_flag  = 'Mobile Active'  THEN rcif_number END) AS mob,
-               COUNT(DISTINCT CASE WHEN digital_active_flag = 'Digital Active' THEN rcif_number END) AS dig
-          FROM wealth_insights_cust
-         WHERE business_date >= '2025-10-01'
-         GROUP BY business_date ORDER BY business_date
-    """).collect()
-    our_map = {str(r["business_date"]): r for r in our}
-    print(f"{'month':>12}  {'olb_delta':>10}  {'mob_delta':>10}  {'dig_delta':>10}")
-    for dt, ref_olb, ref_mob, ref_dig in ref_data:
-        r = our_map.get(dt)
-        if r:
-            print(f"{dt:>12}  {r['olb']-ref_olb:>+10,}  {r['mob']-ref_mob:>+10,}  {r['dig']-ref_dig:>+10,}")
-        else:
-            print(f"{dt:>12}  {'no data':>10}  {'no data':>10}  {'no data':>10}")
+        # ── Diagnostic: check if wealth_agg has duplicate RCIFs ──
+        print("\n[7c] Duplicate check — wealth_agg rows vs distinct RCIFs:")
+        spark.sql("""
+            SELECT business_date,
+                   COUNT(*)                    AS total_rows,
+                   COUNT(DISTINCT rcif_number) AS distinct_rcifs
+              FROM wealth_agg
+             GROUP BY business_date ORDER BY business_date
+        """).show(truncate=False)
 
+        # ── Diagnostic: Power BI-style INTERSECT approach (rcif-only, no ibn) ──
+        print("\n[7d] Power BI-style count (RCIF-only intersect, no ibn constraint):")
+        spark.sql(f"""
+            SELECT w.business_date,
+                   COUNT(DISTINCT CASE WHEN d.olb_active_flag     = 'OLB Active'    THEN w.rcif_number END) AS olb_active_rcif,
+                   COUNT(DISTINCT CASE WHEN d.mob_active_flag     = 'Mobile Active'  THEN w.rcif_number END) AS mob_active_rcif,
+                   COUNT(DISTINCT CASE WHEN d.digital_active_flag = 'Digital Active' THEN w.rcif_number END) AS dig_active_rcif
+              FROM wealth_agg w
+              INNER JOIN (
+                  SELECT rcif_number, month_dt,
+                         MAX(CASE WHEN last_olb IS NOT NULL AND datediff(ods_dt, last_olb) <= 90
+                                  THEN 'OLB Active' ELSE 'Non OLB Active' END) AS olb_active_flag,
+                         MAX(CASE WHEN last_mob IS NOT NULL AND datediff(ods_dt, last_mob) <= 90
+                                  THEN 'Mobile Active' ELSE 'Non Mobile Active' END) AS mob_active_flag,
+                         MAX(CASE WHEN (last_mob IS NOT NULL AND datediff(ods_dt, last_mob) <= 90)
+                                    OR (last_olb IS NOT NULL AND datediff(ods_dt, last_olb) <= 90)
+                                  THEN 'Digital Active' ELSE 'Non Digital Active' END) AS digital_active_flag
+                    FROM digital_monthly
+                   GROUP BY rcif_number, month_dt
+              ) d
+                ON  w.rcif_number = d.rcif_number
+                AND TRUNC(w.business_date, 'MM') = d.month_dt
+             GROUP BY w.business_date
+             ORDER BY w.business_date
+        """).show(truncate=False)
 
-# ── 8) Account Table — wealth_insights_acct ─────────────────────────────────────
-# Grain: (business_date, rcif_number, ip_account_id) — one row per IP account per
-# month.  ip_accounts_cnt is the customer-level total (repeated on each row).
-
-spark.sql("""
-    CREATE OR REPLACE TEMP VIEW wealth_insights_acct AS
-    SELECT
-        ip.business_date,
-        ip.rcif_number,
-        ip.cust_internet_banking_nbr,
-        ip.ip_id,
-        ip.ip_balance,
-        ip.ip_open_date,
-        agg.ip_accounts_cnt,
-        addr.state_name
-    FROM investpath_arr ip
-    JOIN investpath_agg agg
-        ON  ip.business_date = agg.business_date
-        AND ip.rcif_number   = agg.rcif_number
-    LEFT JOIN rcif_address addr
-        ON ip.ip_id = addr.ip_id
-""")
-
-if DEBUG:
-    print("\n[8] wealth_insights_acct sample:")
-    spark.sql("SELECT * FROM wealth_insights_acct LIMIT 10").show(truncate=False)
-
-    print("\n[8] wealth_insights_acct — summary (latest month):")
-    spark.sql("""
-        SELECT business_date,
-               COUNT(DISTINCT ip_id)  AS ip_customers,
-               COUNT(*)              AS ip_accounts,
-               SUM(ip_balance)       AS aum,
-               SUM(ip_balance) / NULLIF(COUNT(*), 0) AS avg_balance
-          FROM wealth_insights_acct
-         GROUP BY business_date
-         ORDER BY business_date
-    """).show(truncate=False)
+    except Exception as e:
+        print(f"[WARN] Debug queries failed: {e}")
 
 
-# ── 9) Write Tables ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════════
+# WRITE TABLES — customer first (small), then account (large)
+# ══════════════════════════════════════════════════════════════════════════════════
 TARGET_WRITE_PARTITIONS = 32
 MAX_RECORDS_PER_FILE    = 1_000_000
 
-# -- Customer table
+# -- 9a) Customer table (write immediately — small, fast)
+print("\n[9a] Writing customer table ...")
 cust_df = spark.table("wealth_insights_cust")
-_ = cust_df.cache().count()                       # materialise to cut lineage
+_ = cust_df.cache().count()
+print(f"[INFO] wealth_insights_cust rows: {_:,}")
 cust_df = cust_df.coalesce(TARGET_WRITE_PARTITIONS)
 
 (cust_df.write
@@ -548,22 +541,39 @@ cust_df = cust_df.coalesce(TARGET_WRITE_PARTITIONS)
     .option("maxRecordsPerFile", MAX_RECORDS_PER_FILE)
     .saveAsTable(f"{DEFAULT_DB}.wealth_insights_cust")
 )
+print(f"[OK] Saved {DEFAULT_DB}.wealth_insights_cust")
 
-# -- Account table
-acct_df = spark.table("wealth_insights_acct")
-_ = acct_df.cache().count()
-acct_df = acct_df.coalesce(TARGET_WRITE_PARTITIONS)
 
-(acct_df.write
-    .mode("overwrite")
-    .option("maxRecordsPerFile", MAX_RECORDS_PER_FILE)
-    .saveAsTable(f"{DEFAULT_DB}.wealth_insights_acct")
-)
+# -- 9b) Account table (larger — uses investpath_df which is DISK_ONLY persisted)
+print("\n[9b] Writing account table ...")
+try:
+    # Build account DF directly from the persisted investpath_df to avoid
+    # re-reading the lazy view through Spark SQL (which can lose the persist).
+    addr_df = spark.table("rcif_address")
 
-print(f"\nSaved {DEFAULT_DB}.wealth_insights_cust")
-print(f"Saved {DEFAULT_DB}.wealth_insights_acct")
+    acct_df = (
+        investpath_df
+        .join(addr_df, on="ip_id", how="left")
+        .withColumn("ip_accounts_cnt",
+                     F.count("ip_account_id").over(
+                         Window.partitionBy("business_date", "rcif_number")))
+    )
+    acct_cnt = acct_df.count()
+    print(f"[INFO] wealth_insights_acct rows: {acct_cnt:,}")
+    acct_df = acct_df.coalesce(TARGET_WRITE_PARTITIONS)
 
-# Cleanup cached tables
+    (acct_df.write
+        .mode("overwrite")
+        .option("maxRecordsPerFile", MAX_RECORDS_PER_FILE)
+        .saveAsTable(f"{DEFAULT_DB}.wealth_insights_acct")
+    )
+    print(f"[OK] Saved {DEFAULT_DB}.wealth_insights_acct")
+except Exception as e:
+    print(f"[ERROR] Account table write failed: {e}")
+    print("[INFO] Customer table was already saved successfully.")
+
+
+# Cleanup
 for t in ["month_ends", "wealth_agg", "digital_monthly"]:
     try:
         spark.sql(f"UNCACHE TABLE IF EXISTS {t}")
@@ -571,6 +581,7 @@ for t in ["month_ends", "wealth_agg", "digital_monthly"]:
         pass
 try:
     investpath_df.unpersist()
+    cust_df.unpersist()
 except Exception:
     pass
 
