@@ -17,7 +17,7 @@ WEALTH_SRC_LIST = [
 
 APPLY_PRIMARY_OWNER_FILTER = False
 IP_FUNDED_BALANCE_THRESHOLD = 0.0
-DEBUG = False
+DEBUG = True
 
 conf = (
     SparkConf()
@@ -382,94 +382,28 @@ if DEBUG:
 
 # ── 5) DIGITAL monthly ──────────────────────────────────────────────────────────
 # NOTE: digital_banking_master uses column `ibn` (not reltibn).
+# We aggregate per (month, rcif, ibn) so we can later join to wealth on
+# cust_internet_banking_nbr = ibn — only the wealth-linked ibn drives flags.
 spark.sql(f"""
     CREATE OR REPLACE TEMP VIEW digital_monthly AS
-    WITH dig_raw AS (
-        SELECT
-            TRUNC(ods_business_dt, 'MM')            AS month_dt,
-            CAST(rcif_customer_nbr AS string)       AS rcif_number,
-            ibn,
-            MAX(olb_last_login_date)                AS last_olb,
-            MAX(mob_last_login_date)                AS last_mob,
-            MAX(ods_business_dt)                    AS ods_dt
-        FROM {DMIB_DB}.digital_banking_master
-        WHERE ods_business_dt >= date('{START_DT}')
-          AND ods_business_dt <= date('{END_DT}')
-        GROUP BY TRUNC(ods_business_dt, 'MM'),
-                 CAST(rcif_customer_nbr AS string),
-                 ibn
-    )
     SELECT
-        month_dt,
-        rcif_number,
+        TRUNC(ods_business_dt, 'MM')            AS month_dt,
+        CAST(rcif_customer_nbr AS string)       AS rcif_number,
         ibn,
-        ods_dt,
-
-        -- Mobile flags
-        CASE WHEN last_mob IS NULL THEN 'Non Mobile User'
-             ELSE 'Mobile User'
-        END AS mobile_flag,
-
-        CASE WHEN last_mob IS NOT NULL
-              AND datediff(ods_dt, last_mob) <= 90
-             THEN 'Mobile Active'
-             ELSE 'Non Mobile Active'
-        END AS mobile_active_flag,
-
-        -- OLB flags
-        CASE WHEN last_olb IS NULL THEN 'Non OLB User'
-             ELSE 'OLB User'
-        END AS olb_flag,
-
-        CASE WHEN last_olb IS NOT NULL
-              AND datediff(ods_dt, last_olb) <= 90
-             THEN 'OLB Active'
-             ELSE 'Non OLB Active'
-        END AS olb_active_flag,
-
-        -- Digital enrollment flag  (ibn presence = enrolled)
-        CASE WHEN ibn IS NULL THEN 'Non Digital User'
-             ELSE 'Digital User'
-        END AS digital_flag,
-
-        -- Digital active = either channel active within 90 days
-        CASE WHEN (last_mob IS NOT NULL AND datediff(ods_dt, last_mob) <= 90)
-               OR (last_olb IS NOT NULL AND datediff(ods_dt, last_olb) <= 90)
-             THEN 'Digital Active'
-             ELSE 'Non Digital Active'
-        END AS digital_active_flag
-
-    FROM dig_raw
-""")
-
-# Per-month, per-RCIF: a customer may have multiple ibn rows.
-# "Any active wins" — take the best flag value per customer per month.
-spark.sql("""
-    CREATE OR REPLACE TEMP VIEW digital_agg AS
-    SELECT
-        month_dt,
-        rcif_number,
-
-        CASE WHEN MAX(CASE WHEN mobile_flag        = 'Mobile User'       THEN 1 ELSE 0 END) = 1
-             THEN 'Mobile User'       ELSE 'Non Mobile User'       END AS mobile_flag,
-        CASE WHEN MAX(CASE WHEN mobile_active_flag  = 'Mobile Active'    THEN 1 ELSE 0 END) = 1
-             THEN 'Mobile Active'     ELSE 'Non Mobile Active'     END AS mobile_active_flag,
-        CASE WHEN MAX(CASE WHEN olb_flag            = 'OLB User'         THEN 1 ELSE 0 END) = 1
-             THEN 'OLB User'          ELSE 'Non OLB User'          END AS olb_flag,
-        CASE WHEN MAX(CASE WHEN olb_active_flag     = 'OLB Active'       THEN 1 ELSE 0 END) = 1
-             THEN 'OLB Active'        ELSE 'Non OLB Active'        END AS olb_active_flag,
-        CASE WHEN MAX(CASE WHEN digital_flag        = 'Digital User'     THEN 1 ELSE 0 END) = 1
-             THEN 'Digital User'      ELSE 'Non Digital User'      END AS digital_flag,
-        CASE WHEN MAX(CASE WHEN digital_active_flag = 'Digital Active'   THEN 1 ELSE 0 END) = 1
-             THEN 'Digital Active'    ELSE 'Non Digital Active'    END AS digital_active_flag
-
-    FROM digital_monthly
-    GROUP BY month_dt, rcif_number
+        MAX(olb_last_login_date)                AS last_olb,
+        MAX(mob_last_login_date)                AS last_mob,
+        MAX(ods_business_dt)                    AS ods_dt
+    FROM {DMIB_DB}.digital_banking_master
+    WHERE ods_business_dt >= date('{START_DT}')
+      AND ods_business_dt <= date('{END_DT}')
+    GROUP BY TRUNC(ods_business_dt, 'MM'),
+             CAST(rcif_customer_nbr AS string),
+             ibn
 """)
 
 if DEBUG:
-    print("\n[5] digital_agg sample:")
-    spark.sql("SELECT * FROM digital_agg LIMIT 10").show(truncate=False)
+    print("\n[5] digital_monthly sample:")
+    spark.sql("SELECT * FROM digital_monthly LIMIT 10").show(truncate=False)
 
 
 # ── 6) Address snapshot ─────────────────────────────────────────────────────────
@@ -495,7 +429,8 @@ spark.sql(f"""
 # ── 7) Customer Table — wealth_insights_cust ────────────────────────────────────
 # Grain: (business_date, rcif_number) — one row per customer per month-end.
 # business_date holds the 6 month-end dates (Sep–Feb).
-# Wealth data joined with digital flags matched by calendar month.
+# Digital flags are derived by joining on cust_internet_banking_nbr = ibn,
+# so only the wealth-linked ibn drives the flags (not all ibn per RCIF).
 
 spark.sql("""
     CREATE OR REPLACE TEMP VIEW wealth_insights_cust AS
@@ -508,22 +443,49 @@ spark.sql("""
         w.division,
         w.wealth_accts_cnt,
 
-        -- digital flags (default to "Non …" when no digital record for this month)
-        COALESCE(d.mobile_flag,        'Non Mobile User')    AS mobile_flag,
-        COALESCE(d.mobile_active_flag, 'Non Mobile Active')  AS mobile_active_flag,
-        COALESCE(d.olb_flag,           'Non OLB User')       AS olb_flag,
-        COALESCE(d.olb_active_flag,    'Non OLB Active')     AS olb_active_flag,
-        COALESCE(d.digital_flag,       'Non Digital User')   AS digital_flag,
-        COALESCE(d.digital_active_flag,'Non Digital Active')  AS digital_active_flag,
+        -- Mobile flags
+        CASE WHEN d.last_mob IS NOT NULL THEN 'Mobile User'
+             ELSE 'Non Mobile User'
+        END AS mobile_flag,
 
-        -- fact_type: defines whether the customer is wealth-only or also digital
-        CASE WHEN d.rcif_number IS NOT NULL THEN 'WEALTH & DIGITAL'
+        CASE WHEN d.last_mob IS NOT NULL
+              AND datediff(d.ods_dt, d.last_mob) <= 90
+             THEN 'Mobile Active'
+             ELSE 'Non Mobile Active'
+        END AS mobile_active_flag,
+
+        -- OLB flags
+        CASE WHEN d.last_olb IS NOT NULL THEN 'OLB User'
+             ELSE 'Non OLB User'
+        END AS olb_flag,
+
+        CASE WHEN d.last_olb IS NOT NULL
+              AND datediff(d.ods_dt, d.last_olb) <= 90
+             THEN 'OLB Active'
+             ELSE 'Non OLB Active'
+        END AS olb_active_flag,
+
+        -- Digital enrollment (ibn match exists = enrolled)
+        CASE WHEN d.ibn IS NOT NULL THEN 'Digital User'
+             ELSE 'Non Digital User'
+        END AS digital_flag,
+
+        -- Digital active = either channel active within 90 days
+        CASE WHEN (d.last_mob IS NOT NULL AND datediff(d.ods_dt, d.last_mob) <= 90)
+               OR (d.last_olb IS NOT NULL AND datediff(d.ods_dt, d.last_olb) <= 90)
+             THEN 'Digital Active'
+             ELSE 'Non Digital Active'
+        END AS digital_active_flag,
+
+        -- fact_type
+        CASE WHEN d.ibn IS NOT NULL THEN 'WEALTH & DIGITAL'
              ELSE 'WEALTH'
         END AS fact_type
 
     FROM wealth_agg w
-    LEFT JOIN digital_agg d
-        ON  w.rcif_number = d.rcif_number
+    LEFT JOIN digital_monthly d
+        ON  w.rcif_number               = d.rcif_number
+        AND w.cust_internet_banking_nbr = d.ibn
         AND TRUNC(w.business_date, 'MM') = d.month_dt
 """)
 
@@ -549,6 +511,33 @@ if DEBUG:
          GROUP BY business_date
          ORDER BY business_date
     """).show(truncate=False)
+
+    # ── Quick delta check vs Power BI reference ──
+    print("\n[7b] Delta vs Power BI reference (positive = we're over):")
+    ref_data = [
+        ("2025-10-31", 64385, 59359, 89061),
+        ("2025-11-28", 64489, 59812, 89507),
+        ("2025-12-31", 64598, 60220, 89928),
+        ("2026-01-30", 65088, 60577, 90451),
+        ("2026-02-27", 65767, 60799, 91034),
+    ]
+    our = spark.sql("""
+        SELECT business_date,
+               COUNT(DISTINCT CASE WHEN olb_active_flag     = 'OLB Active'     THEN rcif_number END) AS olb,
+               COUNT(DISTINCT CASE WHEN mobile_active_flag  = 'Mobile Active'  THEN rcif_number END) AS mob,
+               COUNT(DISTINCT CASE WHEN digital_active_flag = 'Digital Active' THEN rcif_number END) AS dig
+          FROM wealth_insights_cust
+         WHERE business_date >= '2025-10-01'
+         GROUP BY business_date ORDER BY business_date
+    """).collect()
+    our_map = {str(r["business_date"]): r for r in our}
+    print(f"{'month':>12}  {'olb_delta':>10}  {'mob_delta':>10}  {'dig_delta':>10}")
+    for dt, ref_olb, ref_mob, ref_dig in ref_data:
+        r = our_map.get(dt)
+        if r:
+            print(f"{dt:>12}  {r['olb']-ref_olb:>+10,}  {r['mob']-ref_mob:>+10,}  {r['dig']-ref_dig:>+10,}")
+        else:
+            print(f"{dt:>12}  {'no data':>10}  {'no data':>10}  {'no data':>10}")
 
 
 # ── 8) Account Table — wealth_insights_acct ─────────────────────────────────────
