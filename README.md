@@ -91,14 +91,13 @@ spark.sql(f"""
         LATERAL VIEW posexplode(s) pe AS n, _
     ),
     all_dates AS (
-        SELECT DISTINCT CAST(business_date AS date) AS bd
-          FROM {EIL_DB}.d_involved_party_h
-        UNION
-        SELECT DISTINCT CAST(business_date AS date)
-          FROM {EIL_DB}.d_arrangement_to_involved_party_relationship_h
-        UNION
-        SELECT DISTINCT CAST(business_date AS date)
-          FROM {EIL_DB}.d_arrangement_h
+        SELECT DISTINCT bd FROM (
+            SELECT CAST(business_date AS date) AS bd FROM {EIL_DB}.d_involved_party_h
+            UNION ALL
+            SELECT CAST(business_date AS date) AS bd FROM {EIL_DB}.d_arrangement_to_involved_party_relationship_h
+            UNION ALL
+            SELECT CAST(business_date AS date) AS bd FROM {EIL_DB}.d_arrangement_h
+        ) raw_dates
     )
     SELECT MAX(a.bd) AS business_date
       FROM cal m
