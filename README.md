@@ -45,7 +45,21 @@ primary_owner_pred = "1=1"
 if APPLY_PRIMARY_OWNER_FILTER:
     primary_owner_pred = "COALESCE(a2i.relationship_role,'') = 'PRIMARY'"
 
-print(f"[INFO] Window : {START_DT} .. {END_DT}")
+
+# ── Snapshot dates ───────────────────────────────────────────────────────────────
+cust_dt = spark.sql(f"""
+    SELECT MAX(CAST(business_date AS date)) AS dt
+    FROM {EIL_DB}.d_involved_party_h WHERE source_system_code = 'CF'
+""").collect()[0]["dt"]
+
+addr_dt = spark.sql(f"""
+    SELECT MAX(CAST(business_date AS date)) AS dt
+    FROM {EIL_DB}.d_involved_party_address_h
+""").collect()[0]["dt"]
+
+print(f"[INFO] cust_dt : {cust_dt}")
+print(f"[INFO] addr_dt : {addr_dt}")
+print(f"[INFO] Window  : {START_DT} .. {END_DT}")
 
 
 # ── Month-end business dates ─────────────────────────────────────────────────────
@@ -83,7 +97,6 @@ spark.sql(f"""
         ind.cust_internet_banking_nbr,
         ind.private_client_code,
         ind.private_client_trust_code,
-        ind.birth_date,
         ar.arrangement_id, ar.source_system_code,
         ar.business_service_segment_type_code
     FROM {EIL_DB}.d_involved_party_h ind
@@ -133,8 +146,7 @@ spark.sql("""
                   ('DA','SV','CC','MG','LS','TM','LO','CM','CS','EL','IC','MA','PF','PR','SD','BI','RN')
                   THEN acct_key END) AS banking_count,
             MAX(CASE WHEN private_client_code IN ('039','539','339')
-                       OR private_client_trust_code IN ('239','739') THEN 1 ELSE 0 END) AS private_flag,
-            MAX(CASE WHEN birth_date IS NOT NULL THEN 1 ELSE 0 END) AS has_birth_date
+                       OR private_client_trust_code IN ('239','739') THEN 1 ELSE 0 END) AS private_flag
         FROM base GROUP BY business_date, rcif_number
     )
     SELECT business_date, rcif_number, ip_id, cust_internet_banking_nbr, wealth_accts_cnt,
@@ -162,11 +174,28 @@ spark.sql("""
             WHEN (corporate_trust_count = 0 AND institutional_trust_count > 0) THEN 'Institutional Trust'
             WHEN pwm_count > 0 THEN 'Banking only'
             ELSE 'Corporate & Institutional Trust'
-        END AS division,
-        has_birth_date
+        END AS division
     FROM by_rcif
 """)
 print("[OK] wealth_agg")
+
+
+# ── RCIF customer bridge (EXACTLY like old code section 7) ───────────────────────
+# Latest snapshot only, birth_date NOT NULL, outputs (rcif_number, ibn)
+spark.sql(f"""
+    CREATE OR REPLACE TEMP VIEW rcif_customer AS
+    SELECT
+        involved_party_id                  AS ip_id,
+        CAST(rcif_cust_nbr AS string)      AS rcif_number,
+        cust_internet_banking_nbr          AS ibn,
+        birth_date
+    FROM {EIL_DB}.d_involved_party_h
+    WHERE CAST(business_date AS date) = date('{cust_dt}')
+      AND source_system_code = 'CF'
+      AND NVL(deceased_ind, 'N') = 'N'
+      AND birth_date IS NOT NULL
+""")
+print("[OK] rcif_customer (latest snapshot, birth_date NOT NULL)")
 
 
 # ── Digital monthly ──────────────────────────────────────────────────────────────
@@ -178,7 +207,19 @@ spark.sql(f"""
         ibn,
         MAX(olb_last_login_date)  AS last_olb,
         MAX(mob_last_login_date)  AS last_mob,
-        MAX(ods_business_dt)      AS ods_dt
+        MAX(ods_business_dt)      AS ods_dt,
+        CASE WHEN MAX(mob_last_login_date) IS NOT NULL THEN 'Mobile User' ELSE 'Non Mobile User' END AS mobile_flag,
+        CASE WHEN MAX(mob_last_login_date) IS NOT NULL
+              AND datediff(MAX(ods_business_dt), MAX(mob_last_login_date)) <= 90
+             THEN 'Mobile Active' ELSE 'Non Mobile Active' END AS mobile_active_flag,
+        CASE WHEN MAX(olb_last_login_date) IS NOT NULL THEN 'OLB User' ELSE 'Non OLB User' END AS olb_flag,
+        CASE WHEN MAX(olb_last_login_date) IS NOT NULL
+              AND datediff(MAX(ods_business_dt), MAX(olb_last_login_date)) <= 90
+             THEN 'OLB Active' ELSE 'Non OLB Active' END AS olb_active_flag,
+        'Digital User' AS digital_flag,
+        CASE WHEN (MAX(mob_last_login_date) IS NOT NULL AND datediff(MAX(ods_business_dt), MAX(mob_last_login_date)) <= 90)
+               OR (MAX(olb_last_login_date) IS NOT NULL AND datediff(MAX(ods_business_dt), MAX(olb_last_login_date)) <= 90)
+             THEN 'Digital Active' ELSE 'Non Digital Active' END AS digitally_active_flag
     FROM {DMIB_DB}.digital_banking_master
     WHERE ods_business_dt >= date('{START_DT}') AND ods_business_dt <= date('{END_DT}')
     GROUP BY TRUNC(ods_business_dt, 'MM'), CAST(rcif_customer_nbr AS string), ibn
@@ -186,16 +227,46 @@ spark.sql(f"""
 print("[OK] digital_monthly")
 
 
+# ── Digital flags per RCIF (EXACTLY like old code: join on ibn only, MAX flags) ──
+# One static row per rcif_number — Power BI intersects this with monthly wealth
+spark.sql("""
+    CREATE OR REPLACE TEMP VIEW rcif_digital_flags AS
+    WITH joined AS (
+        SELECT
+            c.rcif_number,
+            MAX(CASE WHEN d.digital_flag        = 'Digital User'    THEN 1 ELSE 0 END) AS digital_user_bin,
+            MAX(CASE WHEN d.digitally_active_flag = 'Digital Active' THEN 1 ELSE 0 END) AS digital_active_bin,
+            MAX(CASE WHEN d.mobile_flag          = 'Mobile User'    THEN 1 ELSE 0 END) AS mobile_user_bin,
+            MAX(CASE WHEN d.mobile_active_flag   = 'Mobile Active'  THEN 1 ELSE 0 END) AS mobile_active_bin,
+            MAX(CASE WHEN d.olb_flag             = 'OLB User'       THEN 1 ELSE 0 END) AS olb_user_bin,
+            MAX(CASE WHEN d.olb_active_flag      = 'OLB Active'     THEN 1 ELSE 0 END) AS olb_active_bin
+        FROM rcif_customer c
+        LEFT JOIN digital_monthly d
+            ON c.ibn = d.ibn
+        GROUP BY c.rcif_number
+    )
+    SELECT
+        rcif_number,
+        CASE WHEN digital_user_bin   = 1 THEN 'Digital User'   ELSE 'Non Digital User'   END AS digital_flag,
+        CASE WHEN digital_active_bin = 1 THEN 'Digital Active'  ELSE 'Non Digital Active'  END AS digitally_active_flag,
+        CASE WHEN mobile_user_bin    = 1 THEN 'Mobile User'    ELSE 'Non Mobile User'    END AS mobile_flag,
+        CASE WHEN mobile_active_bin  = 1 THEN 'Mobile Active'  ELSE 'Non Mobile Active'  END AS mobile_active_flag,
+        CASE WHEN olb_user_bin       = 1 THEN 'OLB User'       ELSE 'Non OLB User'       END AS olb_flag,
+        CASE WHEN olb_active_bin     = 1 THEN 'OLB Active'     ELSE 'Non OLB Active'     END AS olb_active_flag
+    FROM joined
+""")
+print("[OK] rcif_digital_flags (static per RCIF, MAX across all months)")
+
+
 # ══════════════════════════════════════════════════════════════════════════════════
-# WRITE: Customer table — WEALTH rows UNION ALL DIGITAL rows
-# fact_type = 'WEALTH' for wealth customers, 'DIGITAL' for full digital population
+# WRITE: Customer table
 # ══════════════════════════════════════════════════════════════════════════════════
 print("\n[WRITE] Customer table ...")
 spark.sql(f"DROP TABLE IF EXISTS {DEFAULT_DB}.wealth_insights_cust")
 spark.sql(f"""
     CREATE TABLE {DEFAULT_DB}.wealth_insights_cust AS
 
-    -- WEALTH rows (one per rcif per month-end)
+    -- WEALTH rows: join to static digital flags on rcif_number only (no month)
     SELECT
         w.business_date,
         w.rcif_number,
@@ -204,27 +275,20 @@ spark.sql(f"""
         w.business_group,
         w.division,
         w.wealth_accts_cnt,
-        CASE WHEN d.last_mob IS NOT NULL THEN 'Mobile User' ELSE 'Non Mobile User' END AS mobile_flag,
-        CASE WHEN d.last_mob IS NOT NULL AND datediff(d.ods_dt, d.last_mob) <= 90
-             THEN 'Mobile Active' ELSE 'Non Mobile Active' END AS mobile_active_flag,
-        CASE WHEN d.last_olb IS NOT NULL THEN 'OLB User' ELSE 'Non OLB User' END AS olb_flag,
-        CASE WHEN d.last_olb IS NOT NULL AND datediff(d.ods_dt, d.last_olb) <= 90
-             THEN 'OLB Active' ELSE 'Non OLB Active' END AS olb_active_flag,
-        CASE WHEN d.ibn IS NOT NULL THEN 'Digital User' ELSE 'Non Digital User' END AS digital_flag,
-        CASE WHEN (d.last_mob IS NOT NULL AND datediff(d.ods_dt, d.last_mob) <= 90)
-               OR (d.last_olb IS NOT NULL AND datediff(d.ods_dt, d.last_olb) <= 90)
-             THEN 'Digital Active' ELSE 'Non Digital Active' END AS digitally_active_flag,
-        'WEALTH' AS fact_type
+        COALESCE(f.mobile_flag,          'Non Mobile User')   AS mobile_flag,
+        COALESCE(f.mobile_active_flag,   'Non Mobile Active') AS mobile_active_flag,
+        COALESCE(f.olb_flag,             'Non OLB User')      AS olb_flag,
+        COALESCE(f.olb_active_flag,      'Non OLB Active')    AS olb_active_flag,
+        COALESCE(f.digital_flag,         'Non Digital User')  AS digital_flag,
+        COALESCE(f.digitally_active_flag,'Non Digital Active') AS digitally_active_flag,
+        CASE WHEN f.rcif_number IS NOT NULL THEN 'WEALTH' ELSE 'WEALTH' END AS fact_type
     FROM wealth_agg w
-    LEFT JOIN digital_monthly d
-        ON  w.has_birth_date            = 1
-        AND w.rcif_number               = d.rcif_number
-        AND w.cust_internet_banking_nbr = d.ibn
-        AND TRUNC(w.business_date, 'MM') = d.month_dt
+    LEFT JOIN rcif_digital_flags f
+        ON w.rcif_number = f.rcif_number
 
     UNION ALL
 
-    -- DIGITAL rows (full company digital population)
+    -- DIGITAL rows (full company digital population, per month)
     SELECT
         CAST(month_dt AS date)   AS business_date,
         rcif_number,
@@ -233,16 +297,12 @@ spark.sql(f"""
         CAST(NULL AS string)     AS business_group,
         CAST(NULL AS string)     AS division,
         CAST(NULL AS bigint)     AS wealth_accts_cnt,
-        CASE WHEN last_mob IS NOT NULL THEN 'Mobile User' ELSE 'Non Mobile User' END AS mobile_flag,
-        CASE WHEN last_mob IS NOT NULL AND datediff(ods_dt, last_mob) <= 90
-             THEN 'Mobile Active' ELSE 'Non Mobile Active' END AS mobile_active_flag,
-        CASE WHEN last_olb IS NOT NULL THEN 'OLB User' ELSE 'Non OLB User' END AS olb_flag,
-        CASE WHEN last_olb IS NOT NULL AND datediff(ods_dt, last_olb) <= 90
-             THEN 'OLB Active' ELSE 'Non OLB Active' END AS olb_active_flag,
-        'Digital User'           AS digital_flag,
-        CASE WHEN (last_mob IS NOT NULL AND datediff(ods_dt, last_mob) <= 90)
-               OR (last_olb IS NOT NULL AND datediff(ods_dt, last_olb) <= 90)
-             THEN 'Digital Active' ELSE 'Non Digital Active' END AS digitally_active_flag,
+        mobile_flag,
+        mobile_active_flag,
+        olb_flag,
+        olb_active_flag,
+        digital_flag,
+        digitally_active_flag,
         'DIGITAL' AS fact_type
     FROM digital_monthly
 """)
