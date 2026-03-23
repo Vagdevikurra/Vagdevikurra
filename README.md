@@ -22,27 +22,9 @@ print("=" * 80)
 
 # ── 1) What date range does the OLD Power BI source table use? ───────────────────
 print("\n[1] Check if old wealth table exists and its date range:")
-try:
-    spark.sql(f"""
-        SELECT MIN(business_date) AS min_dt, MAX(business_date) AS max_dt,
-               COUNT(*) AS rows
-        FROM {DEFAULT_DB}.wic2_wealth_fact
-    """).show(truncate=False)
-except:
-    print("  wic2_wealth_fact not found")
-
-try:
-    spark.sql(f"""
-        SELECT MIN(business_date) AS min_dt, MAX(business_date) AS max_dt,
-               COUNT(*) AS rows
-        FROM {DEFAULT_DB}.wealth_insights_customer1
-    """).show(truncate=False)
-except:
-    print("  wealth_insights_customer1 not found")
-
-# Try the table name from the old code
 for tbl in ["Wealth_Insights_Customer1", "wealth_insights_customer1",
-            "Wealth_Insights_Customerl", "wealth_insights_cust1"]:
+            "Wealth_Insights_Customerl", "wealth_insights_cust1",
+            "wic2_wealth_fact"]:
     try:
         r = spark.sql(f"SELECT COUNT(*) AS c FROM {DEFAULT_DB}.{tbl}").collect()[0]["c"]
         print(f"  Found {DEFAULT_DB}.{tbl} with {r:,} rows")
@@ -50,7 +32,6 @@ for tbl in ["Wealth_Insights_Customer1", "wealth_insights_customer1",
             SELECT MIN(business_date) AS min_dt, MAX(business_date) AS max_dt
             FROM {DEFAULT_DB}.{tbl}
         """).show(truncate=False)
-        break
     except:
         pass
 
@@ -66,9 +47,7 @@ spark.sql(f"""
 
 
 # ── 3) Compare 90-day window: ods_dt vs month-end date ──────────────────────────
-# Theory: if ods_dt differs from the wealth month-end, 90-day boundary shifts
 print("\n[3] ods_dt vs month-end — does it matter?")
-print("    Comparing flag counts using MAX(ods_dt) vs last_day_of_month:")
 spark.sql(f"""
     WITH dig AS (
         SELECT
@@ -97,14 +76,12 @@ spark.sql(f"""
 
 # ── 4) Does grouping by ibn vs RCIF-only change flag counts? ─────────────────────
 print("\n[4] Digital active at RCIF level — ibn-grain vs rcif-grain:")
-print("    (If identical, ibn is not the issue)")
 spark.sql(f"""
     WITH by_ibn AS (
         SELECT TRUNC(ods_business_dt, 'MM') AS month_dt,
                CAST(rcif_customer_nbr AS string) AS rcif_number,
                ibn,
                MAX(olb_last_login_date) AS last_olb,
-               MAX(mob_last_login_date) AS last_mob,
                MAX(ods_business_dt) AS ods_dt
         FROM {DMIB_DB}.digital_banking_master
         WHERE ods_business_dt >= '2025-09-01' AND ods_business_dt <= '2026-02-28'
@@ -114,7 +91,6 @@ spark.sql(f"""
         SELECT TRUNC(ods_business_dt, 'MM') AS month_dt,
                CAST(rcif_customer_nbr AS string) AS rcif_number,
                MAX(olb_last_login_date) AS last_olb,
-               MAX(mob_last_login_date) AS last_mob,
                MAX(ods_business_dt) AS ods_dt
         FROM {DMIB_DB}.digital_banking_master
         WHERE ods_business_dt >= '2025-09-01' AND ods_business_dt <= '2026-02-28'
@@ -137,14 +113,12 @@ spark.sql(f"""
 """).show(truncate=False)
 
 
-# ── 5) What does Power BI's INTERSECT actually see? ──────────────────────────────
-# Our wealth table has ~265k RCIFs. Power BI intersects with Digital.
-# Count how many wealth RCIFs exist in digital with active flags
-print("\n[5] INTERSECT check — wealth RCIFs found in digital with active flags:")
+# ── 5) INTERSECT check — wealth RCIFs in digital with active flags ───────────────
+print("\n[5] INTERSECT — wealth RCIFs found in digital with active flags:")
 spark.sql(f"""
     WITH wealth_rcifs AS (
         SELECT DISTINCT rcif_number, business_date
-        FROM {DEFAULT_DB}.wealth_insights_cust
+        FROM {DEFAULT_DB}.wealth_insights_cust7
         WHERE fact_type = 'WEALTH'
     ),
     dig AS (
@@ -174,13 +148,12 @@ spark.sql(f"""
 """).show(truncate=False)
 
 
-# ── 6) Try with 6-month lookback (180 days vs 90) — sanity check ─────────────────
-# If Power BI uses a stricter window (e.g., 60 days), numbers would be lower
+# ── 6) Day threshold sensitivity (Feb only) ─────────────────────────────────────
 print("\n[6] Sensitivity: flag counts at different day thresholds (Feb only):")
 spark.sql(f"""
     WITH wealth_rcifs AS (
         SELECT DISTINCT rcif_number
-        FROM {DEFAULT_DB}.wealth_insights_cust
+        FROM {DEFAULT_DB}.wealth_insights_cust7
         WHERE fact_type = 'WEALTH' AND business_date = '2026-02-27'
     ),
     dig AS (
@@ -202,33 +175,33 @@ spark.sql(f"""
     FROM wealth_rcifs w
     INNER JOIN dig d ON w.rcif_number = d.rcif_number
 """).show(truncate=False)
-print("    Power BI reference for Feb: OLB=65,767  MOB=60,799")
+print("    Power BI ref for Feb: OLB=65,767  MOB=60,799")
 
 
-# ── 7) Check what the OLD code's digital table looks like ─────────────────────────
-print("\n[7] Checking old digital monthly table (if exists):")
+# ── 7) Check old tables that Power BI might read from ────────────────────────────
+print("\n[7] Looking for old tables Power BI might read:")
 for tbl in ["digital_monthly", "Wealth_Insights_Account1", "wealth_insights_account1",
-            "wealth_insights_acct1"]:
+            "wealth_insights_acct1", "wealth_insights_acct7"]:
     try:
         r = spark.sql(f"SELECT COUNT(*) AS c FROM {DEFAULT_DB}.{tbl}").collect()[0]["c"]
-        print(f"  Found {DEFAULT_DB}.{tbl} ({r:,} rows)")
+        print(f"  {DEFAULT_DB}.{tbl} ({r:,} rows)")
     except:
         pass
 
 
-# ── 8) Check if wealth_insights_cust from old run has flag columns ────────────────
-print("\n[8] Column check on any old customer tables:")
+# ── 8) Column check on old customer tables ────────────────────────────────────────
+print("\n[8] Column check on old customer tables:")
 for tbl in ["wealth_insights_customer1", "Wealth_Insights_Customer1",
-            "wealth_insights_customerl", "wic2_wealth_fact"]:
+            "wealth_insights_cust1", "wic2_wealth_fact"]:
     try:
         cols = [c.name for c in spark.sql(f"SELECT * FROM {DEFAULT_DB}.{tbl} LIMIT 0").schema]
-        print(f"  {DEFAULT_DB}.{tbl} columns: {cols}")
+        print(f"  {DEFAULT_DB}.{tbl}: {cols}")
     except:
         pass
 
 
 print("\n" + "=" * 80)
-print("  DIAGNOSTIC COMPLETE — share this output")
+print("  DIAGNOSTIC COMPLETE")
 print("=" * 80)
 
 spark.stop()
