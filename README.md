@@ -1,50 +1,70 @@
 // ══════════════════════════════════════════════════════════════════════════════
-// WEALTH INSIGHTS — DAX MEASURES
+// WEALTH INSIGHTS — DAX MEASURES (CORRECTED)
 // ══════════════════════════════════════════════════════════════════════════════
 //
-// Tables in model:
-//   Wealth  = wealth_insights_cust7 WHERE fact_type = 'WEALTH'
-//   Digital = wealth_insights_cust7 WHERE fact_type = 'DIGITAL'
-//   InvestPath = wealth_insights_acct7
+// TABLE: wealth_insights_cust7
+//   - fact_type = "WEALTH"  → wealth customers (~265k/month × 6 months)
+//   - fact_type = "DIGITAL" → full digital population
 //
-// If you import the full table, filter in each measure using fact_type.
-// If you split into separate Power BI tables, remove the FILTER wrappers.
+// TABLE: wealth_insights_acct7
+//   - InvestPath IP accounts
+//
+// IMPORTANT MODEL SETUP:
+//   1. Set business_date column type to DATE in both tables
+//   2. Create a Date slicer on the page using business_date
+//   3. If you have a separate Date table, create relationships to both tables
+//
+// The card/headline measures below use MAX(business_date) context so they 
+// work correctly whether a single month is selected or all months show.
 // ══════════════════════════════════════════════════════════════════════════════
 
 
-// ─── HEADLINE METRICS (top row of dashboard) ────────────────────────────────
+// ─── HEADLINE CARD METRICS ──────────────────────────────────────────────────
 
-// Wealth Users — distinct wealth customers
+// Wealth Users — distinct wealth customers IN THE SELECTED MONTH
+// If no month selected, uses latest month
 Wealth Users = 
-CALCULATE(
-    DISTINCTCOUNT(wealth_insights_cust7[rcif_number]),
-    wealth_insights_cust7[fact_type] = "WEALTH"
-)
-
-
-// Top of Company Total Digital Active — company-wide, from DIGITAL rows
-Top of Company Digital Active = 
-CALCULATE(
-    DISTINCTCOUNT(wealth_insights_cust7[cust_internet_banking_nbr]),
-    wealth_insights_cust7[fact_type] = "DIGITAL",
-    wealth_insights_cust7[digitally_active_flag] = "Digital Active"
-)
-
-
-// Digital Enrollments Wealth — wealth customers who are digital users
-Digital Enrollments Wealth = 
+VAR _dt = MAX(wealth_insights_cust7[business_date])
+RETURN
 CALCULATE(
     DISTINCTCOUNT(wealth_insights_cust7[rcif_number]),
     wealth_insights_cust7[fact_type] = "WEALTH",
-    wealth_insights_cust7[digital_flag] = "Digital User"
+    wealth_insights_cust7[business_date] = _dt
 )
 
 
-// Accounts — total wealth arrangement count (from wealth_accts_cnt)
+// Top of Company Total Digital Active
+Top of Company Digital Active = 
+VAR _dt = MAX(wealth_insights_cust7[business_date])
+RETURN
+CALCULATE(
+    DISTINCTCOUNT(wealth_insights_cust7[cust_internet_banking_nbr]),
+    wealth_insights_cust7[fact_type] = "DIGITAL",
+    wealth_insights_cust7[digitally_active_flag] = "Digital Active",
+    wealth_insights_cust7[business_date] = _dt
+)
+
+
+// Digital Enrollments Wealth
+Digital Enrollments Wealth = 
+VAR _dt = MAX(wealth_insights_cust7[business_date])
+RETURN
+CALCULATE(
+    DISTINCTCOUNT(wealth_insights_cust7[rcif_number]),
+    wealth_insights_cust7[fact_type] = "WEALTH",
+    wealth_insights_cust7[digital_flag] = "Digital User",
+    wealth_insights_cust7[business_date] = _dt
+)
+
+
+// Accounts — SUM of wealth_accts_cnt for selected month only
 Accounts = 
+VAR _dt = MAX(wealth_insights_cust7[business_date])
+RETURN
 CALCULATE(
     SUM(wealth_insights_cust7[wealth_accts_cnt]),
-    wealth_insights_cust7[fact_type] = "WEALTH"
+    wealth_insights_cust7[fact_type] = "WEALTH",
+    wealth_insights_cust7[business_date] = _dt
 )
 
 
@@ -57,9 +77,37 @@ DIVIDE(
 )
 
 
-// ─── ACTIVE USER FLAGS (bar charts) ────────────────────────────────────────
+// Wealth Active User Adoption %
+Wealth Active User Adoption % = 
+VAR _dt = MAX(wealth_insights_cust7[business_date])
+VAR _active = CALCULATE(
+    DISTINCTCOUNT(wealth_insights_cust7[rcif_number]),
+    wealth_insights_cust7[fact_type] = "WEALTH",
+    wealth_insights_cust7[digitally_active_flag] = "Digital Active",
+    wealth_insights_cust7[business_date] = _dt
+)
+VAR _total = CALCULATE(
+    DISTINCTCOUNT(wealth_insights_cust7[rcif_number]),
+    wealth_insights_cust7[fact_type] = "WEALTH",
+    wealth_insights_cust7[business_date] = _dt
+)
+RETURN DIVIDE(_active, _total, 0)
 
-// Wealth OLB Active
+
+// % of Digital Population
+% of Digital Population = 
+DIVIDE(
+    [Digital Enrollments Wealth],
+    [Top of Company Digital Active],
+    0
+)
+
+
+// ─── BAR CHART MEASURES (these go on Y-axis, business_date on X-axis) ──────
+// For bar charts: put business_date on the Axis, these measures as Values.
+// The chart context provides the month automatically — no need for MAX(date).
+
+// Wealth OLB Active (for bar chart)
 Wealth OLB Active = 
 CALCULATE(
     DISTINCTCOUNT(wealth_insights_cust7[rcif_number]),
@@ -68,7 +116,19 @@ CALCULATE(
 )
 
 
-// Wealth MOB Active
+// Wealth OLB Active % (the % line on the OLB chart)
+Wealth OLB Active % = 
+DIVIDE(
+    [Wealth OLB Active],
+    CALCULATE(
+        DISTINCTCOUNT(wealth_insights_cust7[rcif_number]),
+        wealth_insights_cust7[fact_type] = "WEALTH"
+    ),
+    0
+)
+
+
+// Wealth MOB Active (for bar chart)
 Wealth MOB Active = 
 CALCULATE(
     DISTINCTCOUNT(wealth_insights_cust7[rcif_number]),
@@ -77,7 +137,19 @@ CALCULATE(
 )
 
 
-// Wealth Digital Active (Digitally Active Wealth Customer)
+// Wealth MOB Active % 
+Wealth MOB Active % = 
+DIVIDE(
+    [Wealth MOB Active],
+    CALCULATE(
+        DISTINCTCOUNT(wealth_insights_cust7[rcif_number]),
+        wealth_insights_cust7[fact_type] = "WEALTH"
+    ),
+    0
+)
+
+
+// Wealth Digital Active (for "Digitally Active Wealth Customer" bar chart)
 Wealth Digital Active = 
 CALCULATE(
     DISTINCTCOUNT(wealth_insights_cust7[rcif_number]),
@@ -86,120 +158,137 @@ CALCULATE(
 )
 
 
-// ─── ADOPTION & PENETRATION ────────────────────────────────────────────────
+// ─── TREND LINE (Wealth Active User Adoption by Month) ─────────────────────
+// Use business_date on X-axis. This measure auto-calculates per month.
 
-// Wealth Active User Adoption % (Digital Active / Wealth Users)
-Wealth Active User Adoption % = 
+// Wealth Users (for trend — works per month when business_date is on axis)
+Wealth Users Trend = 
+CALCULATE(
+    DISTINCTCOUNT(wealth_insights_cust7[rcif_number]),
+    wealth_insights_cust7[fact_type] = "WEALTH"
+)
+
+// Wealth Digital Active Penetration (trend line %)
+Wealth Digital Active Penetration = 
 DIVIDE(
     [Wealth Digital Active],
-    [Wealth Users],
+    [Wealth Users Trend],
     0
 )
 
 
-// % of Digital Population (Wealth Digital Active / Company Digital Active)
-% of Digital Population = 
-DIVIDE(
-    [Wealth Digital Active],
-    [Top of Company Digital Active],
-    0
-)
+// ─── OLB / MOB ACTIVITY TABLE (Within Segment) ────────────────────────────
+// For the matrix/table visual: Business Group on rows, months on columns
 
-
-// Wealth Digitally Active Penetration (same as Adoption, for trend chart)
-Wealth Digitally Active Penetration = 
-DIVIDE(
-    [Wealth Digital Active],
-    [Wealth Users],
-    0
-)
-
-
-// ─── USER FLAGS (enrollment, not just active) ──────────────────────────────
-
-// Wealth OLB Users (enrolled, not necessarily active)
-Wealth OLB Users = 
+// Wealth OLB Enrolled
+Wealth OLB Enrolled = 
 CALCULATE(
     DISTINCTCOUNT(wealth_insights_cust7[rcif_number]),
     wealth_insights_cust7[fact_type] = "WEALTH",
     wealth_insights_cust7[olb_flag] = "OLB User"
 )
 
+// Wealth OLB Enrolled %
+Wealth OLB Enrolled % = 
+DIVIDE(
+    [Wealth OLB Enrolled],
+    CALCULATE(
+        DISTINCTCOUNT(wealth_insights_cust7[rcif_number]),
+        wealth_insights_cust7[fact_type] = "WEALTH"
+    ),
+    0
+)
 
-// Wealth Mobile Users
-Wealth Mobile Users = 
+// Wealth MOB Enrolled
+Wealth MOB Enrolled = 
 CALCULATE(
     DISTINCTCOUNT(wealth_insights_cust7[rcif_number]),
     wealth_insights_cust7[fact_type] = "WEALTH",
     wealth_insights_cust7[mobile_flag] = "Mobile User"
 )
 
+// Wealth MOB Enrolled %
+Wealth MOB Enrolled % = 
+DIVIDE(
+    [Wealth MOB Enrolled],
+    CALCULATE(
+        DISTINCTCOUNT(wealth_insights_cust7[rcif_number]),
+        wealth_insights_cust7[fact_type] = "WEALTH"
+    ),
+    0
+)
+
+
+// OLB MoM Delta (month over month change)
+OLB MoM Delta = 
+VAR _current = [Wealth OLB Active]
+VAR _prior = CALCULATE(
+    [Wealth OLB Active],
+    DATEADD(wealth_insights_cust7[business_date], -1, MONTH)
+)
+RETURN _current - _prior
+
+
+// MOB MoM Delta
+MOB MoM Delta = 
+VAR _current = [Wealth MOB Active]
+VAR _prior = CALCULATE(
+    [Wealth MOB Active],
+    DATEADD(wealth_insights_cust7[business_date], -1, MONTH)
+)
+RETURN _current - _prior
+
 
 // ─── INVESTPATH MEASURES ───────────────────────────────────────────────────
 
 // InvestPath Customers
 InvestPath Customers = 
-DISTINCTCOUNT(wealth_insights_acct7[ip_id])
+VAR _dt = MAX(wealth_insights_acct7[business_date])
+RETURN
+CALCULATE(
+    DISTINCTCOUNT(wealth_insights_acct7[ip_id]),
+    wealth_insights_acct7[business_date] = _dt
+)
 
 
 // # of IP Accounts
 # of IP Accounts = 
-COUNTROWS(wealth_insights_acct7)
+VAR _dt = MAX(wealth_insights_acct7[business_date])
+RETURN
+CALCULATE(
+    COUNTROWS(wealth_insights_acct7),
+    wealth_insights_acct7[business_date] = _dt
+)
 
 
-// AUM (Assets Under Management)
+// AUM
 AUM = 
-SUM(wealth_insights_acct7[ip_balance])
+VAR _dt = MAX(wealth_insights_acct7[business_date])
+RETURN
+CALCULATE(
+    SUM(wealth_insights_acct7[ip_balance]),
+    wealth_insights_acct7[business_date] = _dt
+)
 
 
 // Average Balance per IP Account
 Average Balance per IP Account = 
-DIVIDE(
-    [AUM],
-    [# of IP Accounts],
-    0
-)
+DIVIDE([AUM], [# of IP Accounts], 0)
 
 
 // InvestPath Accounts Funded (balance > 0)
 InvestPath Accounts Funded = 
+VAR _dt = MAX(wealth_insights_acct7[business_date])
+RETURN
 CALCULATE(
     COUNTROWS(wealth_insights_acct7),
-    wealth_insights_acct7[ip_balance] > 0
+    wealth_insights_acct7[ip_balance] > 0,
+    wealth_insights_acct7[business_date] = _dt
 )
 
 
-// ─── BUSINESS GROUP / DIVISION (for decomposition tree) ────────────────────
+// ─── DECOMPOSITION TREE ────────────────────────────────────────────────────
+// Use "Wealth Users Trend" as the measure, business_group as the first level
 
-// Customers by Business Group (use as visual-level measure, sliced by business_group)
-Customers by Business Group = 
-CALCULATE(
-    DISTINCTCOUNT(wealth_insights_cust7[rcif_number]),
-    wealth_insights_cust7[fact_type] = "WEALTH"
-)
-
-
-// ─── RCIF RECORDS DONUT CHART ──────────────────────────────────────────────
-
-// Total RCIF Records (all rows in DIGITAL, for the donut)
-Total RCIF Records = 
-CALCULATE(
-    COUNTROWS(wealth_insights_cust7),
-    wealth_insights_cust7[fact_type] = "DIGITAL"
-)
-
-// Digital User RCIF Records
-Digital User Records = 
-CALCULATE(
-    COUNTROWS(wealth_insights_cust7),
-    wealth_insights_cust7[fact_type] = "DIGITAL",
-    wealth_insights_cust7[digital_flag] = "Digital User"
-)
-
-// Non Digital User Records
-Non Digital User Records = 
-CALCULATE(
-    COUNTROWS(wealth_insights_cust7),
-    wealth_insights_cust7[fact_type] = "DIGITAL",
-    wealth_insights_cust7[digital_flag] = "Non Digital User"
-)
+// Customers by Business Group (use Wealth Users Trend — it works with slicers)
+// Put business_group → division as the decomposition levels
