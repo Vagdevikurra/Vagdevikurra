@@ -211,6 +211,83 @@ print("Customer dimension ready.")
 
 
 over
+
+"""
+=================================================================
+STEP 1 — Reqs #1, #2, #3:  Channel Type, Channel Code, Device
+=================================================================
+Reads: TSMT_AUTHENTICATION_H + TSMT_DEVICE_H  (data lake)
+Joins: customer dimension
+Output: v1_channel_device
+=================================================================
+"""
+
+from v1_config import *
+
+spark = get_spark()
+
+print("=== Reqs #1-3: Channel, Code, Device ===")
+
+# --- Only select the columns we need (keeps memory low) ---
+auth_sql = f"""
+SELECT
+    get_json_object(DATA, '$.RCIF_CUST_NBR')      AS rcif,
+    get_json_object(DATA, '$.channel')             AS channel_type,
+    get_json_object(DATA, '$.channelIndicator')    AS channel_code,
+    get_json_object(DATA, '$.channelSessionId')    AS channel_session_id,
+    get_json_object(DATA, '$.ACTION')              AS action,
+    KAFKA_PROCESS_DT
+FROM {TSMT_AUTHENTICATION_H}
+WHERE KAFKA_PROCESS_DT BETWEEN '{START_DATE}' AND '{END_DATE}'
+"""
+
+dev_sql = f"""
+SELECT
+    get_json_object(DATA, '$.RCIF_CUST_NBR')      AS rcif,
+    get_json_object(DATA, '$.deviceType')          AS device_type,
+    get_json_object(DATA, '$.platform')            AS platform,
+    get_json_object(DATA, '$.osType')              AS os_type,
+    get_json_object(DATA, '$.browserType')         AS browser_type,
+    KAFKA_PROCESS_DT
+FROM {TSMT_DEVICE_H}
+WHERE KAFKA_PROCESS_DT BETWEEN '{START_DATE}' AND '{END_DATE}'
+"""
+
+auth_df = spark.sql(auth_sql)
+dev_df  = spark.sql(dev_sql)
+
+# Join auth + device on rcif + date
+combined = auth_df.alias("a").join(
+    dev_df.alias("d"),
+    (col("a.rcif") == col("d.rcif")) &
+    (col("a.KAFKA_PROCESS_DT") == col("d.KAFKA_PROCESS_DT")),
+    "left"
+)
+
+# Join customer dim
+cust = spark.table(f"{OUTPUT_DB}.v1_customer_dim")
+
+result = combined.join(cust, col("a.rcif") == cust.RCIF_CUST_NBR, "left") \
+    .select(
+        col("a.rcif").alias("RCIF_CUST_NBR"),
+        "channel_type", "channel_code", "channel_session_id",
+        "device_type", "platform", "os_type", "browser_type",
+        "action",
+        col("a.KAFKA_PROCESS_DT").alias("event_date"),
+        "AGE_BANDING", "CUSTOMER_GENERATION",
+        "DIGITAL_CUSTOMER_CHECK"
+    )
+
+save_to_hive(result, "v1_channel_device")
+
+# Free memory
+auth_df.unpersist()
+dev_df.unpersist()
+
+print("=== Reqs #1-3 complete ===")
+
+over
+
 """
 =================================================================
 STEP 2 — Reqs #4-7:  Age Groups + OTP Breakdowns
