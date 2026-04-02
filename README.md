@@ -1,299 +1,224 @@
 from pyspark.sql import SparkSession
+from pyspark import SparkConf
 
 DEFAULT_DB = "dm_ib_dev"
-spark = SparkSession.builder.appName("dup_check").config("spark.sql.legacy.timeParserPolicy","LEGACY").enableHiveSupport().getOrCreate()
+EIL_DB     = "eil"
+DMIB_DB    = "dm_ib"
+START_DT   = "2025-09-01"
+END_DT     = "2026-02-28"
+
+WEALTH_SRC_LIST = [
+    "BI", "RN", "TR", "DA", "SV", "CC", "LS", "MG", "TM",
+    "LO", "CS", "IC", "MA", "PF", "PR", "SD", "CM", "EL"
+]
+
+conf = (
+    SparkConf()
+    .setAppName("wealth_insights_customer")
+    .set("spark.sql.legacy.timeParserPolicy", "LEGACY")
+    .set("spark.sql.autoBroadcastJoinThreshold", "209715200")
+    .set("spark.sql.shuffle.partitions", "600")
+    .set("spark.sql.broadcastTimeout", "1200")
+    .set("spark.executor.heartbeatInterval", "10s")
+    .set("spark.network.timeout", "1200s")
+    .set("spark.rpc.askTimeout", "300s")
+    .set("spark.storage.blockManagerSlaveTimeoutMs", "900000")
+    .set("spark.task.maxFailures", "16")
+    .set("spark.stage.maxConsecutiveAttempts", "10")
+    .set("spark.yarn.max.executor.failures", "64")
+    .set("spark.speculation", "false")
+    .set("spark.blacklist.enabled", "true")
+    .set("spark.blacklist.task.maxTaskAttemptsPerExecutor", "2")
+    .set("spark.blacklist.task.maxTaskAttemptsPerNode", "2")
+    .set("spark.blacklist.stage.maxFailedTasksPerExecutor", "2")
+    .set("spark.blacklist.stage.maxFailedExecutorsPerNode", "2")
+    .set("mapreduce.fileoutputcommitter.algorithm.version", "2")
+)
+
+spark = SparkSession.builder.config(conf=conf).enableHiveSupport().getOrCreate()
 spark.sparkContext.setLogLevel("WARN")
 
-print("=" * 60)
-print("  DUPLICATE RCIF CHECK")
-print("=" * 60)
+wealth_src_csv = ",".join([f"'{s}'" for s in WEALTH_SRC_LIST])
+print(f"[INFO] Window : {START_DT} .. {END_DT}")
 
-# 1) Are there duplicate rcif_numbers per business_date in WEALTH rows?
-print("\n[1] Duplicate RCIFs per month in WEALTH rows:")
+# ══════════════════════════════════════════════════════════════════════════════════
+# Single CREATE TABLE — matching colleague's working code exactly
+# ══════════════════════════════════════════════════════════════════════════════════
+print("\n[WRITE] Wealth_Insights_Customer ...")
+spark.sql(f"DROP TABLE IF EXISTS {DEFAULT_DB}.Wealth_Insights_Customer")
 spark.sql(f"""
-    SELECT business_date,
-           COUNT(*) AS total_rows,
-           COUNT(DISTINCT rcif_number) AS distinct_rcifs,
-           COUNT(*) - COUNT(DISTINCT rcif_number) AS duplicates
-    FROM {DEFAULT_DB}.Wealth_Insights_Customer
-    WHERE fact_type = 'WEALTH'
-    GROUP BY business_date ORDER BY business_date
-""").show(truncate=False)
+    CREATE TABLE {DEFAULT_DB}.Wealth_Insights_Customer AS
 
-# 2) Which RCIFs appear more than once per month?
-print("[2] Sample duplicate RCIFs (if any):")
-spark.sql(f"""
-    SELECT rcif_number, business_date, COUNT(*) AS cnt, 
-           COLLECT_SET(business_group) AS business_groups
-    FROM {DEFAULT_DB}.Wealth_Insights_Customer
-    WHERE fact_type = 'WEALTH'
-    GROUP BY rcif_number, business_date
-    HAVING COUNT(*) > 1
-    ORDER BY cnt DESC
-    LIMIT 20
-""").show(truncate=False)
+    -- ── Dig_Customer: 6-month rolling, per-month aggregation ────────────────────
+    WITH Dig_Customer AS (
+        SELECT
+            DATE_ADD(ADD_MONTHS(TRUNC(dbm.ods_business_dt, 'MM'), 1), -1) AS ods_business_dt,
+            dbm.ibn AS reltibn,
+            dbm.rcif_customer_nbr,
+            MAX(dbm.olb_last_login_date) AS lst_login_olb,
+            MAX(dbm.mob_last_login_date) AS lst_login_mob
+        FROM {DMIB_DB}.digital_banking_master dbm
+        WHERE dbm.ods_business_dt >= date_sub(TRUNC(CAST('{END_DT}' AS date), 'MM'), 180)
+          AND dbm.ods_business_dt < TRUNC(CAST('{END_DT}' AS date), 'MM')
+        GROUP BY
+            DATE_ADD(ADD_MONTHS(TRUNC(dbm.ods_business_dt, 'MM'), 1), -1),
+            dbm.ibn,
+            dbm.rcif_customer_nbr
+    ),
 
-# 3) How many RCIFs have multiple business_groups?
-print("[3] RCIFs with multiple business_groups in latest month:")
-spark.sql(f"""
-    WITH latest AS (
-        SELECT rcif_number, business_group
-        FROM {DEFAULT_DB}.Wealth_Insights_Customer
-        WHERE fact_type = 'WEALTH'
-          AND business_date = (SELECT MAX(business_date) FROM {DEFAULT_DB}.Wealth_Insights_Customer WHERE fact_type='WEALTH')
+    -- ── Digital_Agg: compute 0/1 flags per month per customer ───────────────────
+    Digital_Agg AS (
+        SELECT
+            c.ods_business_dt,
+            c.reltibn,
+            c.rcif_customer_nbr,
+            CASE WHEN datediff(c.ods_business_dt, c.lst_login_mob) <= 90 THEN 1 ELSE 0 END AS Mobile_Active_Flag,
+            CASE WHEN c.lst_login_mob IS NULL THEN 0 ELSE 1 END AS Mobile_Flag,
+            CASE WHEN datediff(c.ods_business_dt, c.lst_login_olb) <= 90 THEN 1 ELSE 0 END AS OLB_Active_Flag,
+            CASE WHEN c.lst_login_olb IS NULL THEN 0 ELSE 1 END AS OLB_Flag,
+            CASE WHEN datediff(c.ods_business_dt, c.lst_login_mob) <= 90
+                   OR datediff(c.ods_business_dt, c.lst_login_olb) <= 90 THEN 1 ELSE 0 END AS Digital_Active_Flag,
+            CASE WHEN c.lst_login_mob IS NOT NULL OR c.lst_login_olb IS NOT NULL THEN 1 ELSE 0 END AS Digital_User
+        FROM Dig_Customer c
+    ),
+
+    -- ── last_ip_date: all business dates in last 6 months ───────────────────────
+    last_ip_date AS (
+        SELECT DISTINCT business_date AS last_dt
+        FROM {EIL_DB}.d_involved_party_h
+        WHERE CAST(business_date AS date) >= add_months(CAST('{END_DT}' AS date), -6)
+    ),
+
+    -- ── pwl: wealth base ────────────────────────────────────────────────────────
+    pwl AS (
+        SELECT
+            CAST(ind.business_date AS date) AS business_date,
+            ind.rcif_cust_nbr AS RCIF_NUMBER,
+            ind.cust_internet_banking_nbr,
+            ind.involved_party_id AS ip_id,
+            CASE
+                WHEN ind.private_client_code IN ('039','539','339') THEN 'Private Wealth'
+                WHEN ind.private_client_trust_code IN ('239','739') THEN 'Private Wealth'
+                ELSE CASE
+                    WHEN ar.business_service_segment_type_code IN ('IS_CT','IS_IT') THEN 'Institutional Services'
+                    WHEN ar.business_service_segment_type_code IN ('REGIS_FC','REGIS') THEN 'Investment Services'
+                    WHEN ar.business_service_segment_type_code = 'PWM' THEN 'Private Wealth'
+                    ELSE concat(ar.business_service_segment_type_code, '-Category2/?')
+                END
+            END AS Business_Group,
+            COUNT(DISTINCT CASE WHEN ar.business_service_segment_type_code = 'IS_CT' THEN ar.arrangement_id END) AS Corporate_Trust_Count,
+            COUNT(DISTINCT CASE WHEN ar.business_service_segment_type_code = 'IS_IT' THEN ar.arrangement_id END) AS Institutional_Trust_Count,
+            COUNT(DISTINCT CASE WHEN ar.business_service_segment_type_code = 'REGIS_FC' THEN ar.arrangement_id END) AS Investment_Count,
+            COUNT(DISTINCT CASE WHEN ar.business_service_segment_type_code = 'REGIS' THEN ar.arrangement_id END) AS Insurance_Count,
+            COUNT(DISTINCT CASE WHEN ar.business_service_segment_type_code = 'PWM' THEN ar.arrangement_id END) AS PWM_Count,
+            COUNT(DISTINCT CASE WHEN ar.source_system_code = 'TR' THEN ar.arrangement_id END) AS Trust_Count,
+            COUNT(DISTINCT CASE WHEN ar.source_system_code IN ('DA','SV','CC','MG','LS','TM','LO','CM','CS','EL','IC','MA','PF','PR','SD') THEN ar.arrangement_id END) AS Banking_Count,
+            COUNT(ar.arrangement_id) AS accts_Cnt
+        FROM {EIL_DB}.d_involved_party_h ind
+        INNER JOIN last_ip_date ON ind.business_date = last_ip_date.last_dt
+        INNER JOIN {EIL_DB}.d_arrangement_to_involved_party_relationship_h a2i
+            ON ind.involved_party_id = a2i.involved_party_id
+            AND ind.business_date = a2i.business_date
+            AND ind.source_system_code = a2i.source_system_code
+        INNER JOIN {EIL_DB}.d_arrangement_h ar
+            ON a2i.arrangement_id = ar.arrangement_id
+            AND a2i.arrangement_source_system_code = ar.source_system_code
+            AND a2i.business_date = ar.business_date
+            AND ar.source_system_code IN ({wealth_src_csv})
+            AND ar.closed_ind = 'N'
+        WHERE ind.source_system_code = 'CF'
+          AND NVL(ind.deceased_ind, 'N') = 'N'
+          AND (CASE
+                  WHEN ind.private_client_code IN ('039','539','339') THEN 1
+                  WHEN ind.private_client_trust_code IN ('239','739') THEN 1
+                  ELSE CASE WHEN ar.business_service_segment_type_code IN ('IS_CT','IS_IT','REGIS_FC','REGIS','PWM') THEN 1 ELSE 0 END
+               END) = 1
+        GROUP BY ind.business_date, ind.involved_party_id, ind.rcif_cust_nbr,
+                 ind.cust_internet_banking_nbr, ar.business_service_segment_type_code,
+                 ind.private_client_code, ind.private_client_trust_code
+    ),
+
+    -- ── Wealth_Pop: apply division logic ────────────────────────────────────────
+    Wealth_Pop AS (
+        SELECT
+            PWl.business_date,
+            PWl.ip_id,
+            PWl.cust_internet_banking_nbr,
+            CAST(PWl.RCIF_NUMBER AS string) AS rcif_number,
+            PWl.Business_Group,
+            CASE
+                WHEN PWl.Business_Group = 'Private Wealth' THEN CASE
+                    WHEN PWl.Trust_Count > 0 AND PWl.Banking_Count > 0 THEN 'Banking & IMAT'
+                    WHEN PWl.Investment_Count + PWl.Trust_Count > 0 AND PWl.Banking_Count = 0 THEN 'Investments Only'
+                    ELSE 'Banking only' END
+                WHEN PWl.Business_Group = 'Investment Services' THEN CASE
+                    WHEN PWl.Investment_Count > 0 AND PWl.Insurance_Count = 0 THEN 'Investment'
+                    WHEN PWl.Investment_Count = 0 AND PWl.Insurance_Count > 0 THEN 'Insurance'
+                    ELSE 'Insurance & Investment' END
+                ELSE CASE
+                    WHEN PWl.Corporate_Trust_Count > 0 AND PWl.Institutional_Trust_Count = 0 THEN 'Corporate Trust'
+                    WHEN PWl.Corporate_Trust_Count = 0 AND PWl.Institutional_Trust_Count > 0 THEN 'Institutional Trust'
+                    WHEN PWl.PWM_Count > 0 THEN 'Banking only'
+                    ELSE 'Corporate & Institutional Trust' END
+            END AS division,
+            PWl.accts_Cnt
+        FROM pwl
+    ),
+
+    -- ── wealth_dedup: one row per (business_date, rcif_number) ──────────────────
+    -- Keeps highest accts_cnt when customer appears in multiple LOBs
+    wealth_dedup AS (
+        SELECT *
+        FROM (
+            SELECT p.*,
+                   ROW_NUMBER() OVER (PARTITION BY business_date, rcif_number ORDER BY accts_cnt DESC) AS rn
+            FROM Wealth_Pop p
+        ) x
+        WHERE rn = 1
     )
-    SELECT COUNT(DISTINCT rcif_number) AS multi_lob_customers
-    FROM (
-        SELECT rcif_number, COUNT(DISTINCT business_group) AS n_groups
-        FROM latest
-        GROUP BY rcif_number
-        HAVING COUNT(DISTINCT business_group) > 1
-    ) x
-""").show(truncate=False)
 
-# 4) Impact on digital flags — do duplicates inflate the count?
-print("[4] Digital active count: with vs without duplicates:")
-spark.sql(f"""
-    SELECT business_date,
-           COUNT(CASE WHEN digitally_active_flag = 'Digital Active' THEN 1 END) AS raw_count,
-           COUNT(DISTINCT CASE WHEN digitally_active_flag = 'Digital Active' THEN rcif_number END) AS distinct_count,
-           COUNT(CASE WHEN digitally_active_flag = 'Digital Active' THEN 1 END) 
-           - COUNT(DISTINCT CASE WHEN digitally_active_flag = 'Digital Active' THEN rcif_number END) AS inflation
-    FROM {DEFAULT_DB}.Wealth_Insights_Customer
-    WHERE fact_type = 'WEALTH'
-    GROUP BY business_date ORDER BY business_date
-""").show(truncate=False)
+    -- ── WEALTH rows: join deduped wealth to per-month digital flags ─────────────
+    SELECT
+        w.business_date,
+        w.rcif_number,
+        w.cust_internet_banking_nbr,
+        CAST(w.ip_id AS string) AS ip_id,
+        w.Business_Group AS business_group,
+        w.division,
+        CAST(w.accts_Cnt AS bigint) AS wealth_accts_cnt,
+        CASE WHEN d.Mobile_Flag = 1 THEN 'Mobile User' ELSE 'Non Mobile User' END AS mobile_flag,
+        CASE WHEN d.Mobile_Active_Flag = 1 THEN 'Mobile Active' ELSE 'Non Mobile Active' END AS mobile_active_flag,
+        CASE WHEN d.OLB_Flag = 1 THEN 'OLB User' ELSE 'Non OLB User' END AS olb_flag,
+        CASE WHEN d.OLB_Active_Flag = 1 THEN 'OLB Active' ELSE 'Non OLB Active' END AS olb_active_flag,
+        CASE WHEN d.Digital_User = 1 THEN 'Digital User' ELSE 'Non Digital User' END AS digital_flag,
+        CASE WHEN d.Digital_Active_Flag = 1 THEN 'Digital Active' ELSE 'Non Digital Active' END AS digitally_active_flag,
+        'WEALTH' AS fact_type
+    FROM wealth_dedup w
+    LEFT JOIN Digital_Agg d
+        ON w.business_date = d.ods_business_dt
+        AND w.rcif_number = d.rcif_customer_nbr
 
-print("=" * 60)
+    UNION ALL
+
+    -- ── DIGITAL rows ────────────────────────────────────────────────────────────
+    SELECT
+        CAST(ods_business_dt AS date) AS business_date,
+        rcif_customer_nbr AS rcif_number,
+        reltibn AS cust_internet_banking_nbr,
+        CAST(NULL AS string) AS ip_id,
+        CAST(NULL AS string) AS business_group,
+        CAST(NULL AS string) AS division,
+        CAST(NULL AS bigint) AS wealth_accts_cnt,
+        CASE WHEN Mobile_Flag = 1 THEN 'Mobile User' ELSE 'Non Mobile User' END AS mobile_flag,
+        CASE WHEN Mobile_Active_Flag = 1 THEN 'Mobile Active' ELSE 'Non Mobile Active' END AS mobile_active_flag,
+        CASE WHEN OLB_Flag = 1 THEN 'OLB User' ELSE 'Non OLB User' END AS olb_flag,
+        CASE WHEN OLB_Active_Flag = 1 THEN 'OLB Active' ELSE 'Non OLB Active' END AS olb_active_flag,
+        CASE WHEN Digital_User = 1 THEN 'Digital User' ELSE 'Non Digital User' END AS digital_flag,
+        CASE WHEN Digital_Active_Flag = 1 THEN 'Digital Active' ELSE 'Non Digital Active' END AS digitally_active_flag,
+        'DIGITAL' AS fact_type
+    FROM Digital_Agg
+""")
+
+print(f"[OK] Saved {DEFAULT_DB}.Wealth_Insights_Customer")
 spark.stop()
-
-// ══════════════════════════════════════════════════════════════════════════════
-// WEALTH INSIGHTS — DAX MEASURES (FINAL v2)
-// ══════════════════════════════════════════════════════════════════════════════
-// Tables: Wealth_Insights_Customer (WEALTH + DIGITAL rows)
-//         Wealth_Insights_Account (InvestPath)
-//
-// IMPORTANT: All measures use DISTINCTCOUNT(rcif_number) to handle 
-// customers who appear in multiple lines of business (business_group).
-// Top cards always show the MOST RECENT month.
-// ══════════════════════════════════════════════════════════════════════════════
-
-
-// ═══ HEADLINE CARDS (always most recent month) ═══
-
-Wealth Users = 
-VAR _dt = CALCULATE(MAX(Wealth_Insights_Customer[business_date]), Wealth_Insights_Customer[fact_type]="WEALTH")
-RETURN CALCULATE(
-    DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
-    Wealth_Insights_Customer[fact_type] = "WEALTH",
-    Wealth_Insights_Customer[business_date] = _dt
-)
-
-Top of Company Digital Active = 
-VAR _dt = CALCULATE(MAX(Wealth_Insights_Customer[business_date]), Wealth_Insights_Customer[fact_type]="DIGITAL")
-RETURN CALCULATE(
-    DISTINCTCOUNT(Wealth_Insights_Customer[cust_internet_banking_nbr]),
-    Wealth_Insights_Customer[fact_type] = "DIGITAL",
-    Wealth_Insights_Customer[digitally_active_flag] = "Digital Active",
-    Wealth_Insights_Customer[business_date] = _dt
-)
-
-Digital Enrollments Wealth = 
-VAR _dt = CALCULATE(MAX(Wealth_Insights_Customer[business_date]), Wealth_Insights_Customer[fact_type]="WEALTH")
-RETURN CALCULATE(
-    DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
-    Wealth_Insights_Customer[fact_type] = "WEALTH",
-    Wealth_Insights_Customer[digital_flag] = "Digital User",
-    Wealth_Insights_Customer[business_date] = _dt
-)
-
-Accounts = 
-VAR _dt = CALCULATE(MAX(Wealth_Insights_Customer[business_date]), Wealth_Insights_Customer[fact_type]="WEALTH")
-RETURN CALCULATE(
-    SUM(Wealth_Insights_Customer[wealth_accts_cnt]),
-    Wealth_Insights_Customer[fact_type] = "WEALTH",
-    Wealth_Insights_Customer[business_date] = _dt
-)
-
-Accounts per User = DIVIDE([Accounts], [Wealth Users], 0)
-
-Wealth Active User Adoption % = 
-VAR _dt = CALCULATE(MAX(Wealth_Insights_Customer[business_date]), Wealth_Insights_Customer[fact_type]="WEALTH")
-VAR _active = CALCULATE(
-    DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
-    Wealth_Insights_Customer[fact_type] = "WEALTH",
-    Wealth_Insights_Customer[digitally_active_flag] = "Digital Active",
-    Wealth_Insights_Customer[business_date] = _dt)
-VAR _total = CALCULATE(
-    DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
-    Wealth_Insights_Customer[fact_type] = "WEALTH",
-    Wealth_Insights_Customer[business_date] = _dt)
-RETURN DIVIDE(_active, _total, 0)
-
-% of Digital Population = 
-DIVIDE([Digital Enrollments Wealth], [Top of Company Digital Active], 0)
-
-
-// ═══ BAR CHARTS (axis = business_date) ═══
-// These auto-slice by month when business_date is on the axis.
-// DISTINCTCOUNT handles multi-LOB customers correctly.
-
-Wealth OLB Active = 
-CALCULATE(
-    DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
-    Wealth_Insights_Customer[fact_type] = "WEALTH",
-    Wealth_Insights_Customer[olb_active_flag] = "OLB Active"
-)
-
-Wealth OLB Active % = 
-DIVIDE(
-    [Wealth OLB Active],
-    CALCULATE(DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
-              Wealth_Insights_Customer[fact_type] = "WEALTH"), 0
-)
-
-Wealth MOB Active = 
-CALCULATE(
-    DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
-    Wealth_Insights_Customer[fact_type] = "WEALTH",
-    Wealth_Insights_Customer[mobile_active_flag] = "Mobile Active"
-)
-
-Wealth MOB Active % = 
-DIVIDE(
-    [Wealth MOB Active],
-    CALCULATE(DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
-              Wealth_Insights_Customer[fact_type] = "WEALTH"), 0
-)
-
-Wealth Digital Active = 
-CALCULATE(
-    DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
-    Wealth_Insights_Customer[fact_type] = "WEALTH",
-    Wealth_Insights_Customer[digitally_active_flag] = "Digital Active"
-)
-
-
-// ═══ TREND LINE ═══
-
-Wealth Users Trend = 
-CALCULATE(
-    DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
-    Wealth_Insights_Customer[fact_type] = "WEALTH"
-)
-
-Wealth Digital Active Penetration = DIVIDE([Wealth Digital Active], [Wealth Users Trend], 0)
-
-
-// ═══ INSIGHTS — OLB/MOB MATRIX ═══
-
-OLB Active Users = 
-CALCULATE(
-    DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
-    Wealth_Insights_Customer[fact_type] = "WEALTH",
-    Wealth_Insights_Customer[olb_active_flag] = "OLB Active"
-)
-
-Wealth OLB Enrolled = 
-CALCULATE(
-    DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
-    Wealth_Insights_Customer[fact_type] = "WEALTH",
-    Wealth_Insights_Customer[olb_flag] = "OLB User"
-)
-
-Wealth OLB Enrolled % = 
-DIVIDE([Wealth OLB Enrolled],
-    CALCULATE(DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
-              Wealth_Insights_Customer[fact_type] = "WEALTH"), 0)
-
-OLB MoM % = 
-VAR _c = [Wealth OLB Active]
-VAR _p = CALCULATE([Wealth OLB Active],
-    DATEADD(Wealth_Insights_Customer[business_date], -1, MONTH))
-RETURN DIVIDE(_c - _p, _p, 0)
-
-OLB MoM Delta = 
-VAR _c = [Wealth OLB Active]
-VAR _p = CALCULATE([Wealth OLB Active],
-    DATEADD(Wealth_Insights_Customer[business_date], -1, MONTH))
-RETURN _c - _p
-
-MOB Active Users = 
-CALCULATE(
-    DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
-    Wealth_Insights_Customer[fact_type] = "WEALTH",
-    Wealth_Insights_Customer[mobile_active_flag] = "Mobile Active"
-)
-
-Wealth MOB Enrolled = 
-CALCULATE(
-    DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
-    Wealth_Insights_Customer[fact_type] = "WEALTH",
-    Wealth_Insights_Customer[mobile_flag] = "Mobile User"
-)
-
-Wealth MOB Enrolled % = 
-DIVIDE([Wealth MOB Enrolled],
-    CALCULATE(DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
-              Wealth_Insights_Customer[fact_type] = "WEALTH"), 0)
-
-MOB MoM % = 
-VAR _c = [Wealth MOB Active]
-VAR _p = CALCULATE([Wealth MOB Active],
-    DATEADD(Wealth_Insights_Customer[business_date], -1, MONTH))
-RETURN DIVIDE(_c - _p, _p, 0)
-
-MOB MoM Delta = 
-VAR _c = [Wealth MOB Active]
-VAR _p = CALCULATE([Wealth MOB Active],
-    DATEADD(Wealth_Insights_Customer[business_date], -1, MONTH))
-RETURN _c - _p
-
-
-// ═══ DECOMPOSITION TREE ═══
-// Analyze: [Wealth Users Trend]
-// Explain By: business_group → division
-
-
-// ═══ RCIF DONUT ═══
-
-Total RCIF Records = 
-CALCULATE(COUNTROWS(Wealth_Insights_Customer),
-    Wealth_Insights_Customer[fact_type] = "DIGITAL")
-
-Digital User Records = 
-CALCULATE(COUNTROWS(Wealth_Insights_Customer),
-    Wealth_Insights_Customer[fact_type] = "DIGITAL",
-    Wealth_Insights_Customer[digital_flag] = "Digital User")
-
-Non Digital User Records = 
-CALCULATE(COUNTROWS(Wealth_Insights_Customer),
-    Wealth_Insights_Customer[fact_type] = "DIGITAL",
-    Wealth_Insights_Customer[digital_flag] = "Non Digital User")
-
-
-// ═══ INVESTPATH ═══
-
-InvestPath Customers = DISTINCTCOUNT(Wealth_Insights_Account[ip_id])
-
-InvestPath Accounts = COUNTROWS(Wealth_Insights_Account)
-
-AUM = SUM(Wealth_Insights_Account[balance])
-
-$Balance per IP Account = DIVIDE([AUM], [InvestPath Accounts], 0)
-
-InvestPath Account Funded = 
-CALCULATE(COUNTROWS(Wealth_Insights_Account),
-    Wealth_Insights_Account[balance] > 0)
-
-
-// ═══ SETUP NOTES ═══
-// 1. Set business_date to Date type in model
-// 2. Cards always show most recent month (no slicer needed)
-// 3. Bar charts: put business_date on axis
-// 4. DISTINCTCOUNT handles multi-LOB customers — no double counting
-// 5. DATEADD for MoM needs business_date marked as Date
-// 6. Format: % → 0.00%, currency → $#,##0, counts → #,##0
-
-
-
+print("DONE.")
