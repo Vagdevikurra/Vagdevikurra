@@ -1,232 +1,299 @@
-"""
-=================================================================
-V1 Auth Dashboard — Config & Helpers (Data Lake / Hive ONLY)
-=================================================================
-All tables read from Hive. No Snowflake connector needed.
-Import this in each individual requirement script.
-=================================================================
-"""
-
 from pyspark.sql import SparkSession
-from pyspark.sql import functions as F
-from pyspark.sql.functions import (
-    col, when, lit, count, countDistinct,
-    sum as _sum, round as _round,
-    to_date, get_json_object, trim, coalesce, datediff
+
+DEFAULT_DB = "dm_ib_dev"
+spark = SparkSession.builder.appName("dup_check").config("spark.sql.legacy.timeParserPolicy","LEGACY").enableHiveSupport().getOrCreate()
+spark.sparkContext.setLogLevel("WARN")
+
+print("=" * 60)
+print("  DUPLICATE RCIF CHECK")
+print("=" * 60)
+
+# 1) Are there duplicate rcif_numbers per business_date in WEALTH rows?
+print("\n[1] Duplicate RCIFs per month in WEALTH rows:")
+spark.sql(f"""
+    SELECT business_date,
+           COUNT(*) AS total_rows,
+           COUNT(DISTINCT rcif_number) AS distinct_rcifs,
+           COUNT(*) - COUNT(DISTINCT rcif_number) AS duplicates
+    FROM {DEFAULT_DB}.Wealth_Insights_Customer
+    WHERE fact_type = 'WEALTH'
+    GROUP BY business_date ORDER BY business_date
+""").show(truncate=False)
+
+# 2) Which RCIFs appear more than once per month?
+print("[2] Sample duplicate RCIFs (if any):")
+spark.sql(f"""
+    SELECT rcif_number, business_date, COUNT(*) AS cnt, 
+           COLLECT_SET(business_group) AS business_groups
+    FROM {DEFAULT_DB}.Wealth_Insights_Customer
+    WHERE fact_type = 'WEALTH'
+    GROUP BY rcif_number, business_date
+    HAVING COUNT(*) > 1
+    ORDER BY cnt DESC
+    LIMIT 20
+""").show(truncate=False)
+
+# 3) How many RCIFs have multiple business_groups?
+print("[3] RCIFs with multiple business_groups in latest month:")
+spark.sql(f"""
+    WITH latest AS (
+        SELECT rcif_number, business_group
+        FROM {DEFAULT_DB}.Wealth_Insights_Customer
+        WHERE fact_type = 'WEALTH'
+          AND business_date = (SELECT MAX(business_date) FROM {DEFAULT_DB}.Wealth_Insights_Customer WHERE fact_type='WEALTH')
+    )
+    SELECT COUNT(DISTINCT rcif_number) AS multi_lob_customers
+    FROM (
+        SELECT rcif_number, COUNT(DISTINCT business_group) AS n_groups
+        FROM latest
+        GROUP BY rcif_number
+        HAVING COUNT(DISTINCT business_group) > 1
+    ) x
+""").show(truncate=False)
+
+# 4) Impact on digital flags — do duplicates inflate the count?
+print("[4] Digital active count: with vs without duplicates:")
+spark.sql(f"""
+    SELECT business_date,
+           COUNT(CASE WHEN digitally_active_flag = 'Digital Active' THEN 1 END) AS raw_count,
+           COUNT(DISTINCT CASE WHEN digitally_active_flag = 'Digital Active' THEN rcif_number END) AS distinct_count,
+           COUNT(CASE WHEN digitally_active_flag = 'Digital Active' THEN 1 END) 
+           - COUNT(DISTINCT CASE WHEN digitally_active_flag = 'Digital Active' THEN rcif_number END) AS inflation
+    FROM {DEFAULT_DB}.Wealth_Insights_Customer
+    WHERE fact_type = 'WEALTH'
+    GROUP BY business_date ORDER BY business_date
+""").show(truncate=False)
+
+print("=" * 60)
+spark.stop()
+
+// ══════════════════════════════════════════════════════════════════════════════
+// WEALTH INSIGHTS — DAX MEASURES (FINAL v2)
+// ══════════════════════════════════════════════════════════════════════════════
+// Tables: Wealth_Insights_Customer (WEALTH + DIGITAL rows)
+//         Wealth_Insights_Account (InvestPath)
+//
+// IMPORTANT: All measures use DISTINCTCOUNT(rcif_number) to handle 
+// customers who appear in multiple lines of business (business_group).
+// Top cards always show the MOST RECENT month.
+// ══════════════════════════════════════════════════════════════════════════════
+
+
+// ═══ HEADLINE CARDS (always most recent month) ═══
+
+Wealth Users = 
+VAR _dt = CALCULATE(MAX(Wealth_Insights_Customer[business_date]), Wealth_Insights_Customer[fact_type]="WEALTH")
+RETURN CALCULATE(
+    DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
+    Wealth_Insights_Customer[fact_type] = "WEALTH",
+    Wealth_Insights_Customer[business_date] = _dt
 )
 
-# -----------------------------------------------------------------
-# DATA LAKE / HIVE TABLE REFERENCES  (same schemas as Snowflake)
-# -----------------------------------------------------------------
-
-# TSMT tables — now reading from Hive data lake, NOT Snowflake
-TSMT_DB = "SL1_TSMT"
-
-TSMT_AUTHENTICATION_H  = f"{TSMT_DB}.TSMT_AUTHENTICATION_H"
-TSMT_DEVICE_H          = f"{TSMT_DB}.TSMT_DEVICE_H"
-TSMT_ENRICHMENT_H      = f"{TSMT_DB}.TSMT_ENRICHMENT_H"
-TSMT_SESSION_H         = f"{TSMT_DB}.TSMT_SESSION_H"
-TSMT_PINDROP_H         = f"{TSMT_DB}.TSMT_PINDROP_H"
-TSMT_TMX_H             = f"{TSMT_DB}.TSMT_TMX_H"
-
-# DM_CIAMOP tables (already Hive)
-DM = "DM_CIAMOP"
-
-LOGIN_AND_PASSKEY_STATS  = f"{DM}.login_and_passkey_stats"
-MFA_APP                  = f"{DM}.mfa_app"
-OTP_STATS_LOOP           = f"{DM}.otp_stats_loop"
-PASSKEY_ENROLLED_USERS   = f"{DM}.passkey_enrolled_users"
-PASSKEY_ENROLLMENT_LOGIN = f"{DM}.passkey_enrollment_login"
-TMX_TSMT_REVIEW_OTP      = f"{DM}.tmx_tsmt_review_otp"
-
-# EIL customer tables (Hive)
-EIL_INVOLVED_PARTY       = "EIL.M_INVOLVED_PARTY_H"
-EIL_DIGITAL_BANKING      = "DM_IB.DIGITAL_BANKING_MASTER"
-EIL_ADDRESS              = "EIL.D_INVOLVED_PARTY_ADDRESS_H"
-EIL_ARRANGEMENT          = "EIL.M_ARRANGEMENT_H"
-
-# -----------------------------------------------------------------
-# DATE PARAMETERS — change these before running
-# -----------------------------------------------------------------
-BUSINESS_DATE = "2025-03-01"
-START_DATE    = "2025-01-01"
-END_DATE      = "2025-03-31"
-
-# -----------------------------------------------------------------
-# OUTPUT — Hive database for PBI
-# -----------------------------------------------------------------
-OUTPUT_DB = "dm_auth_dashboard"
-
-
-# -----------------------------------------------------------------
-# HELPER: get or create a lean Spark session
-# -----------------------------------------------------------------
-def get_spark():
-    return SparkSession.builder \
-        .appName("V1_Auth_Dashboard") \
-        .config("spark.sql.shuffle.partitions", "50") \
-        .config("spark.driver.memory", "4g") \
-        .config("spark.executor.memory", "4g") \
-        .enableHiveSupport() \
-        .getOrCreate()
-
-
-# -----------------------------------------------------------------
-# HELPER: parse JSON fields from the DATA column
-# -----------------------------------------------------------------
-def parse_json_fields(df, field_map):
-    """
-    field_map = {"alias": "$.json.path", ...}
-    Returns df with new columns extracted from DATA.
-    """
-    for alias, path in field_map.items():
-        df = df.withColumn(alias, get_json_object(col("DATA"), path))
-    return df
-
-
-# -----------------------------------------------------------------
-# HELPER: save a small DataFrame to Hive
-# -----------------------------------------------------------------
-def save_to_hive(df, table_name):
-    full = f"{OUTPUT_DB}.{table_name}"
-    print(f"  -> Saving to {full} ...")
-    df.write.mode("overwrite").saveAsTable(full)
-    print(f"  -> Done. {df.count()} rows written.")
-
-
-"""
-=================================================================
-STEP 0 — Build Customer Dimension  (run this FIRST)
-=================================================================
-"""
-
-from v1_config import *
-
-spark = get_spark()
-
-print("Building customer dimension...")
-
-cust_sql = f"""
-SELECT DISTINCT
-    IP.RCIF_CUST_NBR,
-    DB.IBN,
-
-    CASE WHEN DB.IBN IS NOT NULL
-         THEN 'Digital Customer' ELSE 'Non-Digital Customer'
-    END AS DIGITAL_CUSTOMER_CHECK,
-
-    ROUND(DATEDIFF(IP.BUSINESS_DATE, IP.BIRTH_DATE) / 365, 0) AS CUSTOMER_AGE,
-
-    CASE
-        WHEN ROUND(DATEDIFF(IP.BUSINESS_DATE, IP.BIRTH_DATE)/365,0) <= 17  THEN 'Less than 18'
-        WHEN ROUND(DATEDIFF(IP.BUSINESS_DATE, IP.BIRTH_DATE)/365,0) <= 24  THEN '18-24'
-        WHEN ROUND(DATEDIFF(IP.BUSINESS_DATE, IP.BIRTH_DATE)/365,0) <= 34  THEN '25-34'
-        WHEN ROUND(DATEDIFF(IP.BUSINESS_DATE, IP.BIRTH_DATE)/365,0) <= 44  THEN '35-44'
-        WHEN ROUND(DATEDIFF(IP.BUSINESS_DATE, IP.BIRTH_DATE)/365,0) <= 54  THEN '45-54'
-        WHEN ROUND(DATEDIFF(IP.BUSINESS_DATE, IP.BIRTH_DATE)/365,0) <= 64  THEN '55-64'
-        WHEN ROUND(DATEDIFF(IP.BUSINESS_DATE, IP.BIRTH_DATE)/365,0) >= 65  THEN '65+'
-        ELSE 'Unknown'
-    END AS AGE_BANDING,
-
-    CASE
-        WHEN IP.BIRTH_DATE BETWEEN '1946-01-01' AND '1964-12-31' THEN 'Baby Boomer'
-        WHEN IP.BIRTH_DATE BETWEEN '1965-01-01' AND '1980-12-31' THEN 'Gen X'
-        WHEN IP.BIRTH_DATE BETWEEN '1981-01-01' AND '1996-12-31' THEN 'Millennial'
-        WHEN IP.BIRTH_DATE >= '1997-01-01'                       THEN 'Centennial'
-        ELSE 'Other/Unknown'
-    END AS CUSTOMER_GENERATION,
-
-    IP.GENDER_TYPE_CODE AS CUSTOMER_GENDER,
-
-    CASE WHEN AD.CITY_NAME LIKE '%HOLD STATEMENT%' THEN 'UNKNOWN'
-         ELSE AD.CITY_NAME END AS CITY,
-    CASE WHEN AD.STATE_NAME LIKE '%N/A%' THEN 'UNKNOWN'
-         ELSE AD.STATE_NAME END AS STATE
-
-FROM {EIL_INVOLVED_PARTY} IP
-INNER JOIN {EIL_ADDRESS} AD
-    ON IP.SOURCE_SYSTEM_CODE = AD.SOURCE_SYSTEM_CODE
-   AND IP.INVOLVED_PARTY_ID  = AD.INVOLVED_PARTY_ID
-LEFT JOIN {EIL_DIGITAL_BANKING} DB
-    ON IP.RCIF_CUST_NBR = DB.RCIF_CUST_NBR
-
-WHERE IP.BUSINESS_DATE = '{BUSINESS_DATE}'
-  AND IP.RCIF_CUST_NBR IS NOT NULL
-"""
-
-cust_df = spark.sql(cust_sql)
-save_to_hive(cust_df, "v1_customer_dim")
-
-print("Customer dimension ready.")
-
-"""
-=================================================================
-STEP 1 — Reqs #1, #2, #3:  Channel Type, Channel Code, Device
-=================================================================
-DIRECT columns: action, device_os_type, device_model, session_type,
-                application_id, user_id, authentication_method
-FROM DATA (JSON): channel, channelIndicator, channelSessionId
-=================================================================
-"""
-
-from v1_config import *
-
-spark = get_spark()
-
-print("=== Reqs #1-3: Channel, Code, Device ===")
-
-# ---------------------------------------------------------------
-# TSMT_AUTHENTICATION_H — direct cols + JSON for channel fields
-# ---------------------------------------------------------------
-auth_sql = f"""
-SELECT
-    user_id,
-    action,
-    authentication_method,
-    device_os_type,
-    device_model,
-    session_type,
-    application_id,
-    category,
-    get_json_object(data, '$.channel')            AS channel_type,
-    get_json_object(data, '$.channelIndicator')   AS channel_code,
-    get_json_object(data, '$.channelSessionId')   AS channel_session_id,
-    kafka_process_dt                               AS event_date
-FROM {TSMT_AUTHENTICATION_H}
-WHERE kafka_process_dt BETWEEN '{START_DATE}' AND '{END_DATE}'
-"""
-
-print("  Running auth query...")
-auth_df = spark.sql(auth_sql)
-
-# ---------------------------------------------------------------
-# Join to customer dimension via user_id
-# NOTE: if user_id doesn't match RCIF_CUST_NBR, we may need to
-#       join via IBN or another key — check results.
-# ---------------------------------------------------------------
-cust = spark.table(f"{OUTPUT_DB}.v1_customer_dim")
-
-result = auth_df.join(
-    cust,
-    auth_df.user_id == cust.RCIF_CUST_NBR,
-    "left"
-).select(
-    auth_df.user_id.alias("USER_ID"),
-    "channel_type", "channel_code", "channel_session_id",
-    "action", "authentication_method",
-    "device_os_type", "device_model",
-    "session_type", "application_id", "category",
-    "event_date",
-    "AGE_BANDING", "CUSTOMER_GENERATION",
-    "DIGITAL_CUSTOMER_CHECK"
+Top of Company Digital Active = 
+VAR _dt = CALCULATE(MAX(Wealth_Insights_Customer[business_date]), Wealth_Insights_Customer[fact_type]="DIGITAL")
+RETURN CALCULATE(
+    DISTINCTCOUNT(Wealth_Insights_Customer[cust_internet_banking_nbr]),
+    Wealth_Insights_Customer[fact_type] = "DIGITAL",
+    Wealth_Insights_Customer[digitally_active_flag] = "Digital Active",
+    Wealth_Insights_Customer[business_date] = _dt
 )
 
-save_to_hive(result, "v1_channel_device")
+Digital Enrollments Wealth = 
+VAR _dt = CALCULATE(MAX(Wealth_Insights_Customer[business_date]), Wealth_Insights_Customer[fact_type]="WEALTH")
+RETURN CALCULATE(
+    DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
+    Wealth_Insights_Customer[fact_type] = "WEALTH",
+    Wealth_Insights_Customer[digital_flag] = "Digital User",
+    Wealth_Insights_Customer[business_date] = _dt
+)
 
-auth_df.unpersist()
+Accounts = 
+VAR _dt = CALCULATE(MAX(Wealth_Insights_Customer[business_date]), Wealth_Insights_Customer[fact_type]="WEALTH")
+RETURN CALCULATE(
+    SUM(Wealth_Insights_Customer[wealth_accts_cnt]),
+    Wealth_Insights_Customer[fact_type] = "WEALTH",
+    Wealth_Insights_Customer[business_date] = _dt
+)
 
-print("=== Reqs #1-3 complete ===")
+Accounts per User = DIVIDE([Accounts], [Wealth Users], 0)
 
+Wealth Active User Adoption % = 
+VAR _dt = CALCULATE(MAX(Wealth_Insights_Customer[business_date]), Wealth_Insights_Customer[fact_type]="WEALTH")
+VAR _active = CALCULATE(
+    DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
+    Wealth_Insights_Customer[fact_type] = "WEALTH",
+    Wealth_Insights_Customer[digitally_active_flag] = "Digital Active",
+    Wealth_Insights_Customer[business_date] = _dt)
+VAR _total = CALCULATE(
+    DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
+    Wealth_Insights_Customer[fact_type] = "WEALTH",
+    Wealth_Insights_Customer[business_date] = _dt)
+RETURN DIVIDE(_active, _total, 0)
+
+% of Digital Population = 
+DIVIDE([Digital Enrollments Wealth], [Top of Company Digital Active], 0)
+
+
+// ═══ BAR CHARTS (axis = business_date) ═══
+// These auto-slice by month when business_date is on the axis.
+// DISTINCTCOUNT handles multi-LOB customers correctly.
+
+Wealth OLB Active = 
+CALCULATE(
+    DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
+    Wealth_Insights_Customer[fact_type] = "WEALTH",
+    Wealth_Insights_Customer[olb_active_flag] = "OLB Active"
+)
+
+Wealth OLB Active % = 
+DIVIDE(
+    [Wealth OLB Active],
+    CALCULATE(DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
+              Wealth_Insights_Customer[fact_type] = "WEALTH"), 0
+)
+
+Wealth MOB Active = 
+CALCULATE(
+    DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
+    Wealth_Insights_Customer[fact_type] = "WEALTH",
+    Wealth_Insights_Customer[mobile_active_flag] = "Mobile Active"
+)
+
+Wealth MOB Active % = 
+DIVIDE(
+    [Wealth MOB Active],
+    CALCULATE(DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
+              Wealth_Insights_Customer[fact_type] = "WEALTH"), 0
+)
+
+Wealth Digital Active = 
+CALCULATE(
+    DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
+    Wealth_Insights_Customer[fact_type] = "WEALTH",
+    Wealth_Insights_Customer[digitally_active_flag] = "Digital Active"
+)
+
+
+// ═══ TREND LINE ═══
+
+Wealth Users Trend = 
+CALCULATE(
+    DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
+    Wealth_Insights_Customer[fact_type] = "WEALTH"
+)
+
+Wealth Digital Active Penetration = DIVIDE([Wealth Digital Active], [Wealth Users Trend], 0)
+
+
+// ═══ INSIGHTS — OLB/MOB MATRIX ═══
+
+OLB Active Users = 
+CALCULATE(
+    DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
+    Wealth_Insights_Customer[fact_type] = "WEALTH",
+    Wealth_Insights_Customer[olb_active_flag] = "OLB Active"
+)
+
+Wealth OLB Enrolled = 
+CALCULATE(
+    DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
+    Wealth_Insights_Customer[fact_type] = "WEALTH",
+    Wealth_Insights_Customer[olb_flag] = "OLB User"
+)
+
+Wealth OLB Enrolled % = 
+DIVIDE([Wealth OLB Enrolled],
+    CALCULATE(DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
+              Wealth_Insights_Customer[fact_type] = "WEALTH"), 0)
+
+OLB MoM % = 
+VAR _c = [Wealth OLB Active]
+VAR _p = CALCULATE([Wealth OLB Active],
+    DATEADD(Wealth_Insights_Customer[business_date], -1, MONTH))
+RETURN DIVIDE(_c - _p, _p, 0)
+
+OLB MoM Delta = 
+VAR _c = [Wealth OLB Active]
+VAR _p = CALCULATE([Wealth OLB Active],
+    DATEADD(Wealth_Insights_Customer[business_date], -1, MONTH))
+RETURN _c - _p
+
+MOB Active Users = 
+CALCULATE(
+    DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
+    Wealth_Insights_Customer[fact_type] = "WEALTH",
+    Wealth_Insights_Customer[mobile_active_flag] = "Mobile Active"
+)
+
+Wealth MOB Enrolled = 
+CALCULATE(
+    DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
+    Wealth_Insights_Customer[fact_type] = "WEALTH",
+    Wealth_Insights_Customer[mobile_flag] = "Mobile User"
+)
+
+Wealth MOB Enrolled % = 
+DIVIDE([Wealth MOB Enrolled],
+    CALCULATE(DISTINCTCOUNT(Wealth_Insights_Customer[rcif_number]),
+              Wealth_Insights_Customer[fact_type] = "WEALTH"), 0)
+
+MOB MoM % = 
+VAR _c = [Wealth MOB Active]
+VAR _p = CALCULATE([Wealth MOB Active],
+    DATEADD(Wealth_Insights_Customer[business_date], -1, MONTH))
+RETURN DIVIDE(_c - _p, _p, 0)
+
+MOB MoM Delta = 
+VAR _c = [Wealth MOB Active]
+VAR _p = CALCULATE([Wealth MOB Active],
+    DATEADD(Wealth_Insights_Customer[business_date], -1, MONTH))
+RETURN _c - _p
+
+
+// ═══ DECOMPOSITION TREE ═══
+// Analyze: [Wealth Users Trend]
+// Explain By: business_group → division
+
+
+// ═══ RCIF DONUT ═══
+
+Total RCIF Records = 
+CALCULATE(COUNTROWS(Wealth_Insights_Customer),
+    Wealth_Insights_Customer[fact_type] = "DIGITAL")
+
+Digital User Records = 
+CALCULATE(COUNTROWS(Wealth_Insights_Customer),
+    Wealth_Insights_Customer[fact_type] = "DIGITAL",
+    Wealth_Insights_Customer[digital_flag] = "Digital User")
+
+Non Digital User Records = 
+CALCULATE(COUNTROWS(Wealth_Insights_Customer),
+    Wealth_Insights_Customer[fact_type] = "DIGITAL",
+    Wealth_Insights_Customer[digital_flag] = "Non Digital User")
+
+
+// ═══ INVESTPATH ═══
+
+InvestPath Customers = DISTINCTCOUNT(Wealth_Insights_Account[ip_id])
+
+InvestPath Accounts = COUNTROWS(Wealth_Insights_Account)
+
+AUM = SUM(Wealth_Insights_Account[balance])
+
+$Balance per IP Account = DIVIDE([AUM], [InvestPath Accounts], 0)
+
+InvestPath Account Funded = 
+CALCULATE(COUNTROWS(Wealth_Insights_Account),
+    Wealth_Insights_Account[balance] > 0)
+
+
+// ═══ SETUP NOTES ═══
+// 1. Set business_date to Date type in model
+// 2. Cards always show most recent month (no slicer needed)
+// 3. Bar charts: put business_date on axis
+// 4. DISTINCTCOUNT handles multi-LOB customers — no double counting
+// 5. DATEADD for MoM needs business_date marked as Date
+// 6. Format: % → 0.00%, currency → $#,##0, counts → #,##0
 
 
 
