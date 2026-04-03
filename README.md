@@ -1,12 +1,7 @@
 """
 STEP 1 — Session Events Fact Table
-====================================
 ALL direct columns. ZERO JSON.
-All 5 TSMT tables included — same column names carry
-DIFFERENT event entities across tables.
-
 Output: dm_ib_dev.v1_session_events
-PBI join: user_id = v1_customer_dim.RCIF_CUST_NBR
 """
 
 import v1_config as cfg
@@ -16,11 +11,12 @@ spark = cfg.get_spark()
 SD = cfg.START_DATE
 ED = cfg.END_DATE
 
+
 # -------------------------------------------------------------------
-# AUTH_H — reqs 9,10,12,16,19 (OTP, UID/PWD, passwordless, MFA)
-# Has: authentication_method, action3, token_name
+# AUTHENTICATION_H
+# HAS: authentication_method, token_name, action3
 # -------------------------------------------------------------------
-print("1/5  TSMT_AUTHENTICATION_H ...")
+print("1/5  AUTHENTICATION ...")
 
 spark.sql(f"""
     SELECT
@@ -41,6 +37,8 @@ spark.sql(f"""
         flow_id,
         failure,
         policy_id,
+        CAST(NULL AS STRING)    AS error_code,
+        CAST(NULL AS STRING)    AS error_message,
         time                    AS event_time,
         CAST(NULL AS STRING)    AS authentication_result,
         CAST(NULL AS STRING)    AS risk_score,
@@ -56,10 +54,11 @@ spark.sql(f"""
 
 
 # -------------------------------------------------------------------
-# SESSION_H — reqs 2,3,4,8,15,18 (channel, timestamp, SSO, active)
-# Has: token_name. No authentication_method, no action3.
+# SESSION_H
+# HAS: authentication_method, action3, error_code, error_message
+# NO:  token_name
 # -------------------------------------------------------------------
-print("2/5  TSMT_SESSION_H ...")
+print("2/5  SESSION ...")
 
 spark.sql(f"""
     SELECT
@@ -68,18 +67,20 @@ spark.sql(f"""
         session_id,
         session_type,
         application_id,
-        CAST(NULL AS STRING)    AS authentication_method,
+        authentication_method,
         category,
         action,
         action2,
-        CAST(NULL AS STRING)    AS action3,
+        action3,
         device_os_type,
         device_os_version,
         device_model,
-        token_name,
+        CAST(NULL AS STRING)    AS token_name,
         flow_id,
         failure,
         policy_id,
+        error_code,
+        error_message,
         time                    AS event_time,
         CAST(NULL AS STRING)    AS authentication_result,
         CAST(NULL AS STRING)    AS risk_score,
@@ -95,10 +96,11 @@ spark.sql(f"""
 
 
 # -------------------------------------------------------------------
-# ENRICHMENT_H — reqs 13,14 (logout, token refresh)
-# Filtered to only relevant actions to keep it small.
+# ENRICHMENT_H  (only logout + token_refresh)
+# HAS: token_name
+# NO:  authentication_method, action3
 # -------------------------------------------------------------------
-print("3/5  TSMT_ENRICHMENT_H (logout + token_refresh) ...")
+print("3/5  ENRICHMENT (logout + token_refresh) ...")
 
 spark.sql(f"""
     SELECT
@@ -115,10 +117,12 @@ spark.sql(f"""
         device_os_type,
         device_os_version,
         device_model,
-        CAST(NULL AS STRING)    AS token_name,
+        token_name,
         flow_id,
         failure,
         policy_id,
+        CAST(NULL AS STRING)    AS error_code,
+        CAST(NULL AS STRING)    AS error_message,
         time                    AS event_time,
         CAST(NULL AS STRING)    AS authentication_result,
         CAST(NULL AS STRING)    AS risk_score,
@@ -135,10 +139,10 @@ spark.sql(f"""
 
 
 # -------------------------------------------------------------------
-# DEVICE_H — req 5 (device/platform)
-# No authentication_method, no token_name, no action3.
+# DEVICE_H
+# NO: authentication_method, token_name, action3
 # -------------------------------------------------------------------
-print("4/5  TSMT_DEVICE_H ...")
+print("4/5  DEVICE ...")
 
 spark.sql(f"""
     SELECT
@@ -159,6 +163,8 @@ spark.sql(f"""
         flow_id,
         failure,
         policy_id,
+        CAST(NULL AS STRING)    AS error_code,
+        CAST(NULL AS STRING)    AS error_message,
         time                    AS event_time,
         CAST(NULL AS STRING)    AS authentication_result,
         CAST(NULL AS STRING)    AS risk_score,
@@ -174,11 +180,10 @@ spark.sql(f"""
 
 
 # -------------------------------------------------------------------
-# PINDROP_H — req 11 (voice call MFA)
-# Completely different schema: uid (not user_id),
-# no session_id, no session_type, no application_id, etc.
+# PINDROP_H  (completely different schema)
+# uid, authentication_result, risk_score, phone_number, etc.
 # -------------------------------------------------------------------
-print("5/5  TSMT_PINDROP_H ...")
+print("5/5  PINDROP ...")
 
 spark.sql(f"""
     SELECT
@@ -199,6 +204,8 @@ spark.sql(f"""
         CAST(NULL AS STRING)    AS flow_id,
         CAST(NULL AS TINYINT)   AS failure,
         CAST(NULL AS STRING)    AS policy_id,
+        CAST(NULL AS STRING)    AS error_code,
+        CAST(NULL AS STRING)    AS error_message,
         call_start_time         AS event_time,
         authentication_result,
         risk_score,
@@ -234,8 +241,7 @@ print("Saving v1_session_events ...")
 cfg.save_to_hive(combined, "v1_session_events")
 
 print("")
-print("DONE. 2 tables ready for PBI:")
+print("DONE. 2 tables:")
 print(f"  {cfg.OUTPUT_DB}.v1_customer_dim")
 print(f"  {cfg.OUTPUT_DB}.v1_session_events")
-print("")
-print("PBI join: v1_session_events.user_id = v1_customer_dim.RCIF_CUST_NBR")
+print("PBI join: user_id = RCIF_CUST_NBR")
