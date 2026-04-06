@@ -1,3 +1,4 @@
+
 from pyspark.sql import SparkSession
 from pyspark import SparkConf
 
@@ -240,7 +241,6 @@ spark.sql(f"""
     SELECT
         TRUNC(ods_business_dt, 'MM')            AS month_dt,
         CAST(rcif_customer_nbr AS string)       AS rcif_number,
-        ibn,
         MAX(olb_last_login_date)                AS last_olb,
         MAX(mob_last_login_date)                AS last_mob,
         MAX(ods_business_dt)                    AS ods_dt
@@ -248,8 +248,7 @@ spark.sql(f"""
     WHERE ods_business_dt >= date('{START_DT}')
       AND ods_business_dt <= date('{END_DT}')
     GROUP BY TRUNC(ods_business_dt, 'MM'),
-             CAST(rcif_customer_nbr AS string),
-             ibn
+             CAST(rcif_customer_nbr AS string)
 """)
 print("[OK] digital_monthly")
 
@@ -280,7 +279,7 @@ spark.sql(f"DROP TABLE IF EXISTS {DEFAULT_DB}.wealth_insights_customer")
 spark.sql(f"""
     CREATE TABLE {DEFAULT_DB}.wealth_insights_customer AS
 
-    -- WEALTH rows: join deduped wealth to digital on rcif + ibn + month
+    -- WEALTH rows: join deduped wealth to digital on rcif + month
     SELECT
         w.business_date,
         w.rcif_number,
@@ -297,18 +296,17 @@ spark.sql(f"""
              ELSE 'Non OLB User' END AS olb_flag,
         CASE WHEN d.last_olb IS NOT NULL AND datediff(d.ods_dt, d.last_olb) <= 90
              THEN 'OLB Active' ELSE 'Non OLB Active' END AS olb_active_flag,
-        CASE WHEN d.ibn IS NOT NULL THEN 'Digital User'
+        CASE WHEN d.rcif_number IS NOT NULL THEN 'Digital User'
              ELSE 'Non Digital User' END AS digital_flag,
         CASE WHEN (d.last_mob IS NOT NULL AND datediff(d.ods_dt, d.last_mob) <= 90)
                OR (d.last_olb IS NOT NULL AND datediff(d.ods_dt, d.last_olb) <= 90)
              THEN 'Digital Active' ELSE 'Non Digital Active' END AS digitally_active_flag,
-        CASE WHEN d.ibn IS NOT NULL THEN 'WEALTH & DIGITAL'
+        CASE WHEN d.rcif_number IS NOT NULL THEN 'WEALTH & DIGITAL'
              ELSE 'WEALTH' END AS fact_type
 
     FROM wealth_dedup w
     LEFT JOIN digital_monthly d
-        ON  w.rcif_number               = d.rcif_number
-        AND w.cust_internet_banking_nbr = d.ibn
+        ON  w.rcif_number = d.rcif_number
         AND TRUNC(w.business_date, 'MM') = d.month_dt
 
     UNION ALL
@@ -317,7 +315,7 @@ spark.sql(f"""
     SELECT
         CAST(month_dt AS date)   AS business_date,
         rcif_number,
-        ibn                      AS cust_internet_banking_nbr,
+        CAST(NULL AS string)     AS cust_internet_banking_nbr,
         CAST(NULL AS string)     AS ip_id,
         CAST(NULL AS string)     AS business_group,
         CAST(NULL AS string)     AS division,
@@ -330,8 +328,7 @@ spark.sql(f"""
              ELSE 'Non OLB User' END AS olb_flag,
         CASE WHEN last_olb IS NOT NULL AND datediff(ods_dt, last_olb) <= 90
              THEN 'OLB Active' ELSE 'Non OLB Active' END AS olb_active_flag,
-        CASE WHEN ibn IS NOT NULL THEN 'Digital User'
-             ELSE 'Non Digital User' END AS digital_flag,
+        'Digital User' AS digital_flag,
         CASE WHEN (last_mob IS NOT NULL AND datediff(ods_dt, last_mob) <= 90)
                OR (last_olb IS NOT NULL AND datediff(ods_dt, last_olb) <= 90)
              THEN 'Digital Active' ELSE 'Non Digital Active' END AS digitally_active_flag,
