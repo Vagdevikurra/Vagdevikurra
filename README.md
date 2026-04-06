@@ -65,32 +65,12 @@ print(f"[INFO] Window  : {START_DT} .. {END_DT}")
 # ── 1) Month-end business dates ─────────────────────────────────────────────────
 spark.sql(f"""
     CREATE OR REPLACE TEMP VIEW month_ends AS
-    WITH cal AS (
-        SELECT add_months(date('{START_DT}'), n) AS month_start,
-               add_months(date('{START_DT}'), n + 1) AS next_month_start
-        FROM (
-            SELECT sequence(
-                0,
-                CAST(months_between(date('{END_DT}'), date('{START_DT}')) AS INT)
-            ) AS s
-        ) t
-        LATERAL VIEW posexplode(s) pe AS n, _
-    ),
-    all_dates AS (
-        SELECT DISTINCT bd FROM (
-            SELECT CAST(business_date AS date) AS bd FROM {EIL_DB}.d_involved_party_h
-            UNION ALL
-            SELECT CAST(business_date AS date) AS bd FROM {EIL_DB}.d_arrangement_to_involved_party_relationship_h
-            UNION ALL
-            SELECT CAST(business_date AS date) AS bd FROM {EIL_DB}.d_arrangement_h
-        ) raw_dates
-    )
-    SELECT MAX(a.bd) AS business_date
-      FROM cal m
-      LEFT JOIN all_dates a
-        ON a.bd >= m.month_start AND a.bd < m.next_month_start
-     GROUP BY m.month_start
-     ORDER BY m.month_start
+    SELECT MAX(CAST(business_date AS date)) AS business_date
+    FROM {EIL_DB}.d_involved_party_h
+    WHERE CAST(business_date AS date) >= date('{START_DT}')
+      AND CAST(business_date AS date) <= date('{END_DT}')
+    GROUP BY TRUNC(CAST(business_date AS date), 'MM')
+    ORDER BY 1
 """)
 print("[OK] month_ends")
 
