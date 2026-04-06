@@ -276,9 +276,9 @@ print("[OK] rcif_address")
 # WRITE: Customer table — uses wealth_dedup (not wealth_agg) to avoid duplicates
 # ══════════════════════════════════════════════════════════════════════════════════
 print("\n[WRITE] Customer table ...")
-spark.sql(f"DROP TABLE IF EXISTS {DEFAULT_DB}.wealth_insights_cust")
+spark.sql(f"DROP TABLE IF EXISTS {DEFAULT_DB}.wealth_insights_customer")
 spark.sql(f"""
-    CREATE TABLE {DEFAULT_DB}.wealth_insights_cust AS
+    CREATE TABLE {DEFAULT_DB}.wealth_insights_customer AS
 
     -- WEALTH rows: join deduped wealth to digital on rcif + ibn + month
     SELECT
@@ -301,7 +301,7 @@ spark.sql(f"""
              ELSE 'Non Digital User' END AS digital_flag,
         CASE WHEN (d.last_mob IS NOT NULL AND datediff(d.ods_dt, d.last_mob) <= 90)
                OR (d.last_olb IS NOT NULL AND datediff(d.ods_dt, d.last_olb) <= 90)
-             THEN 'Digital Active' ELSE 'Non Digital Active' END AS digital_active_flag,
+             THEN 'Digital Active' ELSE 'Non Digital Active' END AS digitally_active_flag,
         CASE WHEN d.ibn IS NOT NULL THEN 'WEALTH & DIGITAL'
              ELSE 'WEALTH' END AS fact_type
 
@@ -334,11 +334,11 @@ spark.sql(f"""
              ELSE 'Non Digital User' END AS digital_flag,
         CASE WHEN (last_mob IS NOT NULL AND datediff(ods_dt, last_mob) <= 90)
                OR (last_olb IS NOT NULL AND datediff(ods_dt, last_olb) <= 90)
-             THEN 'Digital Active' ELSE 'Non Digital Active' END AS digital_active_flag,
+             THEN 'Digital Active' ELSE 'Non Digital Active' END AS digitally_active_flag,
         'DIGITAL' AS fact_type
     FROM digital_monthly
 """)
 
-print(f"[OK] Saved {DEFAULT_DB}.wealth_insights_cust")
+print(f"[OK] Saved {DEFAULT_DB}.wealth_insights_customer")
 spark.stop()
 print("DONE — Customer table complete. Now run Step 2 (Account table).")
