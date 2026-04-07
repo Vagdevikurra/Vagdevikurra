@@ -73,7 +73,7 @@ spark.sql(f"""
         SELECT
             DATE_ADD(ADD_MONTHS(TRUNC(dbm.ods_business_dt, 'MM'), 1), -1) AS ods_business_dt,
             dbm.ibn AS reltibn,
-            dbm.rcif_customer_nbr,
+            CAST(dbm.rcif_customer_nbr AS string) AS rcif_customer_nbr,
             MAX(dbm.olb_last_login_date) AS lst_login_olb,
             MAX(dbm.mob_last_login_date) AS lst_login_mob
         FROM {DMIB_DB}.digital_banking_master dbm
@@ -81,7 +81,7 @@ spark.sql(f"""
           AND dbm.ods_business_dt <= date('{END_DT}')
         GROUP BY
             DATE_ADD(ADD_MONTHS(TRUNC(dbm.ods_business_dt, 'MM'), 1), -1),
-            dbm.ibn, dbm.rcif_customer_nbr
+            dbm.ibn, CAST(dbm.rcif_customer_nbr AS string)
     ),
 
     Digital_Agg AS (
