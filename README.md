@@ -159,12 +159,10 @@ spark.sql("CACHE TABLE rcif_dig_flags")
 print(f"[OK] rcif_dig_flags: {spark.sql('SELECT COUNT(*) FROM rcif_dig_flags').collect()[0][0]:,} rows")
 
 # ══════════════════════════════════════════════════════════════════════════════════
-# WRITE PART 1: WEALTH rows only
+# WRITE: Use DataFrame API — UNION wealth + digital, then saveAsTable
 # ══════════════════════════════════════════════════════════════════════════════════
-print("\n[WRITE-1] WEALTH rows ...")
-spark.sql(f"DROP TABLE IF EXISTS {DEFAULT_DB}.Wealth_Insights_Customer")
-spark.sql(f"""
-    CREATE TABLE {DEFAULT_DB}.Wealth_Insights_Customer AS
+print("\n[WRITE] Building WEALTH DataFrame ...")
+wealth_df = spark.sql("""
     SELECT
         w.business_date, w.rcif_number, w.cust_internet_banking_nbr,
         CAST(w.ip_id AS string) AS ip_id, w.business_group, w.division, w.wealth_accts_cnt,
@@ -178,15 +176,11 @@ spark.sql(f"""
     FROM wealth_dedup w
     LEFT JOIN rcif_dig_flags f ON w.rcif_number=f.rcif_number
 """)
-wcnt = spark.sql(f"SELECT COUNT(*) FROM {DEFAULT_DB}.Wealth_Insights_Customer").collect()[0][0]
-print(f"[OK] WEALTH rows written: {wcnt:,}")
+wcnt = wealth_df.count()
+print(f"[OK] WEALTH: {wcnt:,} rows")
 
-# ══════════════════════════════════════════════════════════════════════════════════
-# WRITE PART 2: DIGITAL rows — separate INSERT INTO
-# ══════════════════════════════════════════════════════════════════════════════════
-print("\n[WRITE-2] DIGITAL rows ...")
-spark.sql(f"""
-    INSERT INTO {DEFAULT_DB}.Wealth_Insights_Customer
+print("[WRITE] Building DIGITAL DataFrame ...")
+digital_df = spark.sql(f"""
     SELECT
         CAST(TRUNC(ods_business_dt, 'MM') AS date) AS business_date,
         CAST(rcif_customer_nbr AS string) AS rcif_number,
@@ -212,10 +206,15 @@ spark.sql(f"""
     WHERE ods_business_dt >= date('{START_DT}') AND ods_business_dt <= date('{END_DT}')
     GROUP BY TRUNC(ods_business_dt, 'MM'), CAST(rcif_customer_nbr AS string), ibn
 """)
+dcnt = digital_df.count()
+print(f"[OK] DIGITAL: {dcnt:,} rows")
 
-# Verify
+print("[WRITE] Saving combined table ...")
+spark.sql(f"DROP TABLE IF EXISTS {DEFAULT_DB}.Wealth_Insights_Customer")
+combined_df = wealth_df.unionAll(digital_df)
+combined_df.write.mode("overwrite").saveAsTable(f"{DEFAULT_DB}.Wealth_Insights_Customer")
+
 total = spark.sql(f"SELECT COUNT(*) FROM {DEFAULT_DB}.Wealth_Insights_Customer").collect()[0][0]
-dcnt = spark.sql(f"SELECT COUNT(*) FROM {DEFAULT_DB}.Wealth_Insights_Customer WHERE fact_type='DIGITAL'").collect()[0][0]
 da = spark.sql(f"SELECT COUNT(DISTINCT cust_internet_banking_nbr) FROM {DEFAULT_DB}.Wealth_Insights_Customer WHERE fact_type='DIGITAL' AND digitally_active_flag='Digital Active'").collect()[0][0]
 print(f"[OK] Total: {total:,} (WEALTH={wcnt:,}, DIGITAL={dcnt:,})")
 print(f"[OK] Top of Company Digital Active: {da:,}")
