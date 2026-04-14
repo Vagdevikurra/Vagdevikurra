@@ -41,18 +41,20 @@ spark.sparkContext.setLogLevel("WARN")
 wealth_src_csv = ",".join([f"'{s}'" for s in WEALTH_SRC_LIST])
 
 cust_dt = spark.sql(f"SELECT MAX(CAST(business_date AS date)) AS dt FROM {EIL_DB}.d_involved_party_h WHERE source_system_code='CF'").collect()[0]["dt"]
-max_dig_dt = spark.sql(f"SELECT MAX(ods_business_dt) AS dt FROM {DMIB_DB}.digital_banking_master").collect()[0]["dt"]
+print(f"[INFO] cust_dt : {cust_dt}")
+print(f"[INFO] Window  : {START_DT} .. {END_DT}")
 
-print(f"[INFO] cust_dt    : {cust_dt}")
-print(f"[INFO] max_dig_dt : {max_dig_dt}")
-print(f"[INFO] Window     : {START_DT} .. {END_DT}")
+# ── Quick checks ─────────────────────────────────────────────────────────────────
+print("\n[CHECK] transmit_digital_logins:")
+spark.sql(f"""
+    SELECT MIN(login_date) AS min_dt, MAX(login_date) AS max_dt, COUNT(*) AS cnt,
+           COUNT(DISTINCT channel) AS channels
+    FROM {DMIB_DB}.transmit_digital_logins
+    WHERE login_date >= date('{START_DT}') AND login_date <= date('{END_DT}')
+""").show(truncate=False)
 
-# ── Quick data check ─────────────────────────────────────────────────────────────
-dig_check = spark.sql(f"""
-    SELECT COUNT(*) AS cnt FROM {DMIB_DB}.digital_banking_master
-    WHERE ods_business_dt >= date('{START_DT}') AND ods_business_dt <= date('{END_DT}')
-""").collect()[0]["cnt"]
-print(f"[CHECK] digital_banking_master rows in date range: {dig_check:,}")
+print("[CHECK] Channel values:")
+spark.sql(f"SELECT DISTINCT channel FROM {DMIB_DB}.transmit_digital_logins").show(truncate=False)
 
 # ── 1) Month-end business dates ──────────────────────────────────────────────────
 spark.sql(f"""
@@ -78,7 +80,6 @@ spark.sql(f"""
 """)
 spark.sql("CACHE TABLE month_ends")
 print(f"[OK] month_ends: {spark.sql('SELECT COUNT(*) FROM month_ends').collect()[0][0]} months")
-spark.sql("SELECT * FROM month_ends ORDER BY business_date").show(truncate=False)
 
 # ── 2) Wealth base ───────────────────────────────────────────────────────────────
 spark.sql(f"""
@@ -129,89 +130,94 @@ spark.sql("""
 spark.sql("CACHE TABLE wealth_agg")
 print(f"[OK] wealth_agg: {spark.sql('SELECT COUNT(*) FROM wealth_agg').collect()[0][0]:,} rows")
 
-# ── 4) RCIF bridge + digital flags ───────────────────────────────────────────────
+# ── 4) Digital from transmit_digital_logins ──────────────────────────────────────
+# Pivot channel into last_mob / last_olb per rcif per month
 spark.sql(f"""
-    CREATE OR REPLACE TEMP VIEW rcif_bridge AS
-    SELECT DISTINCT CAST(rcif_cust_nbr AS string) AS rcif_number, cust_internet_banking_nbr AS ibn
-    FROM {EIL_DB}.d_involved_party_h
-    WHERE CAST(business_date AS date)=date('{cust_dt}') AND source_system_code='CF' AND NVL(deceased_ind,'N')='N' AND birth_date IS NOT NULL
+    CREATE OR REPLACE TEMP VIEW digital_monthly AS
+    SELECT
+        TRUNC(login_date, 'MM') AS month_dt,
+        CAST(rcif_id AS string) AS rcif_number,
+        MAX(CASE WHEN UPPER(channel) = 'MOBILE' THEN login_date END) AS last_mob,
+        MAX(CASE WHEN UPPER(channel) IN ('OLB','ONLINE','WEB') THEN login_date END) AS last_olb,
+        MAX(login_date) AS last_any_login
+    FROM {DMIB_DB}.transmit_digital_logins
+    WHERE login_date >= date('{START_DT}') AND login_date <= date('{END_DT}')
+    GROUP BY TRUNC(login_date, 'MM'), CAST(rcif_id AS string)
 """)
+spark.sql("CACHE TABLE digital_monthly")
+dm_cnt = spark.sql("SELECT COUNT(*) FROM digital_monthly").collect()[0][0]
+print(f"[OK] digital_monthly: {dm_cnt:,} rows")
 
-spark.sql(f"""
-    CREATE OR REPLACE TEMP VIEW dig_latest AS
-    SELECT ibn, MAX(olb_last_login_date) last_olb, MAX(mob_last_login_date) last_mob, MAX(ods_business_dt) ods_dt
-    FROM {DMIB_DB}.digital_banking_master WHERE ods_business_dt=date('{max_dig_dt}') GROUP BY ibn
-""")
-
-spark.sql("""
-    CREATE OR REPLACE TEMP VIEW rcif_flags AS
-    SELECT b.rcif_number,
-        MAX(CASE WHEN d.last_mob IS NOT NULL THEN 1 ELSE 0 END) mu,
-        MAX(CASE WHEN d.last_mob IS NOT NULL AND datediff(d.ods_dt,d.last_mob)<=90 THEN 1 ELSE 0 END) ma,
-        MAX(CASE WHEN d.last_olb IS NOT NULL THEN 1 ELSE 0 END) ou,
-        MAX(CASE WHEN d.last_olb IS NOT NULL AND datediff(d.ods_dt,d.last_olb)<=90 THEN 1 ELSE 0 END) oa,
-        MAX(CASE WHEN d.ibn IS NOT NULL THEN 1 ELSE 0 END) du,
-        MAX(CASE WHEN (d.last_mob IS NOT NULL AND datediff(d.ods_dt,d.last_mob)<=90) OR (d.last_olb IS NOT NULL AND datediff(d.ods_dt,d.last_olb)<=90) THEN 1 ELSE 0 END) da
-    FROM rcif_bridge b LEFT JOIN dig_latest d ON b.ibn=d.ibn GROUP BY b.rcif_number
-""")
-spark.sql("CACHE TABLE rcif_flags")
-print(f"[OK] rcif_flags: {spark.sql('SELECT COUNT(*) FROM rcif_flags').collect()[0][0]:,} rows")
+# ── 5) Digital flags for WEALTH rows — per month, join on rcif + month ───────────
+# Uses month-end business_date from wealth, matched to digital month via TRUNC
 
 # ══════════════════════════════════════════════════════════════════════════════════
-# 5) SINGLE CREATE TABLE — wealth dedup + flags UNION ALL digital from source
+# 6) SINGLE CREATE TABLE
 # ══════════════════════════════════════════════════════════════════════════════════
 print("\n[WRITE] Creating Wealth_Insights_Customer ...")
 spark.sql(f"DROP TABLE IF EXISTS {DEFAULT_DB}.Wealth_Insights_Customer")
 spark.sql(f"""
     CREATE TABLE {DEFAULT_DB}.Wealth_Insights_Customer AS
 
+    -- WEALTH rows: deduped, per-month digital flags from transmit_digital_logins
     SELECT w.business_date, w.rcif_number, w.ibn AS cust_internet_banking_nbr,
            CAST(w.ip_id AS string) AS ip_id, w.bg AS business_group, w.div AS division, w.accts AS wealth_accts_cnt,
-           CASE WHEN f.mu=1 THEN 'Mobile User' ELSE 'Non Mobile User' END AS mobile_flag,
-           CASE WHEN f.ma=1 THEN 'Mobile Active' ELSE 'Non Mobile Active' END AS mobile_active_flag,
-           CASE WHEN f.ou=1 THEN 'OLB User' ELSE 'Non OLB User' END AS olb_flag,
-           CASE WHEN f.oa=1 THEN 'OLB Active' ELSE 'Non OLB Active' END AS olb_active_flag,
-           CASE WHEN f.du=1 THEN 'Digital User' ELSE 'Non Digital User' END AS digital_flag,
-           CASE WHEN f.da=1 THEN 'Digital Active' ELSE 'Non Digital Active' END AS digitally_active_flag,
+           CASE WHEN d.last_mob IS NOT NULL THEN 'Mobile User' ELSE 'Non Mobile User' END AS mobile_flag,
+           CASE WHEN d.last_mob IS NOT NULL AND datediff(w.business_date, d.last_mob) <= 90
+                THEN 'Mobile Active' ELSE 'Non Mobile Active' END AS mobile_active_flag,
+           CASE WHEN d.last_olb IS NOT NULL THEN 'OLB User' ELSE 'Non OLB User' END AS olb_flag,
+           CASE WHEN d.last_olb IS NOT NULL AND datediff(w.business_date, d.last_olb) <= 90
+                THEN 'OLB Active' ELSE 'Non OLB Active' END AS olb_active_flag,
+           CASE WHEN d.rcif_number IS NOT NULL THEN 'Digital User' ELSE 'Non Digital User' END AS digital_flag,
+           CASE WHEN (d.last_mob IS NOT NULL AND datediff(w.business_date, d.last_mob) <= 90)
+                  OR (d.last_olb IS NOT NULL AND datediff(w.business_date, d.last_olb) <= 90)
+                THEN 'Digital Active' ELSE 'Non Digital Active' END AS digitally_active_flag,
            'WEALTH' AS fact_type
     FROM (
         SELECT *, ROW_NUMBER() OVER (PARTITION BY business_date, rcif_number ORDER BY accts DESC) rn
         FROM wealth_agg
     ) w
-    LEFT JOIN rcif_flags f ON w.rcif_number = f.rcif_number
+    LEFT JOIN digital_monthly d
+        ON w.rcif_number = d.rcif_number
+        AND TRUNC(w.business_date, 'MM') = d.month_dt
     WHERE w.rn = 1
 
     UNION ALL
 
+    -- DIGITAL rows: per-month from transmit_digital_logins
     SELECT
-        CAST(TRUNC(dbm.ods_business_dt, 'MM') AS date) AS business_date,
-        CAST(dbm.rcif_customer_nbr AS string) AS rcif_number,
-        dbm.ibn AS cust_internet_banking_nbr,
+        CAST(TRUNC(login_date, 'MM') AS date) AS business_date,
+        CAST(rcif_id AS string) AS rcif_number,
+        CAST(NULL AS string) AS cust_internet_banking_nbr,
         CAST(NULL AS string) AS ip_id,
         CAST(NULL AS string) AS business_group,
         CAST(NULL AS string) AS division,
         CAST(NULL AS bigint) AS wealth_accts_cnt,
-        CASE WHEN MAX(dbm.mob_last_login_date) IS NOT NULL THEN 'Mobile User' ELSE 'Non Mobile User' END AS mobile_flag,
-        CASE WHEN MAX(dbm.mob_last_login_date) IS NOT NULL AND datediff(MAX(dbm.ods_business_dt), MAX(dbm.mob_last_login_date)) <= 90
+        CASE WHEN MAX(CASE WHEN UPPER(channel)='MOBILE' THEN login_date END) IS NOT NULL THEN 'Mobile User' ELSE 'Non Mobile User' END AS mobile_flag,
+        CASE WHEN MAX(CASE WHEN UPPER(channel)='MOBILE' THEN login_date END) IS NOT NULL
+              AND datediff(DATE_ADD(ADD_MONTHS(TRUNC(login_date,'MM'),1),-1), MAX(CASE WHEN UPPER(channel)='MOBILE' THEN login_date END)) <= 90
              THEN 'Mobile Active' ELSE 'Non Mobile Active' END AS mobile_active_flag,
-        CASE WHEN MAX(dbm.olb_last_login_date) IS NOT NULL THEN 'OLB User' ELSE 'Non OLB User' END AS olb_flag,
-        CASE WHEN MAX(dbm.olb_last_login_date) IS NOT NULL AND datediff(MAX(dbm.ods_business_dt), MAX(dbm.olb_last_login_date)) <= 90
+        CASE WHEN MAX(CASE WHEN UPPER(channel) IN ('OLB','ONLINE','WEB') THEN login_date END) IS NOT NULL THEN 'OLB User' ELSE 'Non OLB User' END AS olb_flag,
+        CASE WHEN MAX(CASE WHEN UPPER(channel) IN ('OLB','ONLINE','WEB') THEN login_date END) IS NOT NULL
+              AND datediff(DATE_ADD(ADD_MONTHS(TRUNC(login_date,'MM'),1),-1), MAX(CASE WHEN UPPER(channel) IN ('OLB','ONLINE','WEB') THEN login_date END)) <= 90
              THEN 'OLB Active' ELSE 'Non OLB Active' END AS olb_active_flag,
         'Digital User' AS digital_flag,
-        CASE WHEN (MAX(dbm.mob_last_login_date) IS NOT NULL AND datediff(MAX(dbm.ods_business_dt), MAX(dbm.mob_last_login_date)) <= 90)
-               OR (MAX(dbm.olb_last_login_date) IS NOT NULL AND datediff(MAX(dbm.ods_business_dt), MAX(dbm.olb_last_login_date)) <= 90)
+        CASE WHEN (MAX(CASE WHEN UPPER(channel)='MOBILE' THEN login_date END) IS NOT NULL
+                   AND datediff(DATE_ADD(ADD_MONTHS(TRUNC(login_date,'MM'),1),-1), MAX(CASE WHEN UPPER(channel)='MOBILE' THEN login_date END)) <= 90)
+               OR (MAX(CASE WHEN UPPER(channel) IN ('OLB','ONLINE','WEB') THEN login_date END) IS NOT NULL
+                   AND datediff(DATE_ADD(ADD_MONTHS(TRUNC(login_date,'MM'),1),-1), MAX(CASE WHEN UPPER(channel) IN ('OLB','ONLINE','WEB') THEN login_date END)) <= 90)
              THEN 'Digital Active' ELSE 'Non Digital Active' END AS digitally_active_flag,
         'DIGITAL' AS fact_type
-    FROM {DMIB_DB}.digital_banking_master dbm
-    WHERE dbm.ods_business_dt >= date('{START_DT}') AND dbm.ods_business_dt <= date('{END_DT}')
-    GROUP BY TRUNC(dbm.ods_business_dt, 'MM'), CAST(dbm.rcif_customer_nbr AS string), dbm.ibn
+    FROM {DMIB_DB}.transmit_digital_logins
+    WHERE login_date >= date('{START_DT}') AND login_date <= date('{END_DT}')
+    GROUP BY TRUNC(login_date, 'MM'), CAST(rcif_id AS string)
 """)
 
 # Verify
 total = spark.sql(f"SELECT COUNT(*) FROM {DEFAULT_DB}.Wealth_Insights_Customer").collect()[0][0]
 wcnt = spark.sql(f"SELECT COUNT(*) FROM {DEFAULT_DB}.Wealth_Insights_Customer WHERE fact_type='WEALTH'").collect()[0][0]
 dcnt = spark.sql(f"SELECT COUNT(*) FROM {DEFAULT_DB}.Wealth_Insights_Customer WHERE fact_type='DIGITAL'").collect()[0][0]
-da = spark.sql(f"SELECT COUNT(DISTINCT cust_internet_banking_nbr) FROM {DEFAULT_DB}.Wealth_Insights_Customer WHERE fact_type='DIGITAL' AND digitally_active_flag='Digital Active'").collect()[0][0]
+da = spark.sql(f"SELECT COUNT(DISTINCT rcif_number) FROM {DEFAULT_DB}.Wealth_Insights_Customer WHERE fact_type='DIGITAL' AND digitally_active_flag='Digital Active'").collect()[0][0]
 print(f"\n[RESULT] Total={total:,}, WEALTH={wcnt:,}, DIGITAL={dcnt:,}")
 print(f"[RESULT] Top of Company Digital Active: {da:,}")
 
